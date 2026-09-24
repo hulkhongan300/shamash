@@ -26,8 +26,9 @@ yt-dlp search + download ──► songbird playback (ffmpeg decode)
   when it is empty.
 - **Local speech-to-text**: Whisper runs on your machine, no audio leaves the
   host.
-- **Minimal dependencies**: `serenity` + `songbird` + `whisper-rs` as crates;
-  `yt-dlp` + `ffmpeg` as the only system tools for the music pipeline.
+- **Minimal dependencies**: `serenity` + `songbird` + `whisper-rs` as crates
+  (+ `dotenvy` for `.env` loading); `yt-dlp` + `ffmpeg` as the only system
+  tools for the music pipeline.
 
 ## Prerequisites
 
@@ -38,8 +39,13 @@ yt-dlp search + download ──► songbird playback (ffmpeg decode)
 ## Setup
 
 ```sh
-scripts/setup.sh   # installs nothing system-level; downloads the Whisper model
+scripts/setup.sh        # downloads a Whisper model to data/model.bin
+cp .env.example .env    # then fill in DISCORD_TOKEN and VOICE_CHANNEL_ID
 ```
+
+The model download takes a minute or so. `scripts/setup.sh` defaults to
+`base.en-q5_1` (great low-power balance); pass any of `tiny.en tiny base.en
+base small.en small` (optionally `-q5_1`/`-q8_0` variants) to pick another.
 
 ### Environment variables
 
@@ -51,11 +57,26 @@ scripts/setup.sh   # installs nothing system-level; downloads the Whisper model
 | `WAKE_WORDS`      | no       | Comma-separated wake words (default `shamash,bot`) |
 | `ALERT_CHANNEL_ID`| no       | Text channel for play confirmations (defaults to the server's system channel, then to the first text channel) |
 
+Secrets live in a gitignored `.env` file next to the binary, loaded through
+[`dotenvy`](https://crates.io/crates/dotenvy). Real environment variables take
+precedence over the file.
+
 ## Run
 
 ```sh
 cargo run --release
 ```
+
+## Testing without Discord
+
+Record a WAV of yourself saying *"Shamash, play Dracula by Tame Impala"* and
+run the transcriber end-to-end (resample → VAD → Whisper → parser):
+
+```sh
+cargo run --release --example transcribe -- recording.wav
+```
+
+It prints what the bot hears and which play request it would make.
 
 ## Development
 

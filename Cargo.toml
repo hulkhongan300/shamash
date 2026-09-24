@@ -9,6 +9,7 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.104"
+dotenvy = "0.15.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "cache", "builder"] }
 songbird = { version = "0.6.0", features = ["receive"] }
