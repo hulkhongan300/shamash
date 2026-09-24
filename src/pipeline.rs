@@ -1,5 +1,10 @@
+use crate::config::Config;
 use crate::parser::{CommandParser, PlayRequest};
+use crate::player::Player;
 use crate::transcriber::Transcriber;
+use serenity::model::id::GuildId;
+use serenity::prelude::Context as SerenityContext;
+use std::sync::Arc;
 
 /// Transcribes an utterance and turns it into a play request, if the grammar
 /// matched. `None` means the transcript contained no play command.
@@ -10,6 +15,47 @@ pub fn transcribe_and_parse(
 ) -> anyhow::Result<Option<PlayRequest>> {
     let transcript = transcriber.transcribe(samples)?;
     Ok(parser.parse(&transcript))
+}
+
+/// The full speech-to-music pipeline: transcribe, parse, and play.
+pub struct ListenerPipeline {
+    pub transcriber: Arc<dyn Transcriber>,
+    pub parser: CommandParser,
+    pub player: Arc<Player>,
+}
+
+impl ListenerPipeline {
+    /// Transcribes `utterance` off the blocking pool, then plays any request
+    /// that matches the grammar. Failures are logged, never fatal.
+    pub async fn handle_utterance(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        utterance: Vec<f32>,
+    ) {
+        let transcriber = self.transcriber.clone();
+        let transcript =
+            match tokio::task::spawn_blocking(move || transcriber.transcribe(&utterance)).await {
+                Ok(Ok(transcript)) => transcript,
+                Ok(Err(e)) => {
+                    println!("transcription failed: {e:#}");
+                    return;
+                }
+                Err(e) => {
+                    println!("transcription task failed: {e}");
+                    return;
+                }
+            };
+
+        let Some(request) = self.parser.parse(&transcript) else {
+            return;
+        };
+        println!("[{guild_id}] play request: {request:?}");
+        if let Err(e) = self.player.play(ctx, config, guild_id, &request).await {
+            println!("playback failed: {e:#}");
+        }
+    }
 }
 
 #[cfg(test)]

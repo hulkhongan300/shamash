@@ -1,6 +1,9 @@
 use crate::config::Config;
 use crate::listener::{VoiceTickHandler, run_listener};
-use crate::state::ConfigKey;
+use crate::parser::CommandParser;
+use crate::pipeline::ListenerPipeline;
+use crate::player::Player;
+use crate::state::{ConfigKey, HttpClientKey, TranscriberKey};
 use anyhow::Context;
 use serenity::model::id::{ChannelId, GuildId};
 use serenity::prelude::Context as SerenityContext;
@@ -44,6 +47,7 @@ impl VoiceService {
     /// spawned per join; it exits automatically when the call is removed.
     pub async fn join_and_listen(
         &self,
+        ctx: &SerenityContext,
         guild_id: GuildId,
         channel: ChannelId,
     ) -> anyhow::Result<()> {
@@ -59,9 +63,43 @@ impl VoiceService {
             handler.add_global_event(CoreEvent::VoiceTick.into(), VoiceTickHandler::new(tx));
         }
 
-        // TODO(step 4): transcribe, parse, and play instead of just logging.
-        tokio::spawn(run_listener(rx, |utterance| {
-            println!("captured utterance of {} samples", utterance.len());
+        let (transcriber, http) = {
+            let data = ctx.data.read().await;
+            let transcriber = data
+                .get::<TranscriberKey>()
+                .cloned()
+                .context("transcriber not present in type map")?;
+            let http = data
+                .get::<HttpClientKey>()
+                .cloned()
+                .context("http client not present in type map")?;
+            (transcriber, http)
+        };
+        let pipeline = Arc::new(ListenerPipeline {
+            transcriber,
+            parser: CommandParser::new(self.config.wake_words.clone()),
+            player: Arc::new(Player {
+                manager: self.manager.clone(),
+                http,
+            }),
+        });
+
+        let ctx = ctx.clone();
+        let config = self.config.clone();
+        tokio::spawn(run_listener(rx, {
+            let pipeline = pipeline.clone();
+            let ctx = ctx.clone();
+            let config = config.clone();
+            move |utterance| {
+                let pipeline = pipeline.clone();
+                let ctx = ctx.clone();
+                let config = config.clone();
+                tokio::spawn(async move {
+                    pipeline
+                        .handle_utterance(&ctx, &config, guild_id, utterance)
+                        .await;
+                });
+            }
         }));
         Ok(())
     }
@@ -105,7 +143,7 @@ impl VoiceService {
                     .map_err(|e| anyhow::anyhow!("failed to leave voice channel: {e}"))?;
             }
         } else if !connected_to_target {
-            self.join_and_listen(guild_id, target).await?;
+            self.join_and_listen(ctx, guild_id, target).await?;
             println!("Joined voice channel {target}");
         }
         Ok(())

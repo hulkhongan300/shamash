@@ -4,6 +4,8 @@ pub mod config;
 pub mod listener;
 pub mod parser;
 pub mod pipeline;
+pub mod player;
 pub mod state;
 pub mod transcriber;
 pub mod voice;
+pub mod whisper;

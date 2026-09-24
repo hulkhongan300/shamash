@@ -1,5 +1,8 @@
 use crate::config::Config;
+use crate::state::{ConfigKey, HttpClientKey, TranscriberKey};
+use crate::transcriber::Transcriber;
 use crate::voice::{VoiceService, decode_config};
+use crate::whisper::WhisperTranscriber;
 use serenity::async_trait;
 use serenity::builder::{
     CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage,
@@ -10,13 +13,18 @@ use serenity::model::id::ChannelId;
 use serenity::model::voice::VoiceState;
 use serenity::prelude::*;
 use songbird::SerenityInit;
+use std::sync::Arc;
 
 pub async fn start(config: Config) -> anyhow::Result<()> {
+    let transcriber: Arc<dyn Transcriber> =
+        Arc::new(WhisperTranscriber::new(&config.whisper_model, 4)?);
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
     let mut client = Client::builder(&config.discord_token, intents)
         .event_handler(Handler)
         .register_songbird_from_config(decode_config())
-        .type_map_insert::<crate::state::ConfigKey>(config)
+        .type_map_insert::<ConfigKey>(config)
+        .type_map_insert::<HttpClientKey>(reqwest::Client::new())
+        .type_map_insert::<TranscriberKey>(transcriber)
         .await?;
     client.start().await?;
     Ok(())

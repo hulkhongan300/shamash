@@ -7,6 +7,7 @@ pub struct Config {
     pub voice_channel_id: u64,
     pub whisper_model: String,
     pub wake_words: HashSet<String>,
+    pub alert_channel_id: Option<u64>,
 }
 
 impl Config {
@@ -15,6 +16,10 @@ impl Config {
         let voice_channel_id = std::env::var("VOICE_CHANNEL_ID")?.parse()?;
         let whisper_model =
             std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "data/model.bin".to_string());
+        let alert_channel_id = std::env::var("ALERT_CHANNEL_ID")
+            .ok()
+            .map(|value| value.parse())
+            .transpose()?;
         let wake_words = std::env::var("WAKE_WORDS")
             .map(|s| split_csv(&s))
             .unwrap_or_else(|_| vec!["shamash".to_string(), "bot".to_string()])
@@ -25,6 +30,7 @@ impl Config {
             voice_channel_id,
             whisper_model,
             wake_words,
+            alert_channel_id,
         })
     }
 }

@@ -49,6 +49,7 @@ scripts/setup.sh   # installs nothing system-level; downloads the Whisper model
 | `VOICE_CHANNEL_ID`| yes      | ID of the voice channel the bot watches and joins  |
 | `WHISPER_MODEL`   | no       | Path to a Whisper model file (default `data/model.bin`) |
 | `WAKE_WORDS`      | no       | Comma-separated wake words (default `shamash,bot`) |
+| `ALERT_CHANNEL_ID`| no       | Text channel for play confirmations (defaults to the server's system channel, then to the first text channel) |
 
 ## Run
 
