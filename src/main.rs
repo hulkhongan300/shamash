@@ -1,6 +1,7 @@
 use serenity::async_trait;
 use serenity::model::gateway::Ready;
 use serenity::prelude::*;
+use shamash::config::Config;
 
 struct Handler;
 
@@ -13,11 +14,9 @@ impl EventHandler for Handler {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let token = std::env::var("DISCORD_TOKEN")
-        .map_err(|_| anyhow::anyhow!("missing environment variable DISCORD_TOKEN"))?;
-
+    let config = Config::from_env()?;
     let intents = GatewayIntents::GUILD_VOICE_STATES;
-    let mut client = Client::builder(&token, intents)
+    let mut client = Client::builder(&config.discord_token, intents)
         .event_handler(Handler)
         .await?;
 
