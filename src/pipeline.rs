@@ -48,11 +48,27 @@ impl ListenerPipeline {
                 }
             };
 
-        println!("[{guild_id}] user: {transcript}");
-        let Some(request) = self.parser.parse(&transcript) else {
-            println!("[{guild_id}] ignored (no play command)");
+        if transcript.trim().is_empty() {
+            println!("[{guild_id}] heard speech but could not make out any words");
             return;
+        }
+        println!("[{guild_id}] heard: {transcript:?}");
+
+        let request = match self.parser.parse_with_reason(&transcript) {
+            Ok(request) => request,
+            Err(miss) => {
+                let wake_words = self
+                    .parser
+                    .wake_words()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("[{guild_id}] not a play command: {miss} (wake words: {wake_words})");
+                return;
+            }
         };
+        println!("[{guild_id}] play: {}", request.query);
         if let Err(e) = self.player.play(ctx, config, guild_id, &request).await {
             println!("[{guild_id}] playback failed: {e:#}");
         }

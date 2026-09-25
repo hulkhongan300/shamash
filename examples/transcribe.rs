@@ -61,12 +61,12 @@ fn main() -> anyhow::Result<()> {
         let transcript = transcriber
             .transcribe(&utterance)
             .with_context(|| format!("transcription failed for {wav_path}"))?;
-        println!("hear: {transcript:?}");
+        println!("heard: {transcript:?}");
         stored.push_str(&transcript);
         stored.push(' ');
-        match parser.parse(&transcript) {
-            Some(request) => println!("would play: {}", request.query),
-            None => println!("(no play request)"),
+        match parser.parse_with_reason(&transcript) {
+            Ok(request) => println!("play: {}", request.query),
+            Err(miss) => println!("not a play command: {miss}"),
         }
     }
     if stored.trim().is_empty() {

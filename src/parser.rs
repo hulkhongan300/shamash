@@ -11,6 +11,28 @@ pub struct PlayRequest {
     pub artist: Option<String>,
 }
 
+/// Why a transcript did not yield a play request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseMiss {
+    /// No configured wake word was heard.
+    NoWakeWord,
+    /// The wake word was heard, but "play" never followed it.
+    NoPlayVerb,
+    /// "play" was heard with nothing to play after it.
+    EmptyRequest,
+}
+
+impl std::fmt::Display for ParseMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::NoWakeWord => "no wake word heard",
+            Self::NoPlayVerb => "no \"play\" after the wake word",
+            Self::EmptyRequest => "nothing to play after \"play\"",
+        };
+        f.write_str(reason)
+    }
+}
+
 /// Turns transcripts into [`PlayRequest`]s using a wake word + "play" grammar.
 #[derive(Debug)]
 pub struct CommandParser {
@@ -27,23 +49,37 @@ impl CommandParser {
         }
     }
 
+    /// The wake words this parser accepts.
+    pub fn wake_words(&self) -> &HashSet<String> {
+        &self.wake_words
+    }
+
     /// Requires a wake word followed by "play <something>".
     ///
     /// Recognizes "play <title> by <artist>" (the artist gets the search bias)
     /// and falls back to the raw text after "play" as the query.
     pub fn parse(&self, transcript: &str) -> Option<PlayRequest> {
+        self.parse_with_reason(transcript).ok()
+    }
+
+    /// Like [`Self::parse`], but reports why the transcript was rejected.
+    pub fn parse_with_reason(&self, transcript: &str) -> Result<PlayRequest, ParseMiss> {
         let text = normalize(transcript);
         let words: Vec<&str> = text.split(' ').collect();
 
-        let wake_idx = words.iter().position(|w| self.wake_words.contains(*w))?;
+        let wake_idx = words
+            .iter()
+            .position(|w| self.wake_words.contains(*w))
+            .ok_or(ParseMiss::NoWakeWord)?;
         let play_at = words[wake_idx + 1..]
             .iter()
             .position(|w| *w == "play")
-            .map(|offset| wake_idx + 1 + offset)?;
+            .map(|offset| wake_idx + 1 + offset)
+            .ok_or(ParseMiss::NoPlayVerb)?;
 
         let rest = words[play_at + 1..].join(" ");
         if rest.is_empty() {
-            return None;
+            return Err(ParseMiss::EmptyRequest);
         }
 
         let (title, artist) = split_artist(&rest);
@@ -52,7 +88,7 @@ impl CommandParser {
             _ => rest,
         };
 
-        Some(PlayRequest {
+        Ok(PlayRequest {
             query,
             title,
             artist,
@@ -158,5 +194,48 @@ mod tests {
     #[test]
     fn empty_transcript_is_rejected() {
         assert!(parser().parse("   ").is_none());
+    }
+
+    #[test]
+    fn reports_why_a_transcript_was_rejected() {
+        let parser = parser();
+        assert_eq!(
+            parser.parse_with_reason("what is the weather"),
+            Err(ParseMiss::NoWakeWord)
+        );
+        assert_eq!(
+            parser.parse_with_reason("shamash what is the weather"),
+            Err(ParseMiss::NoPlayVerb)
+        );
+        assert_eq!(
+            parser.parse_with_reason("shamash play"),
+            Err(ParseMiss::EmptyRequest)
+        );
+        assert!(parser.parse_with_reason("shamash play despacito").is_ok());
+    }
+
+    #[test]
+    fn parse_agrees_with_parse_with_reason() {
+        let parser = parser();
+        for transcript in [
+            "shamash play dracula by tame impala",
+            "bot play despacito",
+            "no wake word here",
+            "shamash play",
+            "  ",
+        ] {
+            assert_eq!(
+                parser.parse(transcript),
+                parser.parse_with_reason(transcript).ok()
+            );
+        }
+    }
+
+    #[test]
+    fn exposes_configured_wake_words() {
+        let parser = parser();
+        let words = parser.wake_words();
+        assert!(words.contains("shamash"));
+        assert!(words.contains("bot"));
     }
 }

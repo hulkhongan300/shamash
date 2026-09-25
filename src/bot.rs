@@ -18,6 +18,8 @@ use std::sync::Arc;
 pub async fn start(config: Config) -> anyhow::Result<()> {
     let transcriber: Arc<dyn Transcriber> =
         Arc::new(WhisperTranscriber::new(&config.whisper_model, 4)?);
+    log_configuration(&config);
+
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
     let mut client = Client::builder(&config.discord_token, intents)
         .event_handler(Handler)
@@ -28,6 +30,30 @@ pub async fn start(config: Config) -> anyhow::Result<()> {
         .await?;
     client.start().await?;
     Ok(())
+}
+
+/// Prints the loaded settings so a misconfigured run is obvious at a glance.
+fn log_configuration(config: &Config) {
+    let mut wake_words: Vec<&str> = config.wake_words.iter().map(String::as_str).collect();
+    wake_words.sort_unstable();
+    println!("Shamash starting up");
+    println!("  whisper model: {}", config.whisper_model);
+    println!("  wake words:    {}", wake_words.join(", "));
+    println!("  voice channel: {}", config.voice_channel_id);
+    match config.alert_channel_id {
+        Some(id) => println!("  alert channel: {id}"),
+        None => println!("  alert channel: auto (system channel, else first text channel)"),
+    }
+    match std::process::Command::new("yt-dlp")
+        .arg("--version")
+        .output()
+    {
+        Ok(output) => println!(
+            "  yt-dlp:        {}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        ),
+        Err(_) => println!("  yt-dlp:        NOT FOUND; playback will fail"),
+    }
 }
 
 pub struct Handler;

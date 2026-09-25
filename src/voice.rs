@@ -86,6 +86,9 @@ impl VoiceService {
 
         let ctx = ctx.clone();
         let config = self.config.clone();
+        let mut wake_words: Vec<&str> = config.wake_words.iter().map(String::as_str).collect();
+        wake_words.sort_unstable();
+        println!("Listening in {channel} for: {}", wake_words.join(", "));
         tokio::spawn(run_listener(rx, {
             let pipeline = pipeline.clone();
             let ctx = ctx.clone();
