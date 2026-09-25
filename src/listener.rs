@@ -83,6 +83,7 @@ pub struct VoiceTickHandler {
 #[derive(Debug)]
 struct TickDiag {
     since: Instant,
+    ticks: u64,
     frames: u64,
     peak: f32,
     frame_len: usize,
@@ -95,6 +96,7 @@ impl VoiceTickHandler {
             .filter(|v| !v.is_empty() && v != "0")
             .map(|_| TickDiag {
                 since: Instant::now(),
+                ticks: 0,
                 frames: 0,
                 peak: 0.0,
                 frame_len: 0,
@@ -105,13 +107,15 @@ impl VoiceTickHandler {
         }
     }
 
-    /// Records one tick and prints a periodic level report when `VOICE_DIAG`
-    /// is set.
+    /// Records one voice tick and prints a periodic report when `VOICE_DIAG` is
+    /// set.
     ///
-    /// "Is any audio arriving at all" is otherwise unanswerable from the
-    /// outside: a muted user, a deafened bot and a gate set above the room all
-    /// look identical from outside, because none of them print anything. This
-    /// line separates them, at the cost of one mutex per 20 ms tick.
+    /// The report is driven by ticks, not by audio, and that is the whole
+    /// point: reporting only when frames arrive cannot distinguish a bot that
+    /// receives nothing from one that receives silence, and those are exactly
+    /// the two cases worth telling apart. A tick count of zero means the voice
+    /// connection is not up; ticks with no frames means nothing is speaking or
+    /// nothing is being decoded.
     fn record(&self, mixed: &[f32]) {
         let Ok(mut diag) = self.diag.lock() else {
             return;
@@ -119,6 +123,7 @@ impl VoiceTickHandler {
         let Some(diag) = diag.as_mut() else {
             return;
         };
+        diag.ticks += 1;
         if !mixed.is_empty() {
             diag.frames += 1;
             diag.frame_len = mixed.len();
@@ -128,16 +133,33 @@ impl VoiceTickHandler {
         if elapsed < Duration::from_secs(5) {
             return;
         }
-        let rate = diag.frames as f32 / elapsed.as_secs_f32();
+        let seconds = elapsed.as_secs_f32();
         println!(
-            "voice diag: {} frames in {:.0}s ({rate:.0}/s), {}/frame, peak rms {:.4} ({:.1} dBFS) vs gate {VAD_RMS_THRESHOLD:.4}",
-            diag.frames,
-            elapsed.as_secs_f32(),
-            diag.frame_len,
-            diag.peak,
-            to_dbfs(diag.peak),
+            "voice diag: {ticks} ticks and {frames} audio frames in {seconds:.0}s \
+             ({frame_rate:.0} frames/s), {frame_len}/frame, peak rms {peak:.4} \
+             ({peak_db:.1} dBFS) vs gate {VAD_RMS_THRESHOLD:.4}",
+            ticks = diag.ticks,
+            frames = diag.frames,
+            frame_rate = diag.frames as f32 / seconds,
+            frame_len = diag.frame_len,
+            peak = diag.peak,
+            peak_db = to_dbfs(diag.peak),
         );
+        if diag.ticks == 0 {
+            println!(
+                "  no voice ticks at all: the call is not connected to Discord's voice server"
+            );
+        } else if diag.frames == 0 {
+            println!(
+                "  ticks are arriving but carry no audio: nobody is speaking, or the decoder is idle"
+            );
+        } else if diag.peak < VAD_RMS_THRESHOLD {
+            println!(
+                "  audio is arriving below the gate: raise the microphone gain or lower VAD_RMS_THRESHOLD"
+            );
+        }
         diag.since = Instant::now();
+        diag.ticks = 0;
         diag.frames = 0;
         diag.peak = 0.0;
     }
@@ -157,9 +179,9 @@ impl EventHandler for VoiceTickHandler {
                 .values()
                 .filter_map(|data| data.decoded_voice.as_deref())
                 .collect();
-            if !frames.is_empty() {
-                let mixed = mix_frames(&frames);
-                self.record(&mixed);
+            let mixed = mix_frames(&frames);
+            self.record(&mixed);
+            if !mixed.is_empty() {
                 let _ = self.tx.send(mixed);
             }
         }
