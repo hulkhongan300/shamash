@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::parser::PlayRequest;
+use crate::search;
 use anyhow::Context;
 use serenity::model::channel::ChannelType;
 use serenity::model::id::{ChannelId, GuildId};
@@ -15,9 +16,9 @@ pub struct Player {
 }
 
 impl Player {
-    /// Looks the query up on YouTube and plays the best audio match, replacing
-    /// whatever is currently playing. Confirmation is posted to the alert
-    /// channel when one is available.
+    /// Searches YouTube for the most popular song matching the request and
+    /// plays it, replacing whatever is currently playing. Confirmation is
+    /// posted to the alert channel when one is available.
     pub async fn play(
         &self,
         ctx: &SerenityContext,
@@ -29,21 +30,26 @@ impl Player {
             .manager
             .get(guild_id)
             .context("bot is not in a voice channel")?;
-        let input = Input::Lazy(Box::new(YoutubeDl::new_search(
-            self.http.clone(),
-            request.query.clone(),
-        )));
+        let match_ = search::most_popular_song(&request.query, search::DEFAULT_CANDIDATES)
+            .await
+            .with_context(|| format!("no match for '{}'", request.query))?;
+        let views = match match_.view_count {
+            Some(views) => format!("{views} views"),
+            None => "unknown views".to_string(),
+        };
+        let summary = format!(
+            "Now playing \u{201c}{}\u{201d} by {} ({views})",
+            match_.title(),
+            match_.channel()
+        );
+        println!("[{guild_id}] {summary}");
+
+        let input = Input::Lazy(Box::new(YoutubeDl::new(self.http.clone(), match_.url)));
         {
             let mut handler = call.lock().await;
             handler.stop();
             handler.play_input(input);
         }
-
-        let summary = match (request.title.as_deref(), request.artist.as_deref()) {
-            (Some(title), Some(artist)) => format!("Playing {title} by {artist}."),
-            _ => format!("Searching YouTube for \u{201c}{}\u{201d}.", request.query),
-        };
-        println!("[{guild_id}] {summary}");
 
         if let Some(channel) = resolve_alert_channel(ctx, config, guild_id)
             && let Err(e) = channel.say(&ctx.http, &summary).await

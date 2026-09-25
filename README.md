@@ -24,6 +24,9 @@ yt-dlp search + download ──► songbird playback (ffmpeg decode)
 
 - **Autonomous joins**: joins when a user enters the configured channel, leaves
   when it is empty.
+- **Picks the popular song**: a request searches YouTube and plays the
+  most-viewed result that looks like a real song — clips, covers, remixes,
+  lyric videos, and long mixes are skipped.
 - **Local speech-to-text**: Whisper runs on your machine, no audio leaves the
   host.
 - **Minimal dependencies**: `serenity` + `songbird` + `whisper-rs` as crates
