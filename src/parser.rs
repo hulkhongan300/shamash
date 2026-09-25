@@ -15,6 +15,9 @@ pub struct PlayRequest {
 /// cannot match everyday speech ("not", "boy", "hot").
 const EXACT_MATCH_MAX_LEN: usize = 4;
 
+/// The command word that turns a phrase into a play request.
+const PLAY_VERB: &str = "play";
+
 /// Single-character mistakes tolerated in longer wake words.
 ///
 /// Speech-to-text reliably mangles a proper name — "shamash" can come back as
@@ -22,6 +25,38 @@ const EXACT_MATCH_MAX_LEN: usize = 4;
 /// broken, so one edit is allowed on words long enough that a near match is
 /// still unlikely to be an ordinary word.
 const FUZZY_MAX_EDITS: usize = 1;
+
+/// Whether `c` is one of the five plain vowels, which is where speech-to-text
+/// substitutes when it mishears a short word ("bot" becomes "but").
+fn is_vowel(c: char) -> bool {
+    matches!(c, 'a' | 'e' | 'i' | 'o' | 'u')
+}
+
+/// Whether two words differ only by one vowel, which is the specific damage
+/// speech-to-text does to a short wake word: "bot" comes back as "but" often
+/// enough that rejecting it makes the bot feel deaf, yet "not", "boy", "hot"
+/// and "top" all differ in a consonant and stay rejected.
+fn differs_by_one_vowel(left: &str, right: &str) -> bool {
+    let mut left = left.chars();
+    let mut right = right.chars();
+    let mut differences = 0;
+
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return differences == 1,
+            (Some(l), Some(r)) => {
+                if l != r {
+                    let both_vowels = is_vowel(l) && is_vowel(r);
+                    if !both_vowels {
+                        return false;
+                    }
+                    differences += 1;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
 
 /// Levenshtein distance between two words, used for wake-word matching.
 fn edit_distance(left: &str, right: &str) -> usize {
@@ -88,10 +123,12 @@ impl CommandParser {
     /// Whether `word` is one of the configured wake words.
     ///
     /// Long wake words tolerate a single character of speech-to-text damage;
-    /// short ones must match exactly to avoid firing on ordinary speech.
+    /// short ones must match exactly, apart from a single swapped vowel, to
+    /// avoid firing on ordinary speech.
     pub fn is_wake_word(&self, word: &str) -> bool {
         self.wake_words.iter().any(|wake| {
             word == wake
+                || differs_by_one_vowel(word, wake)
                 || (wake.chars().count() > EXACT_MATCH_MAX_LEN
                     && edit_distance(word, wake) <= FUZZY_MAX_EDITS)
         })
@@ -99,6 +136,8 @@ impl CommandParser {
 
     /// Requires a wake word followed by "play <something>".
     ///
+    /// "play" doubles as its own wake word when it is configured as one, so
+    /// "play <query>" works on its own while "bot play <query>" still does.
     /// Recognizes "play <title> by <artist>" (the artist gets the search bias)
     /// and falls back to the raw text after "play" as the query.
     pub fn parse(&self, transcript: &str) -> Option<PlayRequest> {
@@ -114,29 +153,49 @@ impl CommandParser {
             .iter()
             .position(|w| self.is_wake_word(w))
             .ok_or(ParseMiss::NoWakeWord)?;
-        let play_at = words[wake_idx + 1..]
-            .iter()
-            .position(|w| *w == "play")
-            .map(|offset| wake_idx + 1 + offset)
-            .ok_or(ParseMiss::NoPlayVerb)?;
-
-        let rest = words[play_at + 1..].join(" ");
-        if rest.is_empty() {
-            return Err(ParseMiss::EmptyRequest);
-        }
-
-        let (title, artist) = split_artist(&rest);
-        let query = match (&title, &artist) {
-            (Some(title), Some(artist)) => format!("{title} by {artist}"),
-            _ => rest,
+        let play_at = if words[wake_idx] == PLAY_VERB {
+            wake_idx
+        } else {
+            words[wake_idx + 1..]
+                .iter()
+                .position(|w| *w == PLAY_VERB)
+                .map(|offset| wake_idx + 1 + offset)
+                .ok_or(ParseMiss::NoPlayVerb)?
         };
 
-        Ok(PlayRequest {
-            query,
-            title,
-            artist,
-        })
+        let rest = words[play_at + 1..].join(" ");
+        build_request(&rest).ok_or(ParseMiss::EmptyRequest)
     }
+
+    /// Builds a request from text spoken after a "play" that was already heard.
+    ///
+    /// A natural pause inside a command splits one sentence across two
+    /// utterances — "bot play", pause, "lofi hip hop" — and the second half
+    /// arrives with no wake word in it. This turns that trailing half into the
+    /// request the first half was waiting for.
+    pub fn request_from_query(&self, text: &str) -> Option<PlayRequest> {
+        build_request(&normalize(text))
+    }
+}
+
+/// Turns the text after "play" into a request, or `None` if there is none.
+fn build_request(rest: &str) -> Option<PlayRequest> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+
+    let (title, artist) = split_artist(rest);
+    let query = match (&title, &artist) {
+        (Some(title), Some(artist)) => format!("{title} by {artist}"),
+        _ => rest.to_string(),
+    };
+
+    Some(PlayRequest {
+        query,
+        title,
+        artist,
+    })
 }
 
 /// Lowercases and strips punctuation, collapsing whitespace.
@@ -168,6 +227,67 @@ mod tests {
 
     fn parser() -> CommandParser {
         CommandParser::new(["shamash", "bot"].into_iter().map(str::to_string))
+    }
+
+    /// A parser configured the way the shipped defaults are, with "play"
+    /// acting as a wake word of its own.
+    fn parser_with_play_wake_word() -> CommandParser {
+        CommandParser::new(["bot", "play"].into_iter().map(str::to_string))
+    }
+
+    /// A parser configured the way the shipped defaults are, including the
+    /// clipped "ut" and "ot" forms of "bot".
+    fn parser_with_short_wake_words() -> CommandParser {
+        CommandParser::new(["bot", "play", "ut", "ot"].into_iter().map(str::to_string))
+    }
+
+    #[test]
+    fn hears_a_wake_word_that_lost_its_first_letter() {
+        for heard in [
+            "ut play despacito",
+            "ot play despacito",
+            "bot play despacito",
+        ] {
+            let req = parser_with_short_wake_words()
+                .parse(heard)
+                .unwrap_or_else(|| panic!("{heard:?} should have been heard"));
+            assert_eq!(req.query, "despacito", "for {heard:?}");
+        }
+    }
+
+    #[test]
+    fn a_clipped_wake_word_is_not_invented_when_not_configured() {
+        let bot_only = CommandParser::new(["bot".to_string()]);
+        assert_eq!(
+            bot_only.parse_with_reason("ut play despacito"),
+            Err(ParseMiss::NoWakeWord)
+        );
+    }
+
+    #[test]
+    fn play_alone_is_a_whole_command_when_it_is_a_wake_word() {
+        let req = parser_with_play_wake_word()
+            .parse("play dracula by tame impala")
+            .unwrap();
+        assert_eq!(req.query, "dracula by tame impala");
+        assert_eq!(req.title.as_deref(), Some("dracula"));
+        assert_eq!(req.artist.as_deref(), Some("tame impala"));
+    }
+
+    #[test]
+    fn play_keeps_working_after_another_wake_word() {
+        let req = parser_with_play_wake_word()
+            .parse("bot play despacito")
+            .unwrap();
+        assert_eq!(req.query, "despacito");
+    }
+
+    #[test]
+    fn a_lone_play_wake_word_still_needs_a_query() {
+        assert_eq!(
+            parser_with_play_wake_word().parse_with_reason("play"),
+            Err(ParseMiss::EmptyRequest)
+        );
     }
 
     #[test]
@@ -312,6 +432,51 @@ mod tests {
                 "should reject {heard:?}"
             );
         }
+    }
+
+    #[test]
+    fn short_wake_word_tolerates_one_swapped_vowel() {
+        let parser = parser();
+        for heard in [
+            "but play despacito",
+            "Bot play despacito",
+            "bat play despacito",
+            "but play despacito",
+        ] {
+            let req = parser.parse(heard).unwrap_or_else(|| panic!("{heard:?}"));
+            assert_eq!(req.query, "despacito", "for {heard:?}");
+        }
+    }
+
+    #[test]
+    fn vowel_substitution_needs_a_single_vowel_difference() {
+        assert!(differs_by_one_vowel("but", "bot"));
+        assert!(differs_by_one_vowel("shamash", "shomash"));
+        assert!(!differs_by_one_vowel("bot", "bot"));
+        assert!(!differs_by_one_vowel("not", "bot"));
+        assert!(!differs_by_one_vowel("boy", "bot"));
+        assert!(!differs_by_one_vowel("hot", "bot"));
+        assert!(!differs_by_one_vowel("but", "bots"));
+        assert!(!differs_by_one_vowel("but", "bu"));
+    }
+
+    #[test]
+    fn builds_a_request_from_the_half_that_followed_a_pause() {
+        let parser = parser();
+        let req = parser.request_from_query("Lo-fi hip hop.").unwrap();
+        assert_eq!(req.query, "lofi hip hop");
+
+        let req = parser.request_from_query("Dracula by Tame Impala").unwrap();
+        assert_eq!(req.query, "dracula by tame impala");
+        assert_eq!(req.title.as_deref(), Some("dracula"));
+        assert_eq!(req.artist.as_deref(), Some("tame impala"));
+    }
+
+    #[test]
+    fn a_pause_with_nothing_after_it_is_not_a_request() {
+        let parser = parser();
+        assert!(parser.request_from_query("   ").is_none());
+        assert!(parser.request_from_query("").is_none());
     }
 
     #[test]
