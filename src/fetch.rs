@@ -14,7 +14,9 @@
 //! stream downloaded and transcoded to WAV.
 
 use anyhow::{Context, bail};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tokio::process::Command;
 
 /// Audio formats to try, best first.
@@ -63,21 +65,46 @@ pub async fn fetch(url: &str, dir: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
+/// The yt-dlp arguments used for every download.
+///
+/// `--force-overwrites` is the important one. yt-dlp's default is
+/// `--no-force-overwrites`, and with a fixed output path that means a video
+/// whose file is already there is *skipped*: yt-dlp prints the path, exits 0,
+/// and writes nothing. Every request after the first therefore replayed the
+/// first song, because the check that the file existed and was not empty could
+/// not tell a fresh download from a skipped one.
+///
+/// `--no-part` is deliberately absent. It makes yt-dlp write straight to the
+/// output, which either truncates the file a playing track is reading or tries
+/// to resume it and fails. With the default `.part` file the new audio is
+/// renamed into place, so the track that is playing keeps the old inode and the
+/// next one opens the new file.
+fn download_args(url: &str, dir: &Path, format: &str) -> Vec<OsString> {
+    [
+        "--no-playlist",
+        "--no-warnings",
+        "--no-simulate",
+        "--force-overwrites",
+    ]
+    .iter()
+    .map(OsString::from)
+    .chain([
+        OsString::from("--format"),
+        OsString::from(format),
+        OsString::from("--output"),
+        dir.join("track.%(ext)s").into_os_string(),
+        OsString::from("--print"),
+        OsString::from("after_move:filepath"),
+        OsString::from(url),
+    ])
+    .collect()
+}
+
 /// Downloads one format into `dir` and returns the path yt-dlp wrote.
 async fn download(url: &str, dir: &Path, format: &str) -> anyhow::Result<PathBuf> {
+    let started = SystemTime::now();
     let output = Command::new("yt-dlp")
-        .args([
-            "--no-playlist",
-            "--no-warnings",
-            "--no-simulate",
-            "--no-part",
-        ])
-        .args(["--format", format])
-        .arg("--output")
-        .arg(dir.join("track.%(ext)s"))
-        .arg("--print")
-        .arg("after_move:filepath")
-        .arg(url)
+        .args(download_args(url, dir, format))
         .output()
         .await
         .with_context(|| format!("could not run yt-dlp to fetch {url}"))?;
@@ -98,11 +125,24 @@ async fn download(url: &str, dir: &Path, format: &str) -> anyhow::Result<PathBuf
         .map(PathBuf::from)
         .context("yt-dlp reported no downloaded file")?;
 
-    let size = tokio::fs::metadata(&path)
+    let metadata = tokio::fs::metadata(&path)
         .await
-        .with_context(|| format!("yt-dlp reported {} but it is not there", path.display()))?
-        .len();
-    anyhow::ensure!(size > 0, "yt-dlp downloaded an empty {}", path.display());
+        .with_context(|| format!("yt-dlp reported {} but it is not there", path.display()))?;
+    anyhow::ensure!(
+        metadata.len() > 0,
+        "yt-dlp downloaded an empty {}",
+        path.display()
+    );
+
+    // A download that never touched the file is the failure that made every
+    // request replay the previous song, so it is caught here rather than
+    // handed to the player as if it were new audio.
+    let written = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    anyhow::ensure!(
+        written >= started,
+        "yt-dlp left {} untouched, so it is a leftover from an earlier request",
+        path.display()
+    );
 
     Ok(path)
 }
@@ -155,6 +195,33 @@ mod tests {
                 "selector branch is not audio-only: {branch}"
             );
         }
+    }
+
+    #[test]
+    fn each_download_forces_a_real_one() {
+        // The failure this prevents: yt-dlp's default skips a download whose
+        // output file already exists, printing the path and exiting 0. The
+        // player could not tell that from a fresh download, so every request
+        // after the first replayed the first song.
+        let args: Vec<String> = download_args(
+            "https://youtu.be/abc",
+            Path::new("/tmp/shamash-1"),
+            DECODABLE_FORMAT,
+        )
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+        assert!(
+            args.iter().any(|a| a == "--force-overwrites"),
+            "a stale file would be replayed: {args:?}"
+        );
+        // Writing straight to the output would truncate the file a playing
+        // track is reading, so the default `.part` file must be left alone.
+        assert!(
+            !args.iter().any(|a| a == "--no-part"),
+            "the output must be renamed into place, not written in place: {args:?}"
+        );
+        assert_eq!(args.last().unwrap(), "https://youtu.be/abc");
     }
 
     #[test]
