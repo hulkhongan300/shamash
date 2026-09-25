@@ -1,7 +1,9 @@
-use crate::audio::VadBuffer;
+use crate::audio::{VadBuffer, rms};
 use serenity::async_trait;
 use songbird::EventHandler;
 use songbird::events::{CoreEvent, Event, EventContext};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// Sample rate (Hz) of the mono audio stream the listener consumes.
@@ -74,12 +76,76 @@ pub fn mix_frames(frames: &[&[i16]]) -> Vec<f32> {
 #[derive(Debug)]
 pub struct VoiceTickHandler {
     tx: UnboundedSender<Vec<f32>>,
+    diag: Mutex<Option<TickDiag>>,
+}
+
+/// Rolling counters behind the `VOICE_DIAG` report.
+#[derive(Debug)]
+struct TickDiag {
+    since: Instant,
+    frames: u64,
+    peak: f32,
+    frame_len: usize,
 }
 
 impl VoiceTickHandler {
     pub fn new(tx: UnboundedSender<Vec<f32>>) -> Self {
-        Self { tx }
+        let diag = std::env::var("VOICE_DIAG")
+            .ok()
+            .filter(|v| !v.is_empty() && v != "0")
+            .map(|_| TickDiag {
+                since: Instant::now(),
+                frames: 0,
+                peak: 0.0,
+                frame_len: 0,
+            });
+        Self {
+            tx,
+            diag: Mutex::new(diag),
+        }
     }
+
+    /// Records one tick and prints a periodic level report when `VOICE_DIAG`
+    /// is set.
+    ///
+    /// "Is any audio arriving at all" is otherwise unanswerable from the
+    /// outside: a muted user, a deafened bot and a gate set above the room all
+    /// look identical from outside, because none of them print anything. This
+    /// line separates them, at the cost of one mutex per 20 ms tick.
+    fn record(&self, mixed: &[f32]) {
+        let Ok(mut diag) = self.diag.lock() else {
+            return;
+        };
+        let Some(diag) = diag.as_mut() else {
+            return;
+        };
+        if !mixed.is_empty() {
+            diag.frames += 1;
+            diag.frame_len = mixed.len();
+            diag.peak = diag.peak.max(rms(mixed));
+        }
+        let elapsed = diag.since.elapsed();
+        if elapsed < Duration::from_secs(5) {
+            return;
+        }
+        let rate = diag.frames as f32 / elapsed.as_secs_f32();
+        println!(
+            "voice diag: {} frames in {:.0}s ({rate:.0}/s), {}/frame, peak rms {:.4} ({:.1} dBFS) vs gate {VAD_RMS_THRESHOLD:.4}",
+            diag.frames,
+            elapsed.as_secs_f32(),
+            diag.frame_len,
+            diag.peak,
+            to_dbfs(diag.peak),
+        );
+        diag.since = Instant::now();
+        diag.frames = 0;
+        diag.peak = 0.0;
+    }
+}
+
+/// Full-scale decibel level of a linear amplitude.
+fn to_dbfs(amplitude: f32) -> f32 {
+    20.0 * amplitude.max(1e-9).log10()
 }
 
 #[async_trait]
@@ -92,7 +158,9 @@ impl EventHandler for VoiceTickHandler {
                 .filter_map(|data| data.decoded_voice.as_deref())
                 .collect();
             if !frames.is_empty() {
-                let _ = self.tx.send(mix_frames(&frames));
+                let mixed = mix_frames(&frames);
+                self.record(&mixed);
+                let _ = self.tx.send(mixed);
             }
         }
         Some(CoreEvent::VoiceTick.into())
