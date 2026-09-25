@@ -3,7 +3,7 @@ use crate::listener::{VoiceTickHandler, run_listener};
 use crate::parser::CommandParser;
 use crate::pipeline::ListenerPipeline;
 use crate::player::Player;
-use crate::state::{ConfigKey, HttpClientKey, TranscriberKey};
+use crate::state::{ConfigKey, TranscriberKey};
 use anyhow::Context;
 use serenity::model::id::{ChannelId, GuildId};
 use serenity::prelude::Context as SerenityContext;
@@ -13,6 +13,11 @@ use songbird::events::CoreEvent;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// How many times a join is attempted before the failure is reported.
+const JOIN_ATTEMPTS: usize = 3;
+/// Pause between join attempts.
+const JOIN_RETRY_DELAY: Duration = Duration::from_secs(3);
 
 /// Builds the songbird driver config that decodes incoming voice to mono
 /// 16 kHz PCM, the format Whisper expects.
@@ -96,24 +101,17 @@ impl VoiceService {
             );
         }
 
-        let (transcriber, http) = {
+        let transcriber = {
             let data = ctx.data.read().await;
-            let transcriber = data
-                .get::<TranscriberKey>()
+            data.get::<TranscriberKey>()
                 .cloned()
-                .context("transcriber not present in type map")?;
-            let http = data
-                .get::<HttpClientKey>()
-                .cloned()
-                .context("http client not present in type map")?;
-            (transcriber, http)
+                .context("transcriber not present in type map")?
         };
         let pipeline = Arc::new(ListenerPipeline::new(
             transcriber,
             CommandParser::new(self.config.wake_words.clone()),
             Arc::new(Player {
                 manager: self.manager.clone(),
-                http,
             }),
         ));
 
@@ -179,10 +177,36 @@ impl VoiceService {
                     .map_err(|e| anyhow::anyhow!("failed to leave voice channel: {e}"))?;
             }
         } else if !connected_to_target {
-            self.join_and_listen(ctx, guild_id, target).await?;
+            self.join_with_retry(ctx, guild_id, target).await?;
             println!("Joined voice channel {target}");
         }
         Ok(())
+    }
+
+    /// Joins `channel`, retrying a few times before giving up.
+    ///
+    /// Discord's gateway sometimes takes longer than songbird's 10 s timeout to
+    /// answer, and one such timeout used to leave the bot outside the channel
+    /// for good: it only ever joins in response to a voice state change, so a
+    /// user already sitting in the channel would never trigger another attempt.
+    async fn join_with_retry(
+        &self,
+        ctx: &SerenityContext,
+        guild_id: GuildId,
+        channel: ChannelId,
+    ) -> anyhow::Result<()> {
+        let mut last = None;
+        for attempt in 1..=JOIN_ATTEMPTS {
+            match self.join_and_listen(ctx, guild_id, channel).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    println!("join attempt {attempt} of {JOIN_ATTEMPTS} failed: {e:#}");
+                    last = Some(e);
+                    tokio::time::sleep(JOIN_RETRY_DELAY).await;
+                }
+            }
+        }
+        Err(last.expect("at least one join attempt is always made"))
     }
 
     /// Stops playback and removes the bot from the guild's voice channel.

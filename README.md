@@ -15,7 +15,7 @@ Discord voice (Opus @ 48 kHz) ──► songbird receive
         ▼
 Resampler (48 kHz → 16 kHz) ──► VAD buffer (flushes on silence)
         ▼
-Whisper (local, via whisper-rs) → transcript
+Parakeet (local, via the Handy app) → transcript
         ▼
 Parser: wake word + "play <title> by <artist>" → search query
         ▼
@@ -27,16 +27,18 @@ yt-dlp search + download ──► songbird playback (ffmpeg decode)
 - **Picks the popular song**: a request searches YouTube and plays the
   most-viewed result that looks like a real song — clips, covers, remixes,
   lyric videos, and long mixes are skipped.
-- **Local speech-to-text**: Whisper runs on your machine, no audio leaves the
-  host.
+- **Local speech-to-text**: transcription runs on your machine, no audio leaves
+  the host.
 - **Minimal dependencies**: `serenity` + `songbird` + `whisper-rs` as crates
-  (+ `dotenvy` for `.env` loading); `yt-dlp` + `ffmpeg` as the only system
-  tools for the music pipeline.
+  (+ `dotenvy` for `.env` loading); the Handy app (or `yt-dlp` + `ffmpeg` for
+  the music pipeline) as the only system tools.
 
 ## Prerequisites
 
 - Rust (edition 2024)
 - System packages: `ffmpeg`, `yt-dlp`, `libopus-dev`, `pkg-config`, `cmake`
+- The [Handy](https://github.com/cjpais/Handy) app for the default
+  speech-to-text engine (it owns the Parakeet model and picks the GPU backend)
 - A Discord application with a bot token (enable voice gateway intents)
 
 ## Setup
@@ -51,14 +53,17 @@ Then create a gitignored `.env` next to the binary with your own values:
 cat > .env <<'EOF'
 DISCORD_TOKEN=your-bot-token
 VOICE_CHANNEL_ID=your-voice-channel-id
-WAKE_WORDS=bot
-WHISPER_MODEL=data/model.bin
 EOF
 ```
 
-The model download takes a minute or so. `scripts/setup.sh` defaults to
-`base.en-q5_1` (great low-power balance); pass any of `tiny.en tiny base.en
-base small.en small` (optionally `-q5_1`/`-q8_0` variants) to pick another.
+Speech-to-text defaults to the Handy app with its Parakeet model, so there is
+nothing else to download. To fall back to the bundled Whisper instead, run
+`scripts/setup.sh` (downloads a model to `data/model.bin`) and set
+`ASR_ENGINE=whisper`.
+
+`scripts/setup.sh` defaults to `base.en-q5_1`; pass any of `tiny.en tiny
+base.en base small.en small` (optionally `-q5_1`/`-q8_0` variants) to pick
+another.
 
 ### Environment variables
 
@@ -66,18 +71,21 @@ base small.en small` (optionally `-q5_1`/`-q8_0` variants) to pick another.
 | ----------------- | -------- | -------------------------------------------------- |
 | `DISCORD_TOKEN`   | yes      | Bot token from the Discord developer portal        |
 | `VOICE_CHANNEL_ID`| yes      | ID of the voice channel the bot watches and joins  |
+| `ASR_ENGINE`      | no       | `handy` (default, Parakeet) or `whisper` (bundled) |
+| `PARAKEET_MODEL`  | no       | Handy model id; the repo's Parakeet Q8_0 model by default |
 | `WHISPER_MODEL`   | no       | Path to a Whisper model file (default `data/model.bin`) |
-| `WAKE_WORDS`      | no       | Comma-separated wake words (default `bot`) |
+| `WAKE_WORDS`      | no       | Comma-separated wake words (default `bot,play,ut,ot`) |
 | `ALERT_CHANNEL_ID`| no       | Text channel for play confirmations (defaults to the server's system channel, then to the first text channel) |
 
 Secrets live in a gitignored `.env` file next to the binary, loaded through
 [`dotenvy`](https://crates.io/crates/dotenvy). Real environment variables take
 precedence over the file.
 
-The default wake word is "bot". Wake words longer than four letters tolerate one
-misheard character, so a longer custom word like "shamash" would still answer to
-"shemash" and "shammash". Shorter ones such as "bot" must be heard exactly,
-otherwise ordinary speech ("not", "boy") would trigger the bot.
+Wake words longer than four letters tolerate one misheard character, so a
+custom word like "shamash" would still answer to "shemash" and "shammash".
+Shorter ones must be heard exactly, otherwise ordinary speech ("not", "boy")
+would trigger the bot — which is why "ut" and "ot" are listed alongside "bot":
+speech-to-text often drops the first consonant of a short word.
 
 ## Run
 

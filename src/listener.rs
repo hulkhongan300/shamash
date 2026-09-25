@@ -1,7 +1,7 @@
 use crate::audio::{VadBuffer, rms};
 use serenity::async_trait;
 use songbird::EventHandler;
-use songbird::events::{CoreEvent, Event, EventContext};
+use songbird::events::{Event, EventContext};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -20,8 +20,13 @@ pub const FRAME_SAMPLES: usize = 320;
 /// `cargo run --release --example transcribe -- recording.wav`, which prints
 /// the peak frame level against this gate.
 pub const VAD_RMS_THRESHOLD: f32 = 0.02;
-/// Silence frames that end an utterance: 15 x 20 ms = 300 ms.
-pub const VAD_GAP_FRAMES: usize = 15;
+/// Silence frames that end an utterance: 25 x 20 ms = 500 ms.
+///
+/// Speaking "bot play lofi hip hop" leaves a short pause before the title, and
+/// a 300 ms gap cut the command in half, sending "play" and the search terms to
+/// two different transcriptions. 500 ms survives a mid-sentence pause while
+/// still cutting the speaker off promptly once they stop.
+pub const VAD_GAP_FRAMES: usize = 25;
 /// Hard cap on one utterance: 600 x 20 ms = 12 s.
 pub const VAD_MAX_FRAMES: usize = 600;
 
@@ -29,6 +34,14 @@ pub const VAD_MAX_FRAMES: usize = 600;
 #[derive(Debug)]
 pub struct Listener {
     vad: VadBuffer,
+    /// Samples of a tick that did not divide evenly into `FRAME_SAMPLES`.
+    ///
+    /// Songbird fires a tick per timer interval and packs however many 20 ms
+    /// packets arrived into it, so a tick is 320 samples only while the
+    /// connection is quiet. While somebody transmits it is regularly 960 or
+    /// 1920 samples, and any remainder has to be carried into the next tick or
+    /// the frame boundaries drift out of alignment with the audio.
+    leftover: Vec<f32>,
 }
 
 impl Listener {
@@ -40,13 +53,34 @@ impl Listener {
                 VAD_GAP_FRAMES,
                 VAD_MAX_FRAMES,
             ),
+            leftover: Vec::new(),
         }
     }
 
     /// Feeds one 20 ms mono frame; returns a completed utterance, if any.
     pub fn push_frame(&mut self, samples: &[f32]) -> Option<Vec<f32>> {
-        let utterance = self.vad.push(samples);
-        (!utterance.is_empty()).then_some(utterance)
+        self.push_samples(samples)
+    }
+
+    /// Feeds however many samples one tick carried, splitting them into 20 ms
+    /// frames; returns a completed utterance, if any.
+    ///
+    /// A tick can hold any whole number of 20 ms packets, so the samples are
+    /// buffered until whole frames can be handed to the detector. Only the first
+    /// utterance of a tick is returned: the detector can only end one, and the
+    /// samples after it are the start of the next.
+    pub fn push_samples(&mut self, samples: &[f32]) -> Option<Vec<f32>> {
+        self.leftover.extend_from_slice(samples);
+        let mut completed = None;
+        while self.leftover.len() >= FRAME_SAMPLES {
+            let rest = self.leftover.split_off(FRAME_SAMPLES);
+            let frame = std::mem::replace(&mut self.leftover, rest);
+            let utterance = self.vad.push(&frame);
+            if completed.is_none() && !utterance.is_empty() {
+                completed = Some(utterance);
+            }
+        }
+        completed
     }
 }
 
@@ -87,6 +121,9 @@ struct TickDiag {
     frames: u64,
     peak: f32,
     frame_len: usize,
+    /// Whether the first-tick announcement has already been made. Reporting
+    /// resets the counters, so this cannot be inferred from `ticks` being zero.
+    announced: bool,
 }
 
 impl VoiceTickHandler {
@@ -113,7 +150,7 @@ impl VoiceTickHandler {
         let Some(diag) = diag.as_mut() else {
             return;
         };
-        if diag.ticks == 0 {
+        if diag.announce_first_tick() {
             println!("voice diag: first voice tick received");
         }
         let now = Instant::now();
@@ -135,11 +172,20 @@ impl TickDiag {
             frames: 0,
             peak: 0.0,
             frame_len: 0,
+            announced: false,
         }
     }
 
     /// Folds one tick into the counters. An empty frame is a tick that carried
     /// no audio.
+    /// Whether this is the first tick seen, so the arrival can be announced.
+    /// Reporting resets the counters, so the flag has to be its own field.
+    fn announce_first_tick(&mut self) -> bool {
+        let first = !self.announced;
+        self.announced = true;
+        first
+    }
+
     fn observe(&mut self, frame: &[f32]) {
         self.ticks += 1;
         if !frame.is_empty() {
@@ -188,7 +234,11 @@ impl TickDiag {
                  VAD_RMS_THRESHOLD",
             );
         }
+        // Counters restart, but the handler is still the same one, so the
+        // first-tick announcement must not be made a second time.
+        let announced = self.announced;
         *self = Self::new(now);
+        self.announced = announced;
         Some(report)
     }
 }
@@ -209,11 +259,31 @@ impl EventHandler for VoiceTickHandler {
                 .collect();
             let mixed = mix_frames(&frames);
             self.record(&mixed);
-            if !mixed.is_empty() {
-                let _ = self.tx.send(mixed);
-            }
+            let _ = self.tx.send(frame_for_tick(mixed));
         }
-        Some(CoreEvent::VoiceTick.into())
+        // Must stay `None`. Returning the same event type we were invoked with
+        // looks like a no-op but deletes the handler: songbird removes it from
+        // the list it is iterating, re-adds it to the store it just emptied,
+        // and then overwrites that store with the list minus the handler. The
+        // bot then receives exactly one tick and is deaf from then on, with no
+        // error anywhere. See `EventStore::process_untimed` in songbird, and
+        // the `EventHandler::act` contract: `None` maintains the event type.
+        None
+    }
+}
+
+/// The frame to hand to the voice detector for one tick.
+///
+/// Discord only sends audio while somebody is transmitting, so silence never
+/// arrives on its own. The detector ends an utterance on a run of quiet
+/// frames, and without them it never ends one: it waits for the 12 s length
+/// cap instead, which needs unbroken speech and so regularly never arrives. A
+/// tick with no audio therefore becomes an explicit silent frame.
+fn frame_for_tick(mixed: Vec<f32>) -> Vec<f32> {
+    if mixed.is_empty() {
+        vec![0.0; FRAME_SAMPLES]
+    } else {
+        mixed
     }
 }
 
@@ -223,7 +293,7 @@ impl EventHandler for VoiceTickHandler {
 pub async fn run_listener(mut rx: UnboundedReceiver<Vec<f32>>, on_utterance: impl Fn(Vec<f32>)) {
     let mut listener = Listener::new();
     while let Some(frame) = rx.recv().await {
-        if let Some(utterance) = listener.push_frame(&frame) {
+        if let Some(utterance) = listener.push_samples(&frame) {
             on_utterance(utterance);
         }
     }
@@ -242,6 +312,95 @@ mod tests {
     /// A 20 ms frame at 16 kHz at a normal speaking level.
     fn speech_frame() -> Vec<f32> {
         vec![0.2; FRAME_SAMPLES]
+    }
+
+    #[test]
+    fn a_tick_with_audio_forwards_that_audio() {
+        let audio = vec![0.25f32; FRAME_SAMPLES];
+        assert_eq!(frame_for_tick(audio.clone()), audio);
+    }
+
+    #[test]
+    fn a_multi_packet_tick_is_split_into_frames_instead_of_panicking() {
+        // The failure this prevents: a tick carrying six 20 ms packets reached
+        // the detector whole, and its frame length assertion took the process
+        // down. Only a single quiet tick is the same size as one frame.
+        let mut listener = Listener::new();
+        let tick = vec![0.2f32; FRAME_SAMPLES * 6];
+        assert!(listener.push_samples(&tick).is_none());
+
+        // 30 quiet frames close the 25 frame gap opened by that tick.
+        let mut ended = None;
+        for _ in 0..VAD_GAP_FRAMES {
+            ended = listener.push_samples(&frame_for_tick(Vec::new()));
+            if ended.is_some() {
+                break;
+            }
+        }
+        let utterance = ended.expect("utterance must survive a multi-packet tick");
+        assert_eq!(utterance.len(), FRAME_SAMPLES * 6);
+    }
+
+    #[test]
+    fn a_tick_whose_length_is_not_a_multiple_of_a_frame_is_reassembled() {
+        let mut listener = Listener::new();
+        // Two frames plus half a frame, split across two ticks.
+        let odd = FRAME_SAMPLES * 2 + FRAME_SAMPLES / 2;
+        assert!(listener.push_samples(&vec![0.2f32; odd]).is_none());
+        assert!(listener.push_samples(&vec![0.2f32; odd]).is_none());
+
+        let mut ended = None;
+        for _ in 0..VAD_GAP_FRAMES {
+            ended = listener.push_samples(&frame_for_tick(Vec::new()));
+            if ended.is_some() {
+                break;
+            }
+        }
+        // The two half frames pair up, so all 5 whole frames survive.
+        assert_eq!(ended.expect("utterance").len(), FRAME_SAMPLES * 5);
+    }
+
+    #[test]
+    fn a_tick_without_audio_forwards_silence_so_utterances_can_end() {
+        let frame = frame_for_tick(Vec::new());
+        assert_eq!(
+            frame.len(),
+            FRAME_SAMPLES,
+            "the detector needs a full frame"
+        );
+        assert!(
+            rms(&frame) < VAD_RMS_THRESHOLD,
+            "the substitute must read as silence to the detector"
+        );
+    }
+
+    #[test]
+    fn a_quieter_run_of_ticks_ends_an_utterance_that_audio_never_ended() {
+        // The failure this prevents: real audio arrives, Discord then goes
+        // quiet without sending silence, and no utterance is ever completed.
+        let mut listener = Listener::new();
+        for _ in 0..10 {
+            assert!(listener.push_frame(&speech_frame()).is_none());
+        }
+        for _ in 0..(VAD_GAP_FRAMES - 1) {
+            assert!(
+                listener.push_frame(&frame_for_tick(Vec::new())).is_none(),
+                "the gap must not close early"
+            );
+        }
+        let utterance = listener.push_frame(&frame_for_tick(Vec::new()));
+        assert_eq!(utterance.as_ref().map(Vec::len), Some(10 * FRAME_SAMPLES));
+    }
+
+    #[test]
+    fn the_first_tick_is_announced_only_once() {
+        let mut diag = TickDiag::new(Instant::now());
+        assert!(diag.announce_first_tick());
+        assert!(!diag.announce_first_tick());
+
+        // A report resets the counters, which must not repeat the announcement.
+        let _ = diag.report(Instant::now() + DIAG_INTERVAL, DIAG_INTERVAL);
+        assert!(!diag.announce_first_tick());
     }
 
     #[test]
@@ -352,7 +511,7 @@ mod tests {
         for _ in 0..5 {
             assert!(listener.push_frame(&loud).is_none());
         }
-        for _ in 0..14 {
+        for _ in 0..(VAD_GAP_FRAMES - 1) {
             assert!(listener.push_frame(&silent).is_none());
         }
         let utterance = listener.push_frame(&silent);
@@ -376,7 +535,7 @@ mod tests {
         for _ in 0..5 {
             let _ = tx.send(loud.clone());
         }
-        for _ in 0..16 {
+        for _ in 0..(VAD_GAP_FRAMES + 1) {
             let _ = tx.send(silent.clone());
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
