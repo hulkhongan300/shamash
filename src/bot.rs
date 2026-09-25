@@ -1,4 +1,5 @@
-use crate::config::Config;
+use crate::config::{AsrEngine, Config};
+use crate::parakeet::HandyTranscriber;
 use crate::state::{ConfigKey, HttpClientKey, TranscriberKey};
 use crate::transcriber::Transcriber;
 use crate::voice::{VoiceService, decode_config};
@@ -16,8 +17,10 @@ use songbird::SerenityInit;
 use std::sync::Arc;
 
 pub async fn start(config: Config) -> anyhow::Result<()> {
-    let transcriber: Arc<dyn Transcriber> =
-        Arc::new(WhisperTranscriber::new(&config.whisper_model, 4)?);
+    let transcriber: Arc<dyn Transcriber> = match config.asr_engine {
+        AsrEngine::Handy => Arc::new(HandyTranscriber::new(&config.parakeet_model)),
+        AsrEngine::Whisper => Arc::new(WhisperTranscriber::new(&config.whisper_model, 4)?),
+    };
     log_configuration(&config);
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
@@ -37,7 +40,16 @@ fn log_configuration(config: &Config) {
     let mut wake_words: Vec<&str> = config.wake_words.iter().map(String::as_str).collect();
     wake_words.sort_unstable();
     println!("Shamash starting up");
-    println!("  whisper model: {}", config.whisper_model);
+    match config.asr_engine {
+        AsrEngine::Handy => {
+            println!("  asr engine:    handy (parakeet)");
+            println!("  parakeet model: {}", config.parakeet_model);
+        }
+        AsrEngine::Whisper => {
+            println!("  asr engine:    whisper (bundled)");
+            println!("  whisper model: {}", config.whisper_model);
+        }
+    }
     println!("  wake words:    {}", wake_words.join(", "));
     println!("  voice channel: {}", config.voice_channel_id);
     match config.alert_channel_id {

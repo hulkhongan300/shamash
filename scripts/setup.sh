@@ -8,12 +8,20 @@
 #   scripts/setup.sh            # download the default model
 #   scripts/setup.sh small.en   # download a different model
 #
-# For quick "does it work" tests, base.en-q5_1 (the default) is a good
-# balance of accuracy, speed, and size. Cut to tiny.en for the absolute
-# lowest CPU usage; bump to small.en for better accuracy on song titles.
+# Every utterance is padded to whisper's 30 second context, so inference cost
+# barely depends on how long the speech is: a two second "play lofi" costs the
+# same as a long sentence. Measured on a 16 core CPU, per utterance:
+#
+#   base.en-q5_1 (default)   2.9 s    <- only one that feels instant
+#   small.en-q5_1            6.6 s
+#   large-v3-turbo-q5_0     27.6 s
+#
+# Bigger models transcribe marginally better on clean speech but are far slower,
+# so the default stays at base.en-q5_1. Use small.en-q5_1 if accuracy matters
+# more than the wait, and tiny.en for the lowest CPU usage.
 set -euo pipefail
 
-WHISPER_MODELS="tiny tiny-q5_1 tiny.en tiny.en-q5_1 base base-q5_1 base.en base.en-q5_1 small small-q5_1 small.en small.en-q5_1"
+WHISPER_MODELS="tiny tiny-q5_1 tiny.en tiny.en-q5_1 base base-q5_1 base.en base.en-q5_1 small small-q5_1 small.en small.en-q5_1 large-v3-turbo large-v3-turbo-q5_0 large-v3-turbo-q8_0"
 
 DEFAULT_MODEL="base.en-q5_1"
 MODEL="${1:-$DEFAULT_MODEL}"
