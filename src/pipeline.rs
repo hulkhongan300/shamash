@@ -22,9 +22,26 @@ pub struct ListenerPipeline {
     pub transcriber: Arc<dyn Transcriber>,
     pub parser: CommandParser,
     pub player: Arc<Player>,
+    /// Utterances that produced no words, reported once there is something
+    /// real to say. Background noise trips the voice detector often enough
+    /// that printing every one of them drowns out real commands.
+    muted_utterances: std::sync::atomic::AtomicUsize,
 }
 
 impl ListenerPipeline {
+    pub fn new(
+        transcriber: Arc<dyn Transcriber>,
+        parser: CommandParser,
+        player: Arc<Player>,
+    ) -> Self {
+        Self {
+            transcriber,
+            parser,
+            player,
+            muted_utterances: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
     /// Transcribes `utterance` off the blocking pool, then plays any request
     /// that matches the grammar. Failures are logged, never fatal.
     pub async fn handle_utterance(
@@ -48,11 +65,35 @@ impl ListenerPipeline {
                 }
             };
 
-        println!("[{guild_id}] user: {transcript}");
-        let Some(request) = self.parser.parse(&transcript) else {
-            println!("[{guild_id}] ignored (no play command)");
+        if transcript.trim().is_empty() {
+            self.muted_utterances
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
+        }
+        let skipped = self
+            .muted_utterances
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if skipped > 0 {
+            println!("[{guild_id}] heard: {transcript:?} (skipped {skipped} unintelligible)");
+        } else {
+            println!("[{guild_id}] heard: {transcript:?}");
+        }
+
+        let request = match self.parser.parse_with_reason(&transcript) {
+            Ok(request) => request,
+            Err(miss) => {
+                let wake_words = self
+                    .parser
+                    .wake_words()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("[{guild_id}] not a play command: {miss} (wake words: {wake_words})");
+                return;
+            }
         };
+        println!("[{guild_id}] play: {}", request.query);
         if let Err(e) = self.player.play(ctx, config, guild_id, &request).await {
             println!("[{guild_id}] playback failed: {e:#}");
         }

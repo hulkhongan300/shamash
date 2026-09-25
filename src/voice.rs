@@ -75,17 +75,20 @@ impl VoiceService {
                 .context("http client not present in type map")?;
             (transcriber, http)
         };
-        let pipeline = Arc::new(ListenerPipeline {
+        let pipeline = Arc::new(ListenerPipeline::new(
             transcriber,
-            parser: CommandParser::new(self.config.wake_words.clone()),
-            player: Arc::new(Player {
+            CommandParser::new(self.config.wake_words.clone()),
+            Arc::new(Player {
                 manager: self.manager.clone(),
                 http,
             }),
-        });
+        ));
 
         let ctx = ctx.clone();
         let config = self.config.clone();
+        let mut wake_words: Vec<&str> = config.wake_words.iter().map(String::as_str).collect();
+        wake_words.sort_unstable();
+        println!("Listening in {channel} for: {}", wake_words.join(", "));
         tokio::spawn(run_listener(rx, {
             let pipeline = pipeline.clone();
             let ctx = ctx.clone();

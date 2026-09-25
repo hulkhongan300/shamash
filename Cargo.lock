@@ -3185,6 +3185,8 @@ dependencies = [
  "anyhow",
  "dotenvy",
  "reqwest",
+ "serde",
+ "serde_json",
  "serenity",
  "songbird",
  "tokio",

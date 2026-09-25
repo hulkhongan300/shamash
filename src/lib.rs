@@ -5,6 +5,7 @@ pub mod listener;
 pub mod parser;
 pub mod pipeline;
 pub mod player;
+pub mod search;
 pub mod state;
 pub mod transcriber;
 pub mod voice;

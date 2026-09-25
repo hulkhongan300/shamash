@@ -24,6 +24,9 @@ yt-dlp search + download ──► songbird playback (ffmpeg decode)
 
 - **Autonomous joins**: joins when a user enters the configured channel, leaves
   when it is empty.
+- **Picks the popular song**: a request searches YouTube and plays the
+  most-viewed result that looks like a real song — clips, covers, remixes,
+  lyric videos, and long mixes are skipped.
 - **Local speech-to-text**: Whisper runs on your machine, no audio leaves the
   host.
 - **Minimal dependencies**: `serenity` + `songbird` + `whisper-rs` as crates
@@ -60,6 +63,10 @@ base small.en small` (optionally `-q5_1`/`-q8_0` variants) to pick another.
 Secrets live in a gitignored `.env` file next to the binary, loaded through
 [`dotenvy`](https://crates.io/crates/dotenvy). Real environment variables take
 precedence over the file.
+
+Wake words longer than four letters tolerate one misheard character, so
+"shemash" and "shammash" still wake the bot; shorter ones like "bot" must be
+heard exactly, otherwise ordinary speech ("not", "boy") would trigger it.
 
 ## Run
 
