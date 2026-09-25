@@ -11,6 +11,7 @@ use songbird::Songbird;
 use songbird::driver::{Channels, DecodeConfig, DecodeMode, SampleRate};
 use songbird::events::CoreEvent;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Builds the songbird driver config that decodes incoming voice to mono
@@ -61,6 +62,38 @@ impl VoiceService {
         {
             let mut handler = call.lock().await;
             handler.add_global_event(CoreEvent::VoiceTick.into(), VoiceTickHandler::new(tx));
+        }
+
+        // songbird's join() returns as soon as the gateway request is sent, so
+        // a call that never reaches Discord's voice server is indistinguishable
+        // from a working one. Wait for the connection and report the result,
+        // because everything downstream depends on it.
+        let mut connected = false;
+        for _ in 0..50 {
+            if call.lock().await.current_connection().is_some() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        {
+            let handler = call.lock().await;
+            println!(
+                "  deaf: {}, mute: {}, voice server: {}",
+                handler.is_deaf(),
+                handler.is_mute(),
+                if connected {
+                    "connected"
+                } else {
+                    "NOT CONNECTED after 10s"
+                },
+            );
+        }
+        if !connected {
+            println!(
+                "No audio can arrive while the voice server connection is missing; \
+                 check RUST_LOG=debug output for the reason."
+            );
         }
 
         let (transcriber, http) = {

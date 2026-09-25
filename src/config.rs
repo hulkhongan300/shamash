@@ -1,5 +1,8 @@
 use std::collections::HashSet;
 
+/// Wake words used when `WAKE_WORDS` is unset.
+pub const DEFAULT_WAKE_WORDS: &[&str] = &["bot"];
+
 /// Runtime configuration loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -22,7 +25,7 @@ impl Config {
             .transpose()?;
         let wake_words = std::env::var("WAKE_WORDS")
             .map(|s| split_csv(&s))
-            .unwrap_or_else(|_| vec!["shamash".to_string(), "bot".to_string()])
+            .unwrap_or_else(|_| DEFAULT_WAKE_WORDS.iter().map(|w| w.to_string()).collect())
             .into_iter()
             .collect();
         Ok(Self {

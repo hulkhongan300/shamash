@@ -68,6 +68,9 @@ impl ListenerPipeline {
         if transcript.trim().is_empty() {
             self.muted_utterances
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            println!(
+                "[{guild_id}] voice detected but no words recognised (too quiet, or too short?)"
+            );
             return;
         }
         let skipped = self
@@ -93,7 +96,13 @@ impl ListenerPipeline {
                 return;
             }
         };
-        println!("[{guild_id}] play: {}", request.query);
+        println!(
+            "[{guild_id}] wake command activated: {transcript:?} -> play {}",
+            request.query
+        );
+        if let Err(e) = self.player.acknowledge(guild_id).await {
+            println!("[{guild_id}] acknowledgement tone failed: {e:#}");
+        }
         if let Err(e) = self.player.play(ctx, config, guild_id, &request).await {
             println!("[{guild_id}] playback failed: {e:#}");
         }

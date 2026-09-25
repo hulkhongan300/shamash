@@ -3190,6 +3190,8 @@ dependencies = [
  "serenity",
  "songbird",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "whisper-rs",
 ]
 

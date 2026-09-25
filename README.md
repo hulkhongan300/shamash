@@ -43,7 +43,17 @@ yt-dlp search + download ──► songbird playback (ffmpeg decode)
 
 ```sh
 scripts/setup.sh        # downloads a Whisper model to data/model.bin
-cp .env.example .env    # then fill in DISCORD_TOKEN and VOICE_CHANNEL_ID
+```
+
+Then create a gitignored `.env` next to the binary with your own values:
+
+```sh
+cat > .env <<'EOF'
+DISCORD_TOKEN=your-bot-token
+VOICE_CHANNEL_ID=your-voice-channel-id
+WAKE_WORDS=bot
+WHISPER_MODEL=data/model.bin
+EOF
 ```
 
 The model download takes a minute or so. `scripts/setup.sh` defaults to
@@ -57,16 +67,17 @@ base small.en small` (optionally `-q5_1`/`-q8_0` variants) to pick another.
 | `DISCORD_TOKEN`   | yes      | Bot token from the Discord developer portal        |
 | `VOICE_CHANNEL_ID`| yes      | ID of the voice channel the bot watches and joins  |
 | `WHISPER_MODEL`   | no       | Path to a Whisper model file (default `data/model.bin`) |
-| `WAKE_WORDS`      | no       | Comma-separated wake words (default `shamash,bot`) |
+| `WAKE_WORDS`      | no       | Comma-separated wake words (default `bot`) |
 | `ALERT_CHANNEL_ID`| no       | Text channel for play confirmations (defaults to the server's system channel, then to the first text channel) |
 
 Secrets live in a gitignored `.env` file next to the binary, loaded through
 [`dotenvy`](https://crates.io/crates/dotenvy). Real environment variables take
 precedence over the file.
 
-Wake words longer than four letters tolerate one misheard character, so
-"shemash" and "shammash" still wake the bot; shorter ones like "bot" must be
-heard exactly, otherwise ordinary speech ("not", "boy") would trigger it.
+The default wake word is "bot". Wake words longer than four letters tolerate one
+misheard character, so a longer custom word like "shamash" would still answer to
+"shemash" and "shammash". Shorter ones such as "bot" must be heard exactly,
+otherwise ordinary speech ("not", "boy") would trigger the bot.
 
 ## Run
 
@@ -76,14 +87,19 @@ cargo run --release
 
 ## Testing without Discord
 
-Record a WAV of yourself saying *"Shamash, play Dracula by Tame Impala"* and
+Record a WAV of yourself saying *"Bot, play Dracula by Tame Impala"* and
 run the transcriber end-to-end (resample → VAD → Whisper → parser):
 
 ```sh
 cargo run --release --example transcribe -- recording.wav
 ```
 
-It prints what the bot hears and which play request it would make.
+It prints what the bot hears and which play request it would make, plus a level
+report: the loudest 20 ms frame against the voice-activity gate. If that frame
+sits below the gate, the bot cannot hear you at all, so the report is the first
+thing to check when it stays silent. `VAD_RMS_THRESHOLD` in `src/listener.rs`
+sets the gate; it defaults to 0.02, which is -34 dBFS against a typical
+conversational voice at -20 dBFS.
 
 ## Development
 

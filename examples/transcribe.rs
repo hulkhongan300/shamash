@@ -11,8 +11,9 @@
 //! `data/model.bin`) or point at another with `WHISPER_MODEL`.
 
 use anyhow::Context;
-use shamash::audio::{Resampler, VadBuffer};
-use shamash::config::Config;
+use shamash::audio::{Resampler, VadBuffer, rms};
+use shamash::config::{Config, DEFAULT_WAKE_WORDS};
+use shamash::listener::{VAD_GAP_FRAMES, VAD_MAX_FRAMES, VAD_RMS_THRESHOLD};
 use shamash::parser::CommandParser;
 use shamash::transcriber::Transcriber;
 use shamash::whisper::WhisperTranscriber;
@@ -34,7 +35,7 @@ fn main() -> anyhow::Result<()> {
                     .map(|w| w.trim().to_ascii_lowercase())
                     .collect()
             })
-            .unwrap_or_else(|_| ["shamash", "bot"].into_iter().map(str::to_string).collect()),
+            .unwrap_or_else(|_| DEFAULT_WAKE_WORDS.iter().map(|w| w.to_string()).collect()),
         // The rest of the config is unused by this harness.
         discord_token: String::new(),
         voice_channel_id: 0,
@@ -51,9 +52,18 @@ fn main() -> anyhow::Result<()> {
     );
     let parser = CommandParser::new(config.wake_words.clone());
 
-    let mut vad = VadBuffer::new(320, 0.02, 15, 600);
+    let mut vad = VadBuffer::new(320, VAD_RMS_THRESHOLD, VAD_GAP_FRAMES, VAD_MAX_FRAMES);
     let mut stored = String::new();
+    let mut peak = 0.0f32;
+    let mut frames_heard = 0usize;
+    let mut frames_total = 0usize;
     for frame in resampled.as_chunks::<320>().0 {
+        frames_total += 1;
+        let level = rms(frame);
+        peak = peak.max(level);
+        if level >= VAD_RMS_THRESHOLD {
+            frames_heard += 1;
+        }
         let utterance = vad.push(frame);
         if utterance.is_empty() {
             continue;
@@ -69,11 +79,35 @@ fn main() -> anyhow::Result<()> {
             Err(miss) => println!("not a play command: {miss}"),
         }
     }
+
+    // Level report, so a threshold that is wrong for this voice is visible
+    // rather than just silent.
+    println!(
+        "level: peak frame rms {:.4} ({:.1} dBFS), gate {:.4} ({:.1} dBFS)",
+        peak,
+        to_dbfs(peak),
+        VAD_RMS_THRESHOLD,
+        to_dbfs(VAD_RMS_THRESHOLD),
+    );
+    println!(
+        "gate: {frames_heard} of {frames_total} frames counted as speech ({:.0}%)",
+        100.0 * frames_heard as f32 / frames_total.max(1) as f32
+    );
+    if frames_heard == 0 {
+        println!(
+            "nothing crossed the gate; speak louder or closer, or lower VAD_RMS_THRESHOLD in src/listener.rs"
+        );
+    }
     if stored.trim().is_empty() {
         println!("no speech detected; try a louder or longer recording");
     }
     println!("done.");
     Ok(())
+}
+
+/// Full-scale decibel level of a linear amplitude.
+fn to_dbfs(amplitude: f32) -> f32 {
+    20.0 * amplitude.max(1e-9).log10()
 }
 
 /// Reads a RIFF/WAVE file and returns f32 samples plus the file's sample rate.
