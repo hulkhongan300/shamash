@@ -48,12 +48,13 @@ impl ListenerPipeline {
                 }
             };
 
+        println!("[{guild_id}] user: {transcript}");
         let Some(request) = self.parser.parse(&transcript) else {
+            println!("[{guild_id}] ignored (no play command)");
             return;
         };
-        println!("[{guild_id}] play request: {request:?}");
         if let Err(e) = self.player.play(ctx, config, guild_id, &request).await {
-            println!("playback failed: {e:#}");
+            println!("[{guild_id}] playback failed: {e:#}");
         }
     }
 }

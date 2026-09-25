@@ -41,9 +41,9 @@ impl Player {
 
         let summary = match (request.title.as_deref(), request.artist.as_deref()) {
             (Some(title), Some(artist)) => format!("Playing {title} by {artist}."),
-            _ => format!("\u{201c}{}\u{201d} searching on YouTube.", request.query),
+            _ => format!("Searching YouTube for \u{201c}{}\u{201d}.", request.query),
         };
-        println!("{summary}");
+        println!("[{guild_id}] {summary}");
 
         if let Some(channel) = resolve_alert_channel(ctx, config, guild_id)
             && let Err(e) = channel.say(&ctx.http, &summary).await
