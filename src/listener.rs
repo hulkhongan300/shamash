@@ -9,6 +9,20 @@ pub const LISTEN_SAMPLE_RATE: u32 = 16_000;
 /// Samples per 20 ms frame at [`LISTEN_SAMPLE_RATE`].
 pub const FRAME_SAMPLES: usize = 320;
 
+/// Frame [`rms`](crate::audio::rms) below which audio counts as silence.
+///
+/// 0.02 is -34 dBFS. Ordinary conversation sits near -20 dBFS and a quiet
+/// voice or low microphone gain near -30 dBFS, so this keeps roughly 4 to 14 dB
+/// of headroom above speech while staying well clear of room tone, which is
+/// typically -45 dBFS or lower. Measure your own voice with
+/// `cargo run --release --example transcribe -- recording.wav`, which prints
+/// the peak frame level against this gate.
+pub const VAD_RMS_THRESHOLD: f32 = 0.02;
+/// Silence frames that end an utterance: 15 x 20 ms = 300 ms.
+pub const VAD_GAP_FRAMES: usize = 15;
+/// Hard cap on one utterance: 600 x 20 ms = 12 s.
+pub const VAD_MAX_FRAMES: usize = 600;
+
 /// Accumulates received frames into complete speech utterances.
 #[derive(Debug)]
 pub struct Listener {
@@ -18,9 +32,12 @@ pub struct Listener {
 impl Listener {
     pub fn new() -> Self {
         Self {
-            // RMS threshold ~0.02, 300 ms of silence ends an utterance,
-            // and a 12 s cap bounds utterances that never hit a pause.
-            vad: VadBuffer::new(FRAME_SAMPLES, 0.02, 15, 600),
+            vad: VadBuffer::new(
+                FRAME_SAMPLES,
+                VAD_RMS_THRESHOLD,
+                VAD_GAP_FRAMES,
+                VAD_MAX_FRAMES,
+            ),
         }
     }
 
