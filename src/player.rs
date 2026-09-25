@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::fetch;
 use crate::parser::PlayRequest;
 use crate::search;
 use anyhow::Context;
@@ -6,7 +7,7 @@ use serenity::model::channel::ChannelType;
 use serenity::model::id::{ChannelId, GuildId};
 use serenity::prelude::Context as SerenityContext;
 use songbird::Songbird;
-use songbird::input::{Input, YoutubeDl};
+use songbird::input::{File as FileInput, Input};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +23,6 @@ const BEEP_CHANNELS: u16 = 2;
 /// Plays music for a request and reports the outcome to a text channel.
 pub struct Player {
     pub manager: Arc<Songbird>,
-    pub http: reqwest::Client,
 }
 
 impl Player {
@@ -72,7 +72,14 @@ impl Player {
         );
         println!("[{guild_id}] {summary}");
 
-        let input = Input::Lazy(Box::new(YoutubeDl::new(self.http.clone(), match_.url)));
+        // Downloaded before the current track is stopped, so a failed fetch
+        // leaves whatever is playing alone.
+        let path = fetch::fetch(&match_.url, &fetch::cache_dir(guild_id.get()))
+            .await
+            .with_context(|| format!("could not fetch '{}'", match_.title()))?;
+        println!("[{guild_id}] playing {}", path.display());
+
+        let input = Input::from(FileInput::new(path));
         {
             let mut handler = call.lock().await;
             handler.stop();
@@ -165,6 +172,48 @@ mod tests {
             .try_into()
             .map(u16::from_le_bytes)
             .unwrap()
+    }
+
+    /// The tone has to survive the same probe songbird runs on it.
+    ///
+    /// Songbird depends on symphonia with `default-features = false` and exposes
+    /// no feature to switch the format handlers back on, so its probe registry
+    /// is empty unless symphonia is also a direct dependency of this crate. That
+    /// build decodes nothing at all: every input fails with "no suitable format
+    /// reader found", so the tone is silent and the music never starts.
+    #[test]
+    fn songbird_can_probe_and_decode_the_tone() {
+        use symphonia::core::codecs::DecoderOptions;
+        use symphonia::core::formats::FormatOptions;
+        use symphonia::core::io::MediaSourceStream;
+        use symphonia::core::meta::MetadataOptions;
+        use symphonia::default::{get_codecs, get_probe};
+
+        let wav = beep_wav();
+        let source =
+            MediaSourceStream::new(Box::new(std::io::Cursor::new(wav)), Default::default());
+        let mut probed = get_probe()
+            .format(
+                &symphonia::core::probe::Hint::new(),
+                source,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .expect("songbird's probe must recognise the tone");
+        let track = probed
+            .format
+            .default_track()
+            .expect("the tone must expose a track");
+        let mut decoder = get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())
+            .expect("the pcm decoder must be registered");
+
+        let mut packets = 0;
+        while let Ok(packet) = probed.format.next_packet() {
+            decoder.decode(&packet).expect("pcm packet must decode");
+            packets += 1;
+        }
+        assert!(packets > 0, "the tone must decode to audio samples");
     }
 
     #[test]

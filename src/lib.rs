@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod bot;
 pub mod config;
+pub mod fetch;
 pub mod listener;
 pub mod parser;
 pub mod pipeline;

@@ -3,7 +3,7 @@ use crate::listener::{VoiceTickHandler, run_listener};
 use crate::parser::CommandParser;
 use crate::pipeline::ListenerPipeline;
 use crate::player::Player;
-use crate::state::{ConfigKey, HttpClientKey, TranscriberKey};
+use crate::state::{ConfigKey, TranscriberKey};
 use anyhow::Context;
 use serenity::model::id::{ChannelId, GuildId};
 use serenity::prelude::Context as SerenityContext;
@@ -96,24 +96,17 @@ impl VoiceService {
             );
         }
 
-        let (transcriber, http) = {
+        let transcriber = {
             let data = ctx.data.read().await;
-            let transcriber = data
-                .get::<TranscriberKey>()
+            data.get::<TranscriberKey>()
                 .cloned()
-                .context("transcriber not present in type map")?;
-            let http = data
-                .get::<HttpClientKey>()
-                .cloned()
-                .context("http client not present in type map")?;
-            (transcriber, http)
+                .context("transcriber not present in type map")?
         };
         let pipeline = Arc::new(ListenerPipeline::new(
             transcriber,
             CommandParser::new(self.config.wake_words.clone()),
             Arc::new(Player {
                 manager: self.manager.clone(),
-                http,
             }),
         ));
 
