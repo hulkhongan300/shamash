@@ -64,6 +64,10 @@ Secrets live in a gitignored `.env` file next to the binary, loaded through
 [`dotenvy`](https://crates.io/crates/dotenvy). Real environment variables take
 precedence over the file.
 
+Wake words longer than four letters tolerate one misheard character, so
+"shemash" and "shammash" still wake the bot; shorter ones like "bot" must be
+heard exactly, otherwise ordinary speech ("not", "boy") would trigger it.
+
 ## Run
 
 ```sh

@@ -11,6 +11,37 @@ pub struct PlayRequest {
     pub artist: Option<String>,
 }
 
+/// Wake words shorter than this must match exactly, so short words like "bot"
+/// cannot match everyday speech ("not", "boy", "hot").
+const EXACT_MATCH_MAX_LEN: usize = 4;
+
+/// Single-character mistakes tolerated in longer wake words.
+///
+/// Speech-to-text reliably mangles a proper name — "shamash" can come back as
+/// "shemash", "samash" or "shammash" — and rejecting those makes the bot feel
+/// broken, so one edit is allowed on words long enough that a near match is
+/// still unlikely to be an ordinary word.
+const FUZZY_MAX_EDITS: usize = 1;
+
+/// Levenshtein distance between two words, used for wake-word matching.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+
+    for (i, l) in left.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, r) in right.iter().enumerate() {
+            let cost = usize::from(l != *r);
+            current[j + 1] = (previous[j] + cost)
+                .min(previous[j + 1] + 1)
+                .min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
 /// Why a transcript did not yield a play request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseMiss {
@@ -54,6 +85,18 @@ impl CommandParser {
         &self.wake_words
     }
 
+    /// Whether `word` is one of the configured wake words.
+    ///
+    /// Long wake words tolerate a single character of speech-to-text damage;
+    /// short ones must match exactly to avoid firing on ordinary speech.
+    pub fn is_wake_word(&self, word: &str) -> bool {
+        self.wake_words.iter().any(|wake| {
+            word == wake
+                || (wake.chars().count() > EXACT_MATCH_MAX_LEN
+                    && edit_distance(word, wake) <= FUZZY_MAX_EDITS)
+        })
+    }
+
     /// Requires a wake word followed by "play <something>".
     ///
     /// Recognizes "play <title> by <artist>" (the artist gets the search bias)
@@ -69,7 +112,7 @@ impl CommandParser {
 
         let wake_idx = words
             .iter()
-            .position(|w| self.wake_words.contains(*w))
+            .position(|w| self.is_wake_word(w))
             .ok_or(ParseMiss::NoWakeWord)?;
         let play_at = words[wake_idx + 1..]
             .iter()
@@ -237,5 +280,57 @@ mod tests {
         let words = parser.wake_words();
         assert!(words.contains("shamash"));
         assert!(words.contains("bot"));
+    }
+
+    #[test]
+    fn tolerates_one_letter_wake_word_mistakes() {
+        let parser = parser();
+        for heard in [
+            "shemash play despacito",
+            "samash play despacito",
+            "shammash play despacito",
+            "shamish play despacito",
+            "Shamash, play despacito",
+        ] {
+            assert!(parser.parse(heard).is_some(), "should accept {heard:?}");
+        }
+    }
+
+    #[test]
+    fn short_wake_words_do_not_match_ordinary_speech() {
+        let parser = parser();
+        for heard in [
+            "not play despacito",
+            "boy play despacito",
+            "hot play despacito",
+            "top play despacito",
+            "i will not play despacito today",
+        ] {
+            assert_eq!(
+                parser.parse_with_reason(heard).err(),
+                Some(ParseMiss::NoWakeWord),
+                "should reject {heard:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_wake_words_that_are_too_far_off() {
+        let parser = parser();
+        assert_eq!(
+            parser.parse_with_reason("chameleon play despacito").err(),
+            Some(ParseMiss::NoWakeWord)
+        );
+    }
+
+    #[test]
+    fn computes_edit_distance() {
+        assert_eq!(edit_distance("shamash", "shamash"), 0);
+        assert_eq!(edit_distance("shamash", "shemash"), 1);
+        assert_eq!(edit_distance("shamash", "shammash"), 1);
+        assert_eq!(edit_distance("shamash", "shamish"), 1);
+        assert_eq!(edit_distance("flaw", "lawn"), 2);
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("", "bot"), 3);
     }
 }
