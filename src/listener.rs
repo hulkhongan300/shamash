@@ -151,7 +151,10 @@ impl VoiceTickHandler {
             );
         } else if diag.frames == 0 {
             println!(
-                "  ticks are arriving but carry no audio: nobody is speaking, or the decoder is idle"
+                "  ticks are arriving but carry no audio. Either nobody is speaking, or \
+                 Discord's end-to-end voice encryption (DAVE) has not finished negotiating, \
+                 in which case nothing can be decoded. Speaking once the bot has been in the \
+                 channel a while, or rejoining the channel, usually settles it."
             );
         } else if diag.peak < VAD_RMS_THRESHOLD {
             println!(
