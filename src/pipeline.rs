@@ -1,0 +1,112 @@
+use crate::config::Config;
+use crate::parser::{CommandParser, PlayRequest};
+use crate::player::Player;
+use crate::transcriber::Transcriber;
+use serenity::model::id::GuildId;
+use serenity::prelude::Context as SerenityContext;
+use std::sync::Arc;
+
+/// Transcribes an utterance and turns it into a play request, if the grammar
+/// matched. `None` means the transcript contained no play command.
+pub fn transcribe_and_parse(
+    transcriber: &dyn Transcriber,
+    parser: &CommandParser,
+    samples: &[f32],
+) -> anyhow::Result<Option<PlayRequest>> {
+    let transcript = transcriber.transcribe(samples)?;
+    Ok(parser.parse(&transcript))
+}
+
+/// The full speech-to-music pipeline: transcribe, parse, and play.
+pub struct ListenerPipeline {
+    pub transcriber: Arc<dyn Transcriber>,
+    pub parser: CommandParser,
+    pub player: Arc<Player>,
+}
+
+impl ListenerPipeline {
+    /// Transcribes `utterance` off the blocking pool, then plays any request
+    /// that matches the grammar. Failures are logged, never fatal.
+    pub async fn handle_utterance(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        utterance: Vec<f32>,
+    ) {
+        let transcriber = self.transcriber.clone();
+        let transcript =
+            match tokio::task::spawn_blocking(move || transcriber.transcribe(&utterance)).await {
+                Ok(Ok(transcript)) => transcript,
+                Ok(Err(e)) => {
+                    println!("transcription failed: {e:#}");
+                    return;
+                }
+                Err(e) => {
+                    println!("transcription task failed: {e}");
+                    return;
+                }
+            };
+
+        println!("[{guild_id}] user: {transcript}");
+        let Some(request) = self.parser.parse(&transcript) else {
+            println!("[{guild_id}] ignored (no play command)");
+            return;
+        };
+        if let Err(e) = self.player.play(ctx, config, guild_id, &request).await {
+            println!("[{guild_id}] playback failed: {e:#}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestTranscriber;
+
+    impl Transcriber for TestTranscriber {
+        fn sample_rate(&self) -> u32 {
+            16_000
+        }
+
+        fn transcribe(&self, _samples: &[f32]) -> anyhow::Result<String> {
+            Ok("shamash play dracula by tame impala".to_string())
+        }
+    }
+
+    struct QuietTranscriber;
+
+    impl Transcriber for QuietTranscriber {
+        fn sample_rate(&self) -> u32 {
+            16_000
+        }
+
+        fn transcribe(&self, _samples: &[f32]) -> anyhow::Result<String> {
+            Ok("just chatting about lunch".to_string())
+        }
+    }
+
+    #[test]
+    fn wired_pipeline_yields_play_request() {
+        let req = transcribe_and_parse(
+            &TestTranscriber,
+            &crate::parser::CommandParser::new(["shamash".to_string()]),
+            &[0.0; 320],
+        )
+        .unwrap()
+        .expect("should match");
+        assert_eq!(req.query, "dracula by tame impala");
+    }
+
+    #[test]
+    fn wired_pipeline_ignores_ordinary_speech() {
+        let result = transcribe_and_parse(
+            &QuietTranscriber,
+            &crate::parser::CommandParser::new(["shamash".to_string()]),
+            &[0.0; 320],
+        )
+        .unwrap();
+        assert!(result.is_none());
+    }
+}
