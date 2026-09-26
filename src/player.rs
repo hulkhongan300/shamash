@@ -8,8 +8,11 @@ use serenity::model::id::{ChannelId, GuildId};
 use serenity::prelude::Context as SerenityContext;
 use songbird::Songbird;
 use songbird::input::{File as FileInput, Input};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Length of the acknowledgement tone.
 const BEEP_DURATION: Duration = Duration::from_millis(150);
@@ -23,9 +26,61 @@ const BEEP_CHANNELS: u16 = 2;
 /// Plays music for a request and reports the outcome to a text channel.
 pub struct Player {
     pub manager: Arc<Songbird>,
+    /// Serialises the work for one guild.
+    ///
+    /// Two commands handled at once would each download and then start a
+    /// track, and the second would replace the first mid-flight, so the song
+    /// that was asked for would be heard as the one before it.
+    busy: Busy,
+    /// The file each guild is playing, so it can be deleted once replaced.
+    playing: Playing,
+}
+
+/// One lock per guild, so a command in one guild cannot hold up another.
+#[derive(Debug, Clone, Default)]
+struct Busy(Arc<Mutex<HashMap<GuildId, Arc<AsyncMutex<()>>>>>);
+
+impl Busy {
+    fn get(&self, guild_id: GuildId) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.lock();
+        Arc::clone(locks.entry(guild_id).or_default())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<GuildId, Arc<AsyncMutex<()>>>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The file each guild last started, kept so each download can be removed
+/// after the song it belongs to has been replaced.
+#[derive(Debug, Clone, Default)]
+struct Playing(Arc<Mutex<HashMap<GuildId, PathBuf>>>);
+
+impl Playing {
+    /// Replaces the guild's current file, returning the one it had.
+    fn swap(&self, guild_id: GuildId, path: PathBuf) -> Option<PathBuf> {
+        self.lock().insert(guild_id, path)
+    }
+
+    /// Forgets the guild's file, returning the one it had.
+    fn take(&self, guild_id: GuildId) -> Option<PathBuf> {
+        self.lock().remove(&guild_id)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<GuildId, PathBuf>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl Player {
+    pub fn new(manager: Arc<Songbird>) -> Self {
+        Self {
+            manager,
+            busy: Busy::default(),
+            playing: Playing::default(),
+        }
+    }
+
     /// Plays a short tone so the speaker knows the wake word and command were
     /// both understood, without stopping whatever is currently playing.
     ///
@@ -54,6 +109,11 @@ impl Player {
         guild_id: GuildId,
         request: &PlayRequest,
     ) -> anyhow::Result<()> {
+        // Held across the search and download as well as the handoff, so two
+        // commands cannot pick their files and start tracks at the same time.
+        let lock = self.busy.get(guild_id);
+        let _held = lock.lock().await;
+
         let call = self
             .manager
             .get(guild_id)
@@ -73,17 +133,25 @@ impl Player {
         println!("[{guild_id}] {summary}");
 
         // Downloaded before the current track is stopped, so a failed fetch
-        // leaves whatever is playing alone.
-        let path = fetch::fetch(&match_.url, &fetch::cache_dir(guild_id.get()))
+        // leaves whatever is playing alone. The file is named after the video
+        // so it can never be mistaken for another song's, and so asking for
+        // the same song twice reuses the download.
+        let video_id = match_.video_id().unwrap_or_default().to_string();
+        let path = fetch::fetch(&video_id, &match_.url, &fetch::cache_dir(guild_id.get()))
             .await
             .with_context(|| format!("could not fetch '{}'", match_.title()))?;
         println!("[{guild_id}] playing {}", path.display());
 
-        let input = Input::from(FileInput::new(path));
         {
             let mut handler = call.lock().await;
             handler.stop();
-            handler.play_input(input);
+            handler.play_input(Input::from(FileInput::new(path.clone())));
+        }
+
+        // Only once the new song is playing is the old one no longer read, and
+        // songbird holds the file open, so this cannot break the track.
+        if let Some(previous) = self.playing.swap(guild_id, path) {
+            let _ = std::fs::remove_file(previous);
         }
 
         if let Some(channel) = resolve_alert_channel(ctx, config, guild_id)
@@ -92,6 +160,18 @@ impl Player {
             println!("failed to post play confirmation: {e}");
         }
         Ok(())
+    }
+
+    /// Stops playback, dropping the guild's current file.
+    ///
+    /// This does not leave the voice channel; `/stop` does both.
+    pub async fn stop(&self, guild_id: GuildId) {
+        if let Some(call) = self.manager.get(guild_id) {
+            call.lock().await.stop();
+        }
+        if let Some(previous) = self.playing.take(guild_id) {
+            let _ = std::fs::remove_file(previous);
+        }
     }
 }
 

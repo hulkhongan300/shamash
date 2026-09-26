@@ -12,11 +12,17 @@
 //! container that YouTube also publishes and that the `isomp4` and `aac`
 //! handlers can decode. Only when a video offers nothing else is the best
 //! stream downloaded and transcoded to WAV.
+//!
+//! Every song gets its own file, named after its video id. A single shared
+//! path cannot work: two commands handled at once, or a queue of more than one
+//! song, would have one download overwrite the audio another track is reading,
+//! and the song that was meant to play would be heard as the one before it.
+//! Because the name is derived from the video, a file already at that path is
+//! that song's audio, so it can be reused instead of downloaded again.
 
 use anyhow::{Context, bail};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 use tokio::process::Command;
 
 /// Audio formats to try, best first.
@@ -32,54 +38,112 @@ pub const DECODABLE_FORMAT: &str = "bestaudio[acodec^=mp4a][vcodec=none]/\
 /// The selector for the fallback download, which is then transcoded.
 const BEST_FORMAT: &str = "bestaudio";
 
-/// Directory holding one guild's downloaded audio.
+/// How many downloaded files to keep per guild.
 ///
-/// A fixed path per guild keeps the temporary directory from growing without
-/// bound. yt-dlp downloads to a `.part` file and renames it into place, so
-/// replacing the file never disturbs a track that is still playing.
+/// Each song is kept while it is playing or queued, and the newest few survive
+/// so a repeated request does not download the same audio twice. Old ones are
+/// pruned, because the songs the listener asks for are never the same twice.
+const KEEP_FILES: usize = 8;
+
+/// Directory holding one guild's downloaded audio.
 pub fn cache_dir(guild_id: u64) -> PathBuf {
     std::env::temp_dir().join(format!("shamash-{guild_id}"))
 }
 
-/// Downloads decodable audio for `url` into `dir` and returns the file to play.
+/// Downloads decodable audio for `video_id` into `dir` and returns the file to
+/// play.
 ///
-/// The file is either the stream YouTube already publishes in a decodable
-/// format, or a WAV transcoded from the best stream it offers.
-pub async fn fetch(url: &str, dir: &Path) -> anyhow::Result<PathBuf> {
+/// `video_id` names the file, so a song already downloaded is reused. The file
+/// is either the stream YouTube publishes in a decodable format, or a WAV
+/// transcoded from the best stream it offers.
+pub async fn fetch(video_id: &str, url: &str, dir: &Path) -> anyhow::Result<PathBuf> {
+    let stem = file_stem(video_id);
     tokio::fs::create_dir_all(dir)
         .await
         .with_context(|| format!("could not create {}", dir.display()))?;
 
-    match download(url, dir, DECODABLE_FORMAT).await {
-        Ok(path) => Ok(path),
+    if let Some(cached) = existing(&stem, dir).await {
+        return Ok(cached);
+    }
+
+    let path = match download(url, dir, &stem, DECODABLE_FORMAT).await {
+        Ok(path) => path,
         Err(no_decodable) => {
             tracing::debug!("no decodable stream for {url}: {no_decodable:#}");
-            let source = download(url, dir, BEST_FORMAT)
+            let source = download(url, dir, &stem, BEST_FORMAT)
                 .await
                 .context("yt-dlp could not download the audio")?;
-            let transcoded = dir.join("track.wav");
+            let transcoded = dir.join(format!("{stem}.wav"));
             transcode(&source, &transcoded).await?;
             let _ = tokio::fs::remove_file(&source).await;
-            Ok(transcoded)
+            transcoded
+        }
+    };
+
+    prune(dir, &stem).await;
+    Ok(path)
+}
+
+/// A file name safe to build from a video id.
+///
+/// Video ids are URL-safe already, but the id reaches this from a search
+/// result, so anything unexpected is replaced rather than trusted as a path.
+fn file_stem(video_id: &str) -> String {
+    let cleaned: String = video_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "track".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// The audio already downloaded for this song, if there is any.
+///
+/// A `.part` file is ignored: it is a download that never finished, so it is
+/// not audio that can be played.
+async fn existing(stem: &str, dir: &Path) -> Option<PathBuf> {
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "part") {
+            continue;
+        }
+        if path.file_stem().and_then(|s| s.to_str()) == Some(stem)
+            && entry
+                .metadata()
+                .await
+                .ok()
+                .is_some_and(|meta| meta.len() > 0)
+        {
+            return Some(path);
         }
     }
+    None
 }
 
 /// The yt-dlp arguments used for every download.
 ///
-/// `--force-overwrites` is the important one. yt-dlp's default is
-/// `--no-force-overwrites`, and with a fixed output path that means a video
-/// whose file is already there is *skipped*: yt-dlp prints the path, exits 0,
-/// and writes nothing. Every request after the first therefore replayed the
-/// first song, because the check that the file existed and was not empty could
-/// not tell a fresh download from a skipped one.
+/// `--force-overwrites` matters when a previous download of this song left a
+/// file behind that was too small to be usable. yt-dlp's default is
+/// `--no-force-overwrites`, and that skips a download whose output already
+/// exists, printing the path and exiting 0, so the caller could not tell a
+/// fresh download from a skipped one.
 ///
-/// `--no-part` is deliberately absent. It makes yt-dlp write straight to the
-/// output, which either truncates the file a playing track is reading or tries
-/// to resume it and fails. With the default `.part` file the new audio is
-/// renamed into place, so the track that is playing keeps the old inode and the
-/// next one opens the new file.
-fn download_args(url: &str, dir: &Path, format: &str) -> Vec<OsString> {
+/// `--no-part` is deliberately absent. With the default `.part` file the new
+/// audio is renamed into place, so a track reading a file of the same name
+/// keeps the old inode and never sees a half-written file.
+fn download_args(url: &str, dir: &Path, stem: &str, format: &str) -> Vec<OsString> {
+    let output = dir.join(format!("{stem}.%(ext)s"));
     [
         "--no-playlist",
         "--no-warnings",
@@ -92,7 +156,7 @@ fn download_args(url: &str, dir: &Path, format: &str) -> Vec<OsString> {
         OsString::from("--format"),
         OsString::from(format),
         OsString::from("--output"),
-        dir.join("track.%(ext)s").into_os_string(),
+        output.into_os_string(),
         OsString::from("--print"),
         OsString::from("after_move:filepath"),
         OsString::from(url),
@@ -101,10 +165,9 @@ fn download_args(url: &str, dir: &Path, format: &str) -> Vec<OsString> {
 }
 
 /// Downloads one format into `dir` and returns the path yt-dlp wrote.
-async fn download(url: &str, dir: &Path, format: &str) -> anyhow::Result<PathBuf> {
-    let started = SystemTime::now();
+async fn download(url: &str, dir: &Path, stem: &str, format: &str) -> anyhow::Result<PathBuf> {
     let output = Command::new("yt-dlp")
-        .args(download_args(url, dir, format))
+        .args(download_args(url, dir, stem, format))
         .output()
         .await
         .with_context(|| format!("could not run yt-dlp to fetch {url}"))?;
@@ -131,16 +194,6 @@ async fn download(url: &str, dir: &Path, format: &str) -> anyhow::Result<PathBuf
     anyhow::ensure!(
         metadata.len() > 0,
         "yt-dlp downloaded an empty {}",
-        path.display()
-    );
-
-    // A download that never touched the file is the failure that made every
-    // request replay the previous song, so it is caught here rather than
-    // handed to the player as if it were new audio.
-    let written = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    anyhow::ensure!(
-        written >= started,
-        "yt-dlp left {} untouched, so it is a leftover from an earlier request",
         path.display()
     );
 
@@ -177,6 +230,33 @@ async fn transcode(source: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Deletes all but the newest [`KEEP_FILES`] downloads, keeping `keep`.
+///
+/// A song being played or waiting in the queue is among the newest, so pruning
+/// by age cannot pull the audio out from under a track that is about to start.
+async fn prune(dir: &Path, keep: &str) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "part") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().await.and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        files.push((modified, path));
+    }
+    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, path) in files.into_iter().skip(KEEP_FILES) {
+        if path.file_stem().and_then(|s| s.to_str()) != Some(keep) {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,19 +278,51 @@ mod tests {
     }
 
     #[test]
-    fn each_download_forces_a_real_one() {
-        // The failure this prevents: yt-dlp's default skips a download whose
-        // output file already exists, printing the path and exiting 0. The
-        // player could not tell that from a fresh download, so every request
-        // after the first replayed the first song.
-        let args: Vec<String> = download_args(
+    fn each_song_downloads_to_its_own_file() {
+        // The bug this prevents: one shared path per guild, so a second
+        // request overwrote the audio a track was reading and the song that
+        // was asked for was heard as the one before it.
+        let one = download_args(
             "https://youtu.be/abc",
             Path::new("/tmp/shamash-1"),
+            "abc",
             DECODABLE_FORMAT,
-        )
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
+        );
+        let two = download_args(
+            "https://youtu.be/xyz",
+            Path::new("/tmp/shamash-1"),
+            "xyz",
+            DECODABLE_FORMAT,
+        );
+        let output_of = |args: &[OsString]| {
+            args.iter()
+                .find(|a| a.to_string_lossy().contains("%(ext)s"))
+                .map(|a| a.to_string_lossy().into_owned())
+                .expect("an output path")
+        };
+        assert_ne!(
+            output_of(&one),
+            output_of(&two),
+            "two songs must not share an output path"
+        );
+        assert!(output_of(&one).ends_with("abc.%(ext)s"));
+    }
+
+    #[test]
+    fn each_download_forces_a_real_one() {
+        // yt-dlp's default skips a download whose output file already exists,
+        // printing the path and exiting 0, so a stale file too small to play
+        // would be handed to the player as if it were fresh audio.
+        let args = download_args(
+            "https://youtu.be/abc",
+            Path::new("/tmp/shamash-1"),
+            "abc",
+            DECODABLE_FORMAT,
+        );
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert!(
             args.iter().any(|a| a == "--force-overwrites"),
             "a stale file would be replayed: {args:?}"
@@ -228,6 +340,105 @@ mod tests {
     fn each_guild_gets_its_own_directory() {
         assert_ne!(cache_dir(1), cache_dir(2));
         assert!(cache_dir(42).ends_with("shamash-42"));
+    }
+
+    #[test]
+    fn a_video_id_cannot_escape_the_cache_directory() {
+        // The id comes from a search result, so it must not be able to name a
+        // path outside the cache.
+        for id in ["../../etc/passwd", "a/b", "..", "with space"] {
+            let stem = file_stem(id);
+            assert!(
+                !stem.contains('/') && !stem.contains('\\'),
+                "id {id} produced a path: {stem}"
+            );
+            assert!(!stem.contains(".."), "id {id} produced {stem}");
+        }
+        assert_eq!(file_stem(""), "track");
+        assert_eq!(file_stem("dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+    }
+
+    #[tokio::test]
+    async fn audio_already_downloaded_is_reused() {
+        // A file named after the video is that song's audio, so asking for
+        // the same song again must not download it a second time.
+        let dir = std::env::temp_dir().join("shamash-existing-test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.expect("create dir");
+        tokio::fs::write(dir.join("abc.m4a"), b"audio")
+            .await
+            .expect("write");
+
+        assert_eq!(existing("abc", &dir).await, Some(dir.join("abc.m4a")));
+        assert_eq!(existing("other", &dir).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_half_downloaded_file_is_not_reused() {
+        // A `.part` file is a download that never finished. Reusing it would
+        // play silence or a fragment.
+        let dir = std::env::temp_dir().join("shamash-part-test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.expect("create dir");
+        tokio::fs::write(dir.join("abc.m4a.part"), b"half")
+            .await
+            .expect("write");
+
+        assert_eq!(existing("abc", &dir).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_empty_file_is_not_reused() {
+        let dir = std::env::temp_dir().join("shamash-empty-test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.expect("create dir");
+        tokio::fs::write(dir.join("abc.m4a"), b"")
+            .await
+            .expect("write");
+
+        assert_eq!(existing("abc", &dir).await, None);
+    }
+
+    #[tokio::test]
+    async fn pruning_keeps_the_newest_downloads_and_the_current_song() {
+        let dir = std::env::temp_dir().join("shamash-prune-test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.expect("create dir");
+        for i in 0..(KEEP_FILES + 4) {
+            tokio::fs::write(dir.join(format!("song{i}.m4a")), b"audio")
+                .await
+                .expect("write");
+            // Make the order of the files unambiguous.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        prune(&dir, "song0").await;
+
+        let mut left: Vec<String> = Vec::new();
+        let mut entries = tokio::fs::read_dir(&dir).await.expect("read dir");
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            left.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        assert!(
+            left.contains(&"song0.m4a".to_string()),
+            "the song being played must survive: {left:?}"
+        );
+        assert!(
+            left.contains(&"song11.m4a".to_string()),
+            "the newest download must survive: {left:?}"
+        );
+        // The 12 files written are song0..song11, and the newest 8 are kept, so
+        // the three oldest after song0 are what goes.
+        for pruned in ["song1.m4a", "song2.m4a", "song3.m4a"] {
+            assert!(
+                !left.contains(&pruned.to_string()),
+                "{pruned} should have been pruned: {left:?}"
+            );
+        }
+        assert!(
+            left.len() <= KEEP_FILES + 1,
+            "the cache must stay bounded: {left:?}"
+        );
     }
 
     /// Checks the fallback used when YouTube offers nothing but Opus: the
@@ -259,6 +470,31 @@ mod tests {
         assert!(header.len() > 44, "the WAV must contain audio");
     }
 
+    /// Downloads two different videos and checks each keeps its own audio,
+    /// which is the bug behind hearing the previous song again. Ignored by
+    /// default because it needs network access and the yt-dlp binary.
+    #[tokio::test]
+    #[ignore = "needs network and yt-dlp"]
+    async fn two_songs_keep_separate_audio() {
+        let dir = std::env::temp_dir().join("shamash-two-songs-test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.expect("create dir");
+
+        let first = fetch("wJGcwEv7838", "https://youtu.be/wJGcwEv7838", &dir)
+            .await
+            .expect("fetch the first");
+        let second = fetch("aqz-KE-bpKQ", "https://youtu.be/aqz-KE-bpKQ", &dir)
+            .await
+            .expect("fetch the second");
+
+        assert_ne!(first, second, "each song needs its own file");
+        assert_ne!(
+            tokio::fs::metadata(&first).await.expect("stat").len(),
+            tokio::fs::metadata(&second).await.expect("stat").len(),
+            "the files must hold different audio"
+        );
+    }
+
     /// Downloads a real video and checks the result is something the decoder
     /// can read. Ignored by default because it needs network access and the
     /// yt-dlp binary.
@@ -272,7 +508,7 @@ mod tests {
         use symphonia::default::{get_codecs, get_probe};
 
         let dir = std::env::temp_dir().join("shamash-fetch-test");
-        let path = fetch("https://youtu.be/wJGcwEv7838", &dir)
+        let path = fetch("wJGcwEv7838", "https://youtu.be/wJGcwEv7838", &dir)
             .await
             .expect("fetch must succeed");
         let bytes = std::fs::read(&path).expect("read");

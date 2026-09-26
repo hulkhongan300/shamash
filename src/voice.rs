@@ -3,7 +3,7 @@ use crate::listener::{VoiceTickHandler, run_listener};
 use crate::parser::CommandParser;
 use crate::pipeline::ListenerPipeline;
 use crate::player::Player;
-use crate::state::{ConfigKey, TranscriberKey};
+use crate::state::{ConfigKey, PlayerKey, TranscriberKey};
 use anyhow::Context;
 use serenity::model::id::{ChannelId, GuildId};
 use serenity::prelude::Context as SerenityContext;
@@ -47,6 +47,15 @@ impl VoiceService {
             .await
             .context("songbird not registered in type map")?;
         Ok(Self { manager, config })
+    }
+
+    /// The shared player, so the dashboard buttons and the voice listener act
+    /// on the same queue.
+    async fn player(&self, ctx: &SerenityContext) -> anyhow::Result<Arc<Player>> {
+        let data = ctx.data.read().await;
+        data.get::<PlayerKey>()
+            .cloned()
+            .context("player not present in type map")
     }
 
     /// Joins `channel` and starts listening for speech. A fresh listener is
@@ -110,9 +119,7 @@ impl VoiceService {
         let pipeline = Arc::new(ListenerPipeline::new(
             transcriber,
             CommandParser::new(self.config.wake_words.clone()),
-            Arc::new(Player {
-                manager: self.manager.clone(),
-            }),
+            self.player(ctx).await?,
         ));
 
         let ctx = ctx.clone();

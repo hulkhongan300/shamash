@@ -27,6 +27,9 @@ yt-dlp search + download ──► songbird playback (ffmpeg decode)
 - **Picks the popular song**: a request searches YouTube and plays the
   most-viewed result that looks like a real song — clips, covers, remixes,
   lyric videos, and long mixes are skipped.
+- **One file per song**: each song downloads to a file named after its video
+  id, so a request can never be served the audio of an earlier one, and asking
+  for the same song again reuses the download.
 - **Local speech-to-text**: transcription runs on your machine, no audio leaves
   the host.
 - **Minimal dependencies**: `serenity` + `songbird` + `whisper-rs` as crates

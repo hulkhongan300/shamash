@@ -1,6 +1,7 @@
 use crate::config::{AsrEngine, Config};
 use crate::parakeet::HandyTranscriber;
-use crate::state::{ConfigKey, HttpClientKey, TranscriberKey};
+use crate::player::Player;
+use crate::state::{ConfigKey, HttpClientKey, PlayerKey, TranscriberKey};
 use crate::transcriber::Transcriber;
 use crate::voice::{VoiceService, decode_config};
 use crate::whisper::WhisperTranscriber;
@@ -31,6 +32,7 @@ pub async fn start(config: Config) -> anyhow::Result<()> {
         .type_map_insert::<HttpClientKey>(reqwest::Client::new())
         .type_map_insert::<TranscriberKey>(transcriber)
         .await?;
+
     client.start().await?;
     Ok(())
 }
@@ -79,6 +81,19 @@ impl EventHandler for Handler {
         if let Err(e) = Command::create_global_command(&ctx.http, command).await {
             println!("failed to register /stop command: {e}");
         }
+
+        // One player for the whole process, so the voice listener and the
+        // dashboard buttons act on the same queue. Built here because that is
+        // the first point the songbird manager can be reached.
+        match songbird::get(&ctx).await {
+            Some(manager) => {
+                ctx.data
+                    .write()
+                    .await
+                    .insert::<PlayerKey>(Arc::new(Player::new(manager)));
+            }
+            None => println!("songbird unavailable, playback is disabled"),
+        }
     }
 
     async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
@@ -108,14 +123,32 @@ impl EventHandler for Handler {
         let Interaction::Command(command) = interaction else {
             return;
         };
+        self.slash_stop(&ctx, command).await;
+    }
+}
+
+/// The interaction handlers, split out of the [`EventHandler`] impl because
+/// they are plain methods rather than events.
+impl Handler {
+    /// Handles `/stop`, which leaves the voice channel as well as stopping.
+    async fn slash_stop(
+        &self,
+        ctx: &Context,
+        command: serenity::model::application::CommandInteraction,
+    ) {
         if command.data.name != "stop" {
             return;
         }
 
-        let response = match VoiceService::from_ctx(&ctx).await {
+        let response = match VoiceService::from_ctx(ctx).await {
             Ok(service) => match command.guild_id {
                 Some(guild_id) => {
                     let was_connected = service.manager.get(guild_id).is_some();
+                    // The player owns the current file, so it has to be told
+                    // as well as the voice service.
+                    if let Some(player) = ctx.data.read().await.get::<PlayerKey>().cloned() {
+                        player.stop(guild_id).await;
+                    }
                     match service.stop(guild_id).await {
                         Ok(()) if was_connected => "Left the voice channel.".to_string(),
                         Ok(()) => "I wasn't in a voice channel.".to_string(),
