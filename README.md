@@ -19,7 +19,11 @@ Parakeet (local, via the Handy app) → transcript
         ▼
 Parser: wake word + "play <title> by <artist>" → search query
         ▼
-yt-dlp search + download ──► songbird playback (ffmpeg decode)
+yt-dlp search + download ──► per-song file ──► songbird playback
+        │
+        ├──► dashboard embed in the alert channel (title, thumbnail, buttons)
+        ▼
+songbird reports the song ended ──► next song in the queue starts
 ```
 
 - **Autonomous joins**: joins when a user enters the configured channel, leaves
@@ -27,9 +31,11 @@ yt-dlp search + download ──► songbird playback (ffmpeg decode)
 - **Picks the popular song**: a request searches YouTube and plays the
   most-viewed result that looks like a real song — clips, covers, remixes,
   lyric videos, and long mixes are skipped.
-- **One file per song**: each song downloads to a file named after its video
-  id, so a request can never be served the audio of an earlier one, and asking
-  for the same song again reuses the download.
+- **Queues what it is asked for**: ask for a second song while one is playing
+  and it waits, starting on its own when the current one ends.
+- **Dashboard controls**: the alert channel carries a now-playing embed with
+  the song's thumbnail and Pause/Resume, Skip and Stop buttons. The message is
+  edited in place rather than replaced, so the channel does not fill up.
 - **Local speech-to-text**: transcription runs on your machine, no audio leaves
   the host.
 - **Minimal dependencies**: `serenity` + `songbird` + `whisper-rs` as crates
@@ -78,7 +84,7 @@ another.
 | `PARAKEET_MODEL`  | no       | Handy model id; the repo's Parakeet Q8_0 model by default |
 | `WHISPER_MODEL`   | no       | Path to a Whisper model file (default `data/model.bin`) |
 | `WAKE_WORDS`      | no       | Comma-separated wake words (default `bot,play,ut,ot`) |
-| `ALERT_CHANNEL_ID`| no       | Text channel for play confirmations (defaults to the server's system channel, then to the first text channel) |
+| `ALERT_CHANNEL_ID`| no       | Text channel for the now-playing dashboard (defaults to the server's system channel, then to the first text channel) |
 
 Secrets live in a gitignored `.env` file next to the binary, loaded through
 [`dotenvy`](https://crates.io/crates/dotenvy). Real environment variables take
@@ -95,6 +101,25 @@ speech-to-text often drops the first consonant of a short word.
 ```sh
 cargo run --release
 ```
+
+### Controlling playback
+
+The dashboard in the alert channel is the only control surface:
+
+| Button   | Effect                                                     |
+| -------- | ---------------------------------------------------------- |
+| Pause    | Pauses the current song; the button becomes Resume         |
+| Resume   | Carries on from where the song paused                        |
+| Skip     | Drops the current song and starts the next one queued       |
+| Stop     | Stops playback and clears the queue                         |
+
+`/stop` is separate: it also leaves the voice channel, so the bot stops
+transcribing until someone comes back.
+
+Each song is downloaded to its own file, named after its video id, so a
+request can never be served the audio of an earlier one. The newest few
+downloads are kept and the rest pruned, which keeps a repeated request
+instant and stops the cache growing without bound.
 
 ## Testing without Discord
 

@@ -1,4 +1,5 @@
 use crate::config::{AsrEngine, Config};
+use crate::dashboard;
 use crate::parakeet::HandyTranscriber;
 use crate::player::Player;
 use crate::state::{ConfigKey, HttpClientKey, PlayerKey, TranscriberKey};
@@ -9,7 +10,7 @@ use serenity::async_trait;
 use serenity::builder::{
     CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage,
 };
-use serenity::model::application::{Command, Interaction};
+use serenity::model::application::{Command, ComponentInteraction, Interaction};
 use serenity::model::gateway::Ready;
 use serenity::model::id::ChannelId;
 use serenity::model::voice::VoiceState;
@@ -120,10 +121,12 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        let Interaction::Command(command) = interaction else {
-            return;
-        };
-        self.slash_stop(&ctx, command).await;
+        match interaction {
+            Interaction::Command(command) => self.slash_stop(&ctx, command).await,
+            Interaction::Component(button) => self.dashboard_button(&ctx, button).await,
+            // Modal submissions and autocomplete have no dashboard buttons.
+            _ => {}
+        }
     }
 }
 
@@ -144,11 +147,6 @@ impl Handler {
             Ok(service) => match command.guild_id {
                 Some(guild_id) => {
                     let was_connected = service.manager.get(guild_id).is_some();
-                    // The player owns the current file, so it has to be told
-                    // as well as the voice service.
-                    if let Some(player) = ctx.data.read().await.get::<PlayerKey>().cloned() {
-                        player.stop(guild_id).await;
-                    }
                     match service.stop(guild_id).await {
                         Ok(()) if was_connected => "Left the voice channel.".to_string(),
                         Ok(()) => "I wasn't in a voice channel.".to_string(),
@@ -165,6 +163,57 @@ impl Handler {
         );
         if let Err(e) = command.create_response(&ctx.http, reply).await {
             println!("failed to respond to /stop: {e}");
+        }
+    }
+
+    /// Handles a press of one of the dashboard's buttons.
+    ///
+    /// The press is acknowledged straight away, because Discord fails an
+    /// interaction that goes unanswered within three seconds and a skip may
+    /// have to download nothing but still waits on the voice lock.
+    async fn dashboard_button(&self, ctx: &Context, button: ComponentInteraction) {
+        let Some(action) = dashboard::action_from_id(&button.data.custom_id) else {
+            // Some other component's press; not ours to answer.
+            return;
+        };
+        let Some(guild_id) = button.guild_id else {
+            return;
+        };
+        if let Err(e) = button.defer(&ctx.http).await {
+            println!("failed to acknowledge a dashboard button: {e}");
+            return;
+        }
+
+        let config = {
+            let data = ctx.data.read().await;
+            data.get::<ConfigKey>().cloned()
+        };
+        let player = {
+            let data = ctx.data.read().await;
+            data.get::<PlayerKey>().cloned()
+        };
+        let (Some(config), Some(player)) = (config, player) else {
+            println!("dashboard button pressed before the bot was ready");
+            return;
+        };
+
+        match action {
+            dashboard::ACTION_PAUSE | dashboard::ACTION_RESUME => {
+                match player.toggle_pause(guild_id).await {
+                    Some(true) => println!("[{guild_id}] paused"),
+                    Some(false) => println!("[{guild_id}] resumed"),
+                    None => println!("[{guild_id}] nothing to pause"),
+                }
+                player.draw_dashboard(ctx, &config, guild_id).await;
+            }
+            dashboard::ACTION_SKIP => {
+                player.skip(ctx, &config, guild_id).await;
+            }
+            dashboard::ACTION_STOP => {
+                player.stop(ctx, &config, guild_id).await;
+            }
+            // `action_from_id` only returns the four above.
+            _ => {}
         }
     }
 }

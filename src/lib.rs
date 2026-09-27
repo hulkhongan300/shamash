@@ -1,12 +1,14 @@
 pub mod audio;
 pub mod bot;
 pub mod config;
+pub mod dashboard;
 pub mod fetch;
 pub mod listener;
 pub mod parakeet;
 pub mod parser;
 pub mod pipeline;
 pub mod player;
+pub mod queue;
 pub mod search;
 pub mod state;
 pub mod transcriber;
