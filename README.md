@@ -62,8 +62,13 @@ Then create a gitignored `.env` next to the binary with your own values:
 cat > .env <<'EOF'
 DISCORD_TOKEN=your-bot-token
 VOICE_CHANNEL_ID=your-voice-channel-id
+ALERT_CHANNEL_ID=your-text-channel-id
 EOF
 ```
+
+`VOICE_CHANNEL_ID` is the channel the bot listens in, `ALERT_CHANNEL_ID` the one
+it writes to. With Developer Mode on in Discord, right-click either channel and
+choose "Copy Channel ID" to fill them in.
 
 Speech-to-text defaults to the Handy app with its Parakeet model, so there is
 nothing else to download. To fall back to the bundled Whisper instead, run
@@ -84,7 +89,7 @@ another.
 | `PARAKEET_MODEL`  | no       | Handy model id; the repo's Parakeet Q8_0 model by default |
 | `WHISPER_MODEL`   | no       | Path to a Whisper model file (default `data/model.bin`) |
 | `WAKE_WORDS`      | no       | Comma-separated wake words (default `bot,play,ut,ot`) |
-| `ALERT_CHANNEL_ID`| no       | Text channel for the now-playing dashboard (defaults to the server's system channel, then to the first text channel) |
+| `ALERT_CHANNEL_ID`| no       | Text channel for the now-playing dashboard and every other bot message (defaults to the server's system channel, then to the first text channel) |
 
 Secrets live in a gitignored `.env` file next to the binary, loaded through
 [`dotenvy`](https://crates.io/crates/dotenvy). Real environment variables take

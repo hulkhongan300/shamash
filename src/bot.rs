@@ -56,8 +56,8 @@ fn log_configuration(config: &Config) {
     println!("  wake words:    {}", wake_words.join(", "));
     println!("  voice channel: {}", config.voice_channel_id);
     match config.alert_channel_id {
-        Some(id) => println!("  alert channel: {id}"),
-        None => println!("  alert channel: auto (system channel, else first text channel)"),
+        Some(id) => println!("  text channel:  {id}"),
+        None => println!("  text channel:  auto (system channel, else first text channel)"),
     }
     match std::process::Command::new("yt-dlp")
         .arg("--version")

@@ -53,10 +53,7 @@ impl Config {
             std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "data/model.bin".to_string());
         let parakeet_model = std::env::var("PARAKEET_MODEL")
             .unwrap_or_else(|_| crate::parakeet::DEFAULT_MODEL.to_string());
-        let alert_channel_id = std::env::var("ALERT_CHANNEL_ID")
-            .ok()
-            .map(|value| value.parse())
-            .transpose()?;
+        let alert_channel_id = parse_optional_id(std::env::var("ALERT_CHANNEL_ID").ok())?;
         let wake_words = std::env::var("WAKE_WORDS")
             .map(|s| split_csv(&s))
             .unwrap_or_else(|_| DEFAULT_WAKE_WORDS.iter().map(|w| w.to_string()).collect())
@@ -72,6 +69,19 @@ impl Config {
             alert_channel_id,
         })
     }
+}
+
+/// Parses an optional channel id, treating blank as unset.
+///
+/// Blank is treated as unset so a placeholder line left in `.env` falls back
+/// to the default channel rather than refusing to start on a parse error.
+fn parse_optional_id(value: Option<String>) -> anyhow::Result<Option<u64>> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(Into::into)
 }
 
 fn split_csv(value: &str) -> Vec<String> {
@@ -95,6 +105,26 @@ mod tests {
     #[test]
     fn empty_csv_yields_no_wake_words() {
         assert!(split_csv(" , , ").is_empty());
+    }
+
+    #[test]
+    fn a_blank_optional_channel_id_means_unset() {
+        assert_eq!(parse_optional_id(Some(String::new())).unwrap(), None);
+        assert_eq!(parse_optional_id(Some("   ".to_string())).unwrap(), None);
+        assert_eq!(parse_optional_id(None).unwrap(), None);
+    }
+
+    #[test]
+    fn an_optional_channel_id_is_read_when_present() {
+        assert_eq!(
+            parse_optional_id(Some(" 12345 ".to_string())).unwrap(),
+            Some(12345)
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_optional_channel_id_is_rejected() {
+        assert!(parse_optional_id(Some("not-a-channel".to_string())).is_err());
     }
 
     #[test]
