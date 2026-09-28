@@ -7,12 +7,15 @@
 //!
 //!     cargo run --release --example transcribe -- path/to/recording.wav
 //!
-//! Requires a Whisper model. Fetch one with `scripts/setup.sh` (default
-//! `data/model.bin`) or point at another with `WHISPER_MODEL`.
+//! Requires a Whisper model, because the harness drives the bundled engine
+//! directly. Fetch one with `scripts/setup.sh` (default `data/model.bin`) or
+//! point at another with `WHISPER_MODEL`. The bot itself defaults to the Handy
+//! app and Parakeet instead; set `ASR_ENGINE=whisper` to use this engine there
+//! too.
 
 use anyhow::Context;
 use shamash::audio::{Resampler, VadBuffer, rms};
-use shamash::config::{Config, DEFAULT_WAKE_WORDS};
+use shamash::config::{AsrEngine, Config, DEFAULT_WAKE_WORDS};
 use shamash::listener::{VAD_GAP_FRAMES, VAD_MAX_FRAMES, VAD_RMS_THRESHOLD};
 use shamash::parser::CommandParser;
 use shamash::transcriber::Transcriber;
@@ -39,7 +42,11 @@ fn main() -> anyhow::Result<()> {
         // The rest of the config is unused by this harness.
         discord_token: String::new(),
         voice_channel_id: 0,
+        // The harness always drives Whisper directly; the bot picks its engine
+        // from the environment instead.
+        asr_engine: AsrEngine::Whisper,
         whisper_model: model_path.clone(),
+        parakeet_model: shamash::parakeet::DEFAULT_MODEL.to_string(),
         alert_channel_id: None,
     };
 

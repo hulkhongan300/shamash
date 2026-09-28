@@ -2,6 +2,13 @@ use crate::transcriber::Transcriber;
 use anyhow::Context;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+/// The language the transcriber is tuned for.
+///
+/// Commands are spoken in one language, so declaring it skips Whisper's
+/// language-detection pass and stops it from spending the budget on a wrong
+/// guess.
+const LANGUAGE: &str = "en";
+
 /// Whisper-backed [`Transcriber`] running whisper.cpp locally.
 ///
 /// whisper.cpp is not thread-safe across concurrent transcriptions, so all
@@ -41,6 +48,8 @@ impl Transcriber for WhisperTranscriber {
         params.set_n_threads(self.threads);
         params.set_print_special(false);
         params.set_print_progress(false);
+        params.set_language(Some(LANGUAGE));
+        params.set_translate(false);
         state
             .full(params, samples)
             .context("failed to transcribe audio")?;

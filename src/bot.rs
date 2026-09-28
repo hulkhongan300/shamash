@@ -1,5 +1,8 @@
-use crate::config::Config;
-use crate::state::{ConfigKey, HttpClientKey, TranscriberKey};
+use crate::config::{AsrEngine, Config};
+use crate::dashboard;
+use crate::parakeet::HandyTranscriber;
+use crate::player::Player;
+use crate::state::{ConfigKey, HttpClientKey, PlayerKey, TranscriberKey};
 use crate::transcriber::Transcriber;
 use crate::voice::{VoiceService, decode_config};
 use crate::whisper::WhisperTranscriber;
@@ -7,7 +10,7 @@ use serenity::async_trait;
 use serenity::builder::{
     CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage,
 };
-use serenity::model::application::{Command, Interaction};
+use serenity::model::application::{Command, ComponentInteraction, Interaction};
 use serenity::model::gateway::Ready;
 use serenity::model::id::ChannelId;
 use serenity::model::voice::VoiceState;
@@ -16,8 +19,10 @@ use songbird::SerenityInit;
 use std::sync::Arc;
 
 pub async fn start(config: Config) -> anyhow::Result<()> {
-    let transcriber: Arc<dyn Transcriber> =
-        Arc::new(WhisperTranscriber::new(&config.whisper_model, 4)?);
+    let transcriber: Arc<dyn Transcriber> = match config.asr_engine {
+        AsrEngine::Handy => Arc::new(HandyTranscriber::new(&config.parakeet_model)),
+        AsrEngine::Whisper => Arc::new(WhisperTranscriber::new(&config.whisper_model, 4)?),
+    };
     log_configuration(&config);
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
@@ -28,6 +33,7 @@ pub async fn start(config: Config) -> anyhow::Result<()> {
         .type_map_insert::<HttpClientKey>(reqwest::Client::new())
         .type_map_insert::<TranscriberKey>(transcriber)
         .await?;
+
     client.start().await?;
     Ok(())
 }
@@ -37,12 +43,21 @@ fn log_configuration(config: &Config) {
     let mut wake_words: Vec<&str> = config.wake_words.iter().map(String::as_str).collect();
     wake_words.sort_unstable();
     println!("Shamash starting up");
-    println!("  whisper model: {}", config.whisper_model);
+    match config.asr_engine {
+        AsrEngine::Handy => {
+            println!("  asr engine:    handy (parakeet)");
+            println!("  parakeet model: {}", config.parakeet_model);
+        }
+        AsrEngine::Whisper => {
+            println!("  asr engine:    whisper (bundled)");
+            println!("  whisper model: {}", config.whisper_model);
+        }
+    }
     println!("  wake words:    {}", wake_words.join(", "));
     println!("  voice channel: {}", config.voice_channel_id);
     match config.alert_channel_id {
-        Some(id) => println!("  alert channel: {id}"),
-        None => println!("  alert channel: auto (system channel, else first text channel)"),
+        Some(id) => println!("  text channel:  {id}"),
+        None => println!("  text channel:  auto (system channel, else first text channel)"),
     }
     match std::process::Command::new("yt-dlp")
         .arg("--version")
@@ -66,6 +81,19 @@ impl EventHandler for Handler {
             CreateCommand::new("stop").description("Stop playback and leave the voice channel");
         if let Err(e) = Command::create_global_command(&ctx.http, command).await {
             println!("failed to register /stop command: {e}");
+        }
+
+        // One player for the whole process, so the voice listener and the
+        // dashboard buttons act on the same queue. Built here because that is
+        // the first point the songbird manager can be reached.
+        match songbird::get(&ctx).await {
+            Some(manager) => {
+                ctx.data
+                    .write()
+                    .await
+                    .insert::<PlayerKey>(Arc::new(Player::new(manager)));
+            }
+            None => println!("songbird unavailable, playback is disabled"),
         }
     }
 
@@ -93,14 +121,29 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        let Interaction::Command(command) = interaction else {
-            return;
-        };
+        match interaction {
+            Interaction::Command(command) => self.slash_stop(&ctx, command).await,
+            Interaction::Component(button) => self.dashboard_button(&ctx, button).await,
+            // Modal submissions and autocomplete have no dashboard buttons.
+            _ => {}
+        }
+    }
+}
+
+/// The interaction handlers, split out of the [`EventHandler`] impl because
+/// they are plain methods rather than events.
+impl Handler {
+    /// Handles `/stop`, which leaves the voice channel as well as stopping.
+    async fn slash_stop(
+        &self,
+        ctx: &Context,
+        command: serenity::model::application::CommandInteraction,
+    ) {
         if command.data.name != "stop" {
             return;
         }
 
-        let response = match VoiceService::from_ctx(&ctx).await {
+        let response = match VoiceService::from_ctx(ctx).await {
             Ok(service) => match command.guild_id {
                 Some(guild_id) => {
                     let was_connected = service.manager.get(guild_id).is_some();
@@ -120,6 +163,57 @@ impl EventHandler for Handler {
         );
         if let Err(e) = command.create_response(&ctx.http, reply).await {
             println!("failed to respond to /stop: {e}");
+        }
+    }
+
+    /// Handles a press of one of the dashboard's buttons.
+    ///
+    /// The press is acknowledged straight away, because Discord fails an
+    /// interaction that goes unanswered within three seconds and a skip may
+    /// have to download nothing but still waits on the voice lock.
+    async fn dashboard_button(&self, ctx: &Context, button: ComponentInteraction) {
+        let Some(action) = dashboard::action_from_id(&button.data.custom_id) else {
+            // Some other component's press; not ours to answer.
+            return;
+        };
+        let Some(guild_id) = button.guild_id else {
+            return;
+        };
+        if let Err(e) = button.defer(&ctx.http).await {
+            println!("failed to acknowledge a dashboard button: {e}");
+            return;
+        }
+
+        let config = {
+            let data = ctx.data.read().await;
+            data.get::<ConfigKey>().cloned()
+        };
+        let player = {
+            let data = ctx.data.read().await;
+            data.get::<PlayerKey>().cloned()
+        };
+        let (Some(config), Some(player)) = (config, player) else {
+            println!("dashboard button pressed before the bot was ready");
+            return;
+        };
+
+        match action {
+            dashboard::ACTION_PAUSE | dashboard::ACTION_RESUME => {
+                match player.toggle_pause(guild_id).await {
+                    Some(true) => println!("[{guild_id}] paused"),
+                    Some(false) => println!("[{guild_id}] resumed"),
+                    None => println!("[{guild_id}] nothing to pause"),
+                }
+                player.draw_dashboard(ctx, &config, guild_id).await;
+            }
+            dashboard::ACTION_SKIP => {
+                player.skip(ctx, &config, guild_id).await;
+            }
+            dashboard::ACTION_STOP => {
+                player.stop(ctx, &config, guild_id).await;
+            }
+            // `action_from_id` only returns the four above.
+            _ => {}
         }
     }
 }

@@ -15,6 +15,25 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "cache", "builder"] }
 songbird = { version = "0.6.0", features = ["receive"] }
+# Songbird depends on symphonia with `default-features = false` and exposes no
+# feature to turn format handlers back on, so its probe registry is empty and
+# every input fails with "no suitable format reader found". Depending on
+# symphonia directly enables the handlers; Cargo unifies the features into the
+# copy songbird links against.
+# `wav`+`pcm` decode the acknowledgement tone, `mkv`+`vorbis` decode the
+# WebM/Opus audio YouTube serves, and the rest cover the other formats a search
+# result can come back as.
+symphonia = { version = "0.5.5", default-features = false, features = [
+    "aac",
+    "flac",
+    "isomp4",
+    "mkv",
+    "mp3",
+    "ogg",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

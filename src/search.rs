@@ -47,6 +47,12 @@ pub struct Candidate {
     pub duration: Option<f64>,
     /// Uploading channel, used as the artist hint in logs.
     pub channel: Option<String>,
+    /// Bare video id, which the dashboard needs to build a thumbnail URL.
+    ///
+    /// Not every yt-dlp version reports it, so it may be absent even when the
+    /// id is recoverable from `url`.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 impl Candidate {
@@ -56,6 +62,17 @@ impl Candidate {
 
     pub fn channel(&self) -> &str {
         self.channel.as_deref().unwrap_or("unknown channel")
+    }
+
+    /// The video id, used to build the dashboard thumbnail URL.
+    ///
+    /// Prefers the reported id and falls back to reading it out of the URL,
+    /// which yt-dlp writes in a few shapes depending on version and mode.
+    pub fn video_id(&self) -> Option<&str> {
+        if let Some(id) = self.id.as_deref().filter(|id| !id.is_empty()) {
+            return Some(id);
+        }
+        url_video_id(&self.url)
     }
 
     /// Whether the result looks like a song rather than a clip, cover, or mix.
@@ -118,6 +135,37 @@ fn select(entries: &[Candidate]) -> Option<&Candidate> {
         .or_else(|| entries.iter().max_by_key(|entry| entry.views()))
 }
 
+/// Reads the video id out of a YouTube URL.
+///
+/// Handles the bare id that `--flat-playlist` search emits, the `watch?v=`
+/// form, and the `youtu.be/` and `/shorts/` paths, so a thumbnail can be built
+/// whichever shape a given yt-dlp version produces.
+fn url_video_id(url: &str) -> Option<&str> {
+    const PREFIXES: [&str; 4] = [
+        "https://www.youtube.com/watch?v=",
+        "https://youtube.com/watch?v=",
+        "https://youtu.be/",
+        "https://www.youtube.com/shorts/",
+    ];
+    for prefix in PREFIXES {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            let id = rest.split(['&', '?']).next().unwrap_or(rest);
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    // A bare id, which is what a flat playlist search reports.
+    if !url.is_empty()
+        && url
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Some(url);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +177,7 @@ mod tests {
             view_count: views,
             duration,
             channel: Some("someone".to_string()),
+            id: None,
         }
     }
 
@@ -187,6 +236,52 @@ mod tests {
         assert!(select(&[]).is_none());
     }
 
+    #[test]
+    fn reads_the_video_id_from_every_url_shape() {
+        // --flat-playlist search reports these in different shapes depending
+        // on version, and the dashboard needs the id for the thumbnail.
+        for (url, expected) in [
+            ("https://www.youtube.com/watch?v=09839DpTctU", "09839DpTctU"),
+            ("https://youtube.com/watch?v=09839DpTctU", "09839DpTctU"),
+            ("https://youtu.be/09839DpTctU", "09839DpTctU"),
+            ("https://www.youtube.com/shorts/09839DpTctU", "09839DpTctU"),
+            (
+                "https://www.youtube.com/watch?v=09839DpTctU&t=42s",
+                "09839DpTctU",
+            ),
+            ("09839DpTctU", "09839DpTctU"),
+        ] {
+            assert_eq!(url_video_id(url), Some(expected), "from {url}");
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_url_has_no_video_id() {
+        for url in ["", "https://example.com/watch", "https://vimeo.com/12345"] {
+            assert_eq!(url_video_id(url), None, "from {url}");
+        }
+    }
+
+    #[test]
+    fn a_reported_id_beats_parsing_the_url() {
+        let mut entry = candidate("song", Some(1), Some(200.0));
+        entry.id = Some("reported-id".to_string());
+        assert_eq!(entry.video_id(), Some("reported-id"));
+    }
+
+    #[test]
+    fn the_video_id_falls_back_to_the_url() {
+        let entry = candidate("09839DpTctU", Some(1), Some(200.0));
+        assert_eq!(entry.video_id(), Some("09839DpTctU"));
+    }
+
+    #[test]
+    fn an_empty_reported_id_falls_back_to_the_url() {
+        let mut entry = candidate("09839DpTctU", Some(1), Some(200.0));
+        entry.id = Some(String::new());
+        assert_eq!(entry.video_id(), Some("09839DpTctU"));
+    }
+
     /// Hits the real YouTube via yt-dlp. Ignored by default because it needs
     /// network access and the yt-dlp binary:
     /// `cargo test -- --ignored search`.
@@ -198,5 +293,9 @@ mod tests {
             .expect("search should find a song");
         println!("picked: {} ({:?})", found.title(), found.view_count);
         assert!(!found.url.is_empty());
+        assert!(
+            found.video_id().is_some(),
+            "a search hit must yield a thumbnail id"
+        );
     }
 }
