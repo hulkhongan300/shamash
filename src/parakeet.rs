@@ -107,7 +107,12 @@ impl Transcriber for HandyTranscriber {
             .with_context(|| format!("failed to write {}", path.display()))?;
 
         let result = self.run(&path);
-        let _ = std::fs::remove_file(&path);
+        // The WAV only exists to be handed to the subprocess, so a failure to
+        // delete it is worth a warning: it accumulates in the working directory
+        // otherwise.
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!("could not remove temp wav {}: {e}", path.display());
+        }
         let output = result?;
 
         println!(
