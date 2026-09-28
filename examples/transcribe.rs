@@ -7,29 +7,34 @@
 //!
 //!     cargo run --release --example transcribe -- path/to/recording.wav
 //!
-//! Requires a Whisper model, because the harness drives the bundled engine
-//! directly. Fetch one with `scripts/setup.sh` (default `data/model.bin`) or
-//! point at another with `WHISPER_MODEL`. The bot itself defaults to the Handy
-//! app and Parakeet instead; set `ASR_ENGINE=whisper` to use this engine there
-//! too.
+//! Uses the same engine as the bot: the in-process transcribe.cpp one, with the
+//! default Parakeet model. Point it elsewhere with `PARAKEET_MODEL`, and set
+//! `ASR_LANGUAGE=en` for models that need a language hint.
 
 use anyhow::Context;
 use shamash::audio::{Resampler, VadBuffer, rms};
 use shamash::config::{AsrEngine, Config, DEFAULT_WAKE_WORDS};
+use shamash::direct::DirectTranscriber;
 use shamash::listener::{VAD_GAP_FRAMES, VAD_MAX_FRAMES, VAD_RMS_THRESHOLD};
 use shamash::parser::CommandParser;
 use shamash::transcriber::Transcriber;
-use shamash::whisper::WhisperTranscriber;
 use std::path::Path;
 
 fn main() -> anyhow::Result<()> {
     let wav_path = std::env::args()
         .nth(1)
         .context("usage: transcribe <recording.wav>")?;
-    let model_path =
-        std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "data/model.bin".to_string());
-    let transcriber = WhisperTranscriber::new(&model_path, 4)
-        .with_context(|| format!("failed to load Whisper model at '{model_path}'"))?;
+    let parakeet_model = std::env::var("PARAKEET_MODEL")
+        .unwrap_or_else(|_| shamash::model::DEFAULT_MODEL_ID.to_string());
+    let asr_language = std::env::var("ASR_LANGUAGE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let transcriber: Box<dyn Transcriber> = Box::new(DirectTranscriber::new(
+        &parakeet_model,
+        asr_language.as_deref(),
+    )?);
 
     let config = Config {
         wake_words: std::env::var("WAKE_WORDS")
@@ -42,11 +47,11 @@ fn main() -> anyhow::Result<()> {
         // The rest of the config is unused by this harness.
         discord_token: String::new(),
         voice_channel_id: 0,
-        // The harness always drives Whisper directly; the bot picks its engine
-        // from the environment instead.
-        asr_engine: AsrEngine::Whisper,
-        whisper_model: model_path.clone(),
-        parakeet_model: shamash::parakeet::DEFAULT_MODEL.to_string(),
+        // The harness drives the engine directly; the bot picks its own from
+        // the environment instead.
+        asr_engine: AsrEngine::Direct,
+        parakeet_model,
+        asr_language,
         alert_channel_id: None,
     };
 
@@ -60,10 +65,10 @@ fn main() -> anyhow::Result<()> {
     let parser = CommandParser::new(config.wake_words.clone());
 
     let mut vad = VadBuffer::new(320, VAD_RMS_THRESHOLD, VAD_GAP_FRAMES, VAD_MAX_FRAMES);
-    let mut stored = String::new();
     let mut peak = 0.0f32;
     let mut frames_heard = 0usize;
     let mut frames_total = 0usize;
+    let mut spoke = false;
     for frame in resampled.as_chunks::<320>().0 {
         frames_total += 1;
         let level = rms(frame);
@@ -71,20 +76,13 @@ fn main() -> anyhow::Result<()> {
         if level >= VAD_RMS_THRESHOLD {
             frames_heard += 1;
         }
-        let utterance = vad.push(frame);
-        if utterance.is_empty() {
-            continue;
-        }
-        let transcript = transcriber
-            .transcribe(&utterance)
-            .with_context(|| format!("transcription failed for {wav_path}"))?;
-        println!("heard: {transcript:?}");
-        stored.push_str(&transcript);
-        stored.push(' ');
-        match parser.parse_with_reason(&transcript) {
-            Ok(request) => println!("play: {}", request.query),
-            Err(miss) => println!("not a play command: {miss}"),
-        }
+        spoke |= report(&vad.push(frame), transcriber.as_ref(), &parser)?;
+    }
+    // The buffer flushes on a long silence or at the frame cap, so a recording
+    // that stops mid-sentence would never be transcribed. A synthetic tail of
+    // silence stands in for the speaker having finished.
+    for _ in 0..VAD_GAP_FRAMES {
+        spoke |= report(&vad.push(&[0.0; 320]), transcriber.as_ref(), &parser)?;
     }
 
     // Level report, so a threshold that is wrong for this voice is visible
@@ -105,11 +103,34 @@ fn main() -> anyhow::Result<()> {
             "nothing crossed the gate; speak louder or closer, or lower VAD_RMS_THRESHOLD in src/listener.rs"
         );
     }
-    if stored.trim().is_empty() {
+    if !spoke {
         println!("no speech detected; try a louder or longer recording");
     }
     println!("done.");
     Ok(())
+}
+
+/// Transcribes one completed utterance and reports what the parser made of it.
+///
+/// Returns whether there was any speech, so the caller can tell an empty
+/// recording from one that merely failed to parse.
+fn report(
+    utterance: &[f32],
+    transcriber: &dyn Transcriber,
+    parser: &CommandParser,
+) -> anyhow::Result<bool> {
+    if utterance.is_empty() {
+        return Ok(false);
+    }
+    let transcript = transcriber
+        .transcribe(utterance)
+        .context("transcription failed")?;
+    println!("heard: {transcript:?}");
+    match parser.parse_with_reason(&transcript) {
+        Ok(request) => println!("play: {}", request.query),
+        Err(miss) => println!("not a play command: {miss}"),
+    }
+    Ok(true)
 }
 
 /// Full-scale decibel level of a linear amplitude.

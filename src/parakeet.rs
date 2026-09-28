@@ -20,8 +20,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// real VAD utterances. Both would drop commands.
 ///
 /// Override with `PARAKEET_MODEL` to try another model without editing code.
-pub const DEFAULT_MODEL: &str =
-    "handy-computer/parakeet-tdt_ctc-110m-gguf/parakeet-tdt_ctc-110m-Q8_0.gguf";
+///
+/// Shared with the in-process engine, so `ASR_ENGINE=handy` and
+/// `ASR_ENGINE=direct` cannot silently drift onto different models.
+pub use crate::model::DEFAULT_MODEL_ID as DEFAULT_MODEL;
 
 /// Hands each utterance to the Handy app's headless batch mode and returns the
 /// text it prints.
@@ -71,7 +73,8 @@ impl HandyTranscriber {
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     anyhow::anyhow!(
-                        "could not find '{}' on path; install the Handy app or set ASR_ENGINE=whisper",
+                        "could not find '{}' on path; install the Handy app, or drop \
+                         ASR_ENGINE=handy to use the in-process engine, which does not need it",
                         self.program
                     )
                 } else {
@@ -244,7 +247,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(err.contains("could not find"), "unhelpful error: {err}");
         assert!(
-            err.contains("ASR_ENGINE=whisper"),
+            err.contains("in-process engine"),
             "no fallback named: {err}"
         );
     }

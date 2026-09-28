@@ -15,7 +15,7 @@ Discord voice (Opus @ 48 kHz) ──► songbird receive
         ▼
 Resampler (48 kHz → 16 kHz) ──► VAD buffer (flushes on silence)
         ▼
-Parakeet (local, via the Handy app) → transcript
+Parakeet (local, transcribe.cpp linked in) → transcript
         ▼
 Parser: wake word + "play <title> by <artist>" → search query
         ▼
@@ -38,23 +38,25 @@ songbird reports the song ended ──► next song in the queue starts
   edited in place rather than replaced, so the channel does not fill up.
 - **Local speech-to-text**: transcription runs on your machine, no audio leaves
   the host.
-- **Minimal dependencies**: `serenity` + `songbird` + `whisper-rs` as crates
-  (+ `dotenvy` for `.env` loading); the Handy app (or `yt-dlp` + `ffmpeg` for
-  the music pipeline) as the only system tools.
+- **Few dependencies**: `serenity` + `songbird` + `transcribe-cpp` as crates
+  (+ `dotenvy` for `.env` loading); `yt-dlp` + `ffmpeg` for the music pipeline.
 
 ## Prerequisites
 
 - Rust (edition 2024)
-- System packages: `ffmpeg`, `yt-dlp`, `libopus-dev`, `pkg-config`, `cmake`
-- The [Handy](https://github.com/cjpais/Handy) app for the default
-  speech-to-text engine (it owns the Parakeet model and picks the GPU backend)
+- System packages: `ffmpeg`, `yt-dlp`, `libopus-dev`, `pkg-config`, `cmake`,
+  and a C/C++ toolchain (`transcribe-cpp` builds its engine from source)
+- A Parakeet GGUF model. The default one comes from the
+  [Handy](https://github.com/cjpais/Handy) app's Hugging Face cache, so
+  installing Handy once is the easiest way to get it
 - A Discord application with a bot token (enable voice gateway intents)
 
 ## Setup
 
-```sh
-scripts/setup.sh        # downloads a Whisper model to data/model.bin
-```
+Install the [Handy](https://github.com/cjpais/Handy) app once and pick a
+Parakeet model in it, so the weights land in the Hugging Face cache that
+`PARAKEET_MODEL` resolves against. Or skip it and point `PARAKEET_MODEL`
+straight at any transcribe.cpp GGUF.
 
 Then create a gitignored `.env` next to the binary with your own values:
 
@@ -70,14 +72,24 @@ EOF
 it writes to. With Developer Mode on in Discord, right-click either channel and
 choose "Copy Channel ID" to fill them in.
 
-Speech-to-text defaults to the Handy app with its Parakeet model, so there is
-nothing else to download. To fall back to the bundled Whisper instead, run
-`scripts/setup.sh` (downloads a model to `data/model.bin`) and set
-`ASR_ENGINE=whisper`.
+Speech-to-text links [transcribe.cpp](https://github.com/cjpais/Handy) into
+the bot and keeps the model loaded, so an utterance costs inference time only.
+Measured here on a 2 s utterance with Parakeet TDT+CTC 110M: 90 ms in-process
+versus 346 ms through `handy --transcribe-file`, which reloads the model and
+starts a Tauri app every time. `cargo run --release --example bench_direct --
+recording.wav` prints the same split.
 
-`scripts/setup.sh` defaults to `base.en-q5_1`; pass any of `tiny.en tiny
-base.en base small.en small` (optionally `-q5_1`/`-q8_0` variants) to pick
-another.
+`PARAKEET_MODEL` takes either a path to a `.gguf` or a Handy catalogue id, which
+is resolved against the Hugging Face cache. Some models (Canary, Nemotron) need
+a language hint to produce text at all; set `ASR_LANGUAGE=en` for those.
+
+`ASR_ENGINE=handy` restores the old subprocess behaviour, which is slower but
+useful for comparing engines on the same audio.
+
+Whisper models work the same way, as GGUFs, through this engine. The old
+`whisper-rs` engine and `scripts/setup.sh` are gone: it vendored its own copy
+of `ggml` and could not be linked alongside transcribe.cpp, so one had to go.
+`ASR_ENGINE=whisper` now fails with a message saying so.
 
 ### Environment variables
 
@@ -85,9 +97,9 @@ another.
 | ----------------- | -------- | -------------------------------------------------- |
 | `DISCORD_TOKEN`   | yes      | Bot token from the Discord developer portal        |
 | `VOICE_CHANNEL_ID`| yes      | ID of the voice channel the bot watches and joins  |
-| `ASR_ENGINE`      | no       | `handy` (default, Parakeet) or `whisper` (bundled) |
-| `PARAKEET_MODEL`  | no       | Handy model id; the repo's Parakeet Q8_0 model by default |
-| `WHISPER_MODEL`   | no       | Path to a Whisper model file (default `data/model.bin`) |
+| `ASR_ENGINE`      | no       | `direct` (default, in-process transcribe.cpp) or `handy` (subprocess) |
+| `PARAKEET_MODEL`  | no       | Path to a `.gguf`, or a Handy model id; the Handy cache's Parakeet TDT+CTC 110M by default |
+| `ASR_LANGUAGE`    | no       | Language hint for models that need one, e.g. `en` for Canary or Nemotron |
 | `WAKE_WORDS`      | no       | Comma-separated wake words (default `bot,play,ut,ot`) |
 | `ALERT_CHANNEL_ID`| no       | Text channel for the now-playing dashboard and every other bot message (defaults to the server's system channel, then to the first text channel) |
 

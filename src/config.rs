@@ -13,18 +13,26 @@ pub const DEFAULT_WAKE_WORDS: &[&str] = &["bot", "play", "ut", "ot"];
 /// Which speech-to-text engine transcribes speech.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsrEngine {
-    /// The Handy app, which owns a Parakeet model and the GPU backend.
+    /// transcribe.cpp linked directly into this process, model held resident.
+    Direct,
+    /// The Handy app, kept as a fallback; loads a model per utterance.
     Handy,
-    /// The bundled whisper.cpp model.
-    Whisper,
 }
 
 impl AsrEngine {
     fn parse(value: &str) -> anyhow::Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
+        let value = value.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "direct" | "transcribe-cpp" | "tcpp" => Ok(Self::Direct),
             "handy" | "parakeet" => Ok(Self::Handy),
-            "whisper" => Ok(Self::Whisper),
-            other => anyhow::bail!("unknown ASR_ENGINE '{other}'; use 'handy' or 'whisper'"),
+            // Whisper used to be a separate engine here. It now runs through
+            // transcribe.cpp like every other model.
+            "whisper" => anyhow::bail!(
+                "ASR_ENGINE=whisper is gone: the bundled whisper-rs engine cannot be \
+                 linked alongside transcribe.cpp, which replaced it. Use \
+                 ASR_ENGINE=direct and set PARAKEET_MODEL to a Whisper GGUF."
+            ),
+            other => anyhow::bail!("unknown ASR_ENGINE '{other}'; use 'direct' or 'handy'"),
         }
     }
 }
@@ -35,8 +43,8 @@ pub struct Config {
     pub discord_token: String,
     pub voice_channel_id: u64,
     pub asr_engine: AsrEngine,
-    pub whisper_model: String,
     pub parakeet_model: String,
+    pub asr_language: Option<String>,
     pub wake_words: HashSet<String>,
     pub alert_channel_id: Option<u64>,
 }
@@ -47,12 +55,16 @@ impl Config {
         let voice_channel_id = std::env::var("VOICE_CHANNEL_ID")?.parse()?;
         let asr_engine = match std::env::var("ASR_ENGINE") {
             Ok(value) => AsrEngine::parse(&value)?,
-            Err(_) => AsrEngine::Handy,
+            Err(_) => AsrEngine::Direct,
         };
-        let whisper_model =
-            std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "data/model.bin".to_string());
         let parakeet_model = std::env::var("PARAKEET_MODEL")
-            .unwrap_or_else(|_| crate::parakeet::DEFAULT_MODEL.to_string());
+            .unwrap_or_else(|_| crate::model::DEFAULT_MODEL_ID.into());
+        // Only the models that cannot detect a language for themselves need
+        // this; Canary and Nemotron return empty text without it.
+        let asr_language = std::env::var("ASR_LANGUAGE")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let alert_channel_id = parse_optional_id(std::env::var("ALERT_CHANNEL_ID").ok())?;
         let wake_words = std::env::var("WAKE_WORDS")
             .map(|s| split_csv(&s))
@@ -63,8 +75,8 @@ impl Config {
             discord_token,
             voice_channel_id,
             asr_engine,
-            whisper_model,
             parakeet_model,
+            asr_language,
             wake_words,
             alert_channel_id,
         })
@@ -131,7 +143,19 @@ mod tests {
     fn asr_engine_names_are_case_insensitive() {
         assert_eq!(AsrEngine::parse("Handy").unwrap(), AsrEngine::Handy);
         assert_eq!(AsrEngine::parse(" parakeet ").unwrap(), AsrEngine::Handy);
-        assert_eq!(AsrEngine::parse("WHISPER").unwrap(), AsrEngine::Whisper);
+        assert_eq!(AsrEngine::parse("DIRECT").unwrap(), AsrEngine::Direct);
+        assert_eq!(
+            AsrEngine::parse(" transcribe-cpp ").unwrap(),
+            AsrEngine::Direct
+        );
+    }
+
+    /// The removed engine's name should point at the replacement rather than
+    /// be reported as unknown.
+    #[test]
+    fn the_removed_whisper_engine_says_where_to_go() {
+        let err = AsrEngine::parse("whisper").unwrap_err().to_string();
+        assert!(err.contains("ASR_ENGINE=direct"), "unhelpful error: {err}");
     }
 
     #[test]

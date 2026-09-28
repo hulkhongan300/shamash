@@ -35,6 +35,19 @@ symphonia = { version = "0.5.5", default-features = false, features = [
     "wav",
 ] }
 tokio = { version = "1.53.1", features = ["full"] }
+# transcribe.cpp, the same engine the Handy app wraps, linked directly instead
+# of through `handy --transcribe-file`. Spawning that binary cost ~180 ms of app
+# startup and a full model load on *every* utterance; holding the model in
+# process makes a command cost only inference. The crate vendors and builds the
+# C++ tree, so there is no dependency on the Handy install at runtime.
+# `vulkan` is deliberately off: the Vulkan *runtime* is installed on this
+# machine but the SDK headers are not, and the backend will not compile without
+# them. Turn the feature on after `pacman -S vulkan-headers` to use the GPU.
+transcribe-cpp = "0.2.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
-whisper-rs = "0.16.0"
+# transcribe.cpp is the speech engine. It replaced whisper-rs, which cannot
+# coexist with it: both vendor their own copy of ggml and export the same C
+# symbols, so a binary linking both dies with duplicate-symbol errors. Whisper
+# models still work, as GGUFs, through this engine.
+
