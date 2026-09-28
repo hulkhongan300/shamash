@@ -21,13 +21,6 @@ impl TypeMapKey for PlayerKey {
     type Value = std::sync::Arc<Player>;
 }
 
-/// Type-map key holding the shared HTTP client used for music lookups.
-pub struct HttpClientKey;
-
-impl TypeMapKey for HttpClientKey {
-    type Value = reqwest::Client;
-}
-
 /// Type-map key holding the shared speech-to-text transcriber.
 pub struct TranscriberKey;
 
