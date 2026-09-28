@@ -1,0 +1,155 @@
+# Shamash
+
+A wake-word Discord music bot written in Rust.
+
+Shamash joins a designated voice channel whenever a member enters it, listens
+to what people say, and plays music when it hears a request:
+
+> **"Shamash, play Dracula by Tame Impala"**
+
+## How it works
+
+```
+Discord voice (Opus @ 48 kHz) ──► songbird receive
+        │  VoiceTick → PCM (mono f32 48 kHz)
+        ▼
+Resampler (48 kHz → 16 kHz) ──► VAD buffer (flushes on silence)
+        ▼
+Parakeet (local, via the Handy app) → transcript
+        ▼
+Parser: wake word + "play <title> by <artist>" → search query
+        ▼
+yt-dlp search + download ──► per-song file ──► songbird playback
+        │
+        ├──► dashboard embed in the alert channel (title, thumbnail, buttons)
+        ▼
+songbird reports the song ended ──► next song in the queue starts
+```
+
+- **Autonomous joins**: joins when a user enters the configured channel, leaves
+  when it is empty.
+- **Picks the popular song**: a request searches YouTube and plays the
+  most-viewed result that looks like a real song — clips, covers, remixes,
+  lyric videos, and long mixes are skipped.
+- **Queues what it is asked for**: ask for a second song while one is playing
+  and it waits, starting on its own when the current one ends.
+- **Dashboard controls**: the alert channel carries a now-playing embed with
+  the song's thumbnail and Pause/Resume, Skip and Stop buttons. The message is
+  edited in place rather than replaced, so the channel does not fill up.
+- **Local speech-to-text**: transcription runs on your machine, no audio leaves
+  the host.
+- **Minimal dependencies**: `serenity` + `songbird` + `whisper-rs` as crates
+  (+ `dotenvy` for `.env` loading); the Handy app (or `yt-dlp` + `ffmpeg` for
+  the music pipeline) as the only system tools.
+
+## Prerequisites
+
+- Rust (edition 2024)
+- System packages: `ffmpeg`, `yt-dlp`, `libopus-dev`, `pkg-config`, `cmake`
+- The [Handy](https://github.com/cjpais/Handy) app for the default
+  speech-to-text engine (it owns the Parakeet model and picks the GPU backend)
+- A Discord application with a bot token (enable voice gateway intents)
+
+## Setup
+
+```sh
+scripts/setup.sh        # downloads a Whisper model to data/model.bin
+```
+
+Then create a gitignored `.env` next to the binary with your own values:
+
+```sh
+cat > .env <<'EOF'
+DISCORD_TOKEN=your-bot-token
+VOICE_CHANNEL_ID=your-voice-channel-id
+ALERT_CHANNEL_ID=your-text-channel-id
+EOF
+```
+
+`VOICE_CHANNEL_ID` is the channel the bot listens in, `ALERT_CHANNEL_ID` the one
+it writes to. With Developer Mode on in Discord, right-click either channel and
+choose "Copy Channel ID" to fill them in.
+
+Speech-to-text defaults to the Handy app with its Parakeet model, so there is
+nothing else to download. To fall back to the bundled Whisper instead, run
+`scripts/setup.sh` (downloads a model to `data/model.bin`) and set
+`ASR_ENGINE=whisper`.
+
+`scripts/setup.sh` defaults to `base.en-q5_1`; pass any of `tiny.en tiny
+base.en base small.en small` (optionally `-q5_1`/`-q8_0` variants) to pick
+another.
+
+### Environment variables
+
+| Variable          | Required | Description                                        |
+| ----------------- | -------- | -------------------------------------------------- |
+| `DISCORD_TOKEN`   | yes      | Bot token from the Discord developer portal        |
+| `VOICE_CHANNEL_ID`| yes      | ID of the voice channel the bot watches and joins  |
+| `ASR_ENGINE`      | no       | `handy` (default, Parakeet) or `whisper` (bundled) |
+| `PARAKEET_MODEL`  | no       | Handy model id; the repo's Parakeet Q8_0 model by default |
+| `WHISPER_MODEL`   | no       | Path to a Whisper model file (default `data/model.bin`) |
+| `WAKE_WORDS`      | no       | Comma-separated wake words (default `bot,play,ut,ot`) |
+| `ALERT_CHANNEL_ID`| no       | Text channel for the now-playing dashboard and every other bot message (defaults to the server's system channel, then to the first text channel) |
+
+Secrets live in a gitignored `.env` file next to the binary, loaded through
+[`dotenvy`](https://crates.io/crates/dotenvy). Real environment variables take
+precedence over the file.
+
+Wake words longer than four letters tolerate one misheard character, so a
+custom word like "shamash" would still answer to "shemash" and "shammash".
+Shorter ones must be heard exactly, otherwise ordinary speech ("not", "boy")
+would trigger the bot — which is why "ut" and "ot" are listed alongside "bot":
+speech-to-text often drops the first consonant of a short word.
+
+## Run
+
+```sh
+cargo run --release
+```
+
+### Controlling playback
+
+The dashboard in the alert channel is the only control surface:
+
+| Button   | Effect                                                     |
+| -------- | ---------------------------------------------------------- |
+| Pause    | Pauses the current song; the button becomes Resume         |
+| Resume   | Carries on from where the song paused                        |
+| Skip     | Drops the current song and starts the next one queued       |
+| Stop     | Stops playback and clears the queue                         |
+
+`/stop` is separate: it also leaves the voice channel, so the bot stops
+transcribing until someone comes back.
+
+Each song is downloaded to its own file, named after its video id, so a
+request can never be served the audio of an earlier one. The newest few
+downloads are kept and the rest pruned, which keeps a repeated request
+instant and stops the cache growing without bound.
+
+## Testing without Discord
+
+Record a WAV of yourself saying *"Bot, play Dracula by Tame Impala"* and
+run the transcriber end-to-end (resample → VAD → Whisper → parser):
+
+```sh
+cargo run --release --example transcribe -- recording.wav
+```
+
+It prints what the bot hears and which play request it would make, plus a level
+report: the loudest 20 ms frame against the voice-activity gate. If that frame
+sits below the gate, the bot cannot hear you at all, so the report is the first
+thing to check when it stays silent. `VAD_RMS_THRESHOLD` in `src/listener.rs`
+sets the gate; it defaults to 0.02, which is -34 dBFS against a typical
+conversational voice at -20 dBFS.
+
+## Development
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
