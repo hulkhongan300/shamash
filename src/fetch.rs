@@ -50,6 +50,18 @@ pub fn cache_dir(guild_id: u64) -> PathBuf {
     std::env::temp_dir().join(format!("shamash-{guild_id}"))
 }
 
+/// Tries to delete a file, logging rather than failing when it cannot.
+///
+/// None of these deletions decide whether playback succeeds, so an error is
+/// only worth a warning. It is logged rather than ignored because a cache that
+/// cannot prune itself grows without bound, and a temporary file that cannot
+/// be cleaned up accumulates in the working directory.
+async fn remove_file(path: &Path, what: &str) {
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        tracing::warn!("could not remove {what} {}: {e}", path.display());
+    }
+}
+
 /// Downloads decodable audio for `video_id` into `dir` and returns the file to
 /// play.
 ///
@@ -75,7 +87,7 @@ pub async fn fetch(video_id: &str, url: &str, dir: &Path) -> anyhow::Result<Path
                 .context("yt-dlp could not download the audio")?;
             let transcoded = dir.join(format!("{stem}.wav"));
             transcode(&source, &transcoded).await?;
-            let _ = tokio::fs::remove_file(&source).await;
+            remove_file(&source, "the intermediate download").await;
             transcoded
         }
     };
@@ -252,7 +264,7 @@ async fn prune(dir: &Path, keep: &str) {
     files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     for (_, path) in files.into_iter().skip(KEEP_FILES) {
         if path.file_stem().and_then(|s| s.to_str()) != Some(keep) {
-            let _ = tokio::fs::remove_file(&path).await;
+            remove_file(&path, "an old cached download").await;
         }
     }
 }

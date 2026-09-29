@@ -416,6 +416,81 @@ mod tests {
         }
     }
 
+    /// "play" is a shipped default wake word, and a bare "play" stands in for
+    /// the whole command so the shortest useful thing to say is "play lofi".
+    ///
+    /// The cost is that ordinary speech about playing something is taken as a
+    /// request. This is a deliberate trade rather than a bug: the shorter
+    /// command is worth more than avoiding a few unwanted searches, and the
+    /// queue makes a false trigger cheap to skip past.
+    ///
+    /// These assertions exist so the behaviour is not "fixed" by someone who
+    /// reads it as an oversight. A rejection list would only cover the phrases
+    /// somebody thought of.
+    #[test]
+    fn a_bare_play_wake_word_takes_the_next_words_as_a_query() {
+        let parser = parser_with_play_wake_word();
+        for (heard, query) in [
+            ("play despacito", "despacito"),
+            ("play the game", "the game"),
+            ("play guitar", "guitar"),
+            ("play football tomorrow", "football tomorrow"),
+            ("play again", "again"),
+        ] {
+            let request = parser.parse(heard).unwrap_or_else(|| {
+                panic!(
+                    "{heard:?} should parse, got {:?}",
+                    parser.parse_with_reason(heard)
+                )
+            });
+            assert_eq!(request.query, query, "wrong query for {heard:?}");
+        }
+    }
+
+    /// The trade above does not extend to "play" with nothing after it, which
+    /// is the case where there is no query to search for at all.
+    #[test]
+    fn a_bare_play_with_nothing_after_it_still_needs_a_title() {
+        assert_eq!(
+            parser_with_play_wake_word().parse_with_reason("play"),
+            Err(ParseMiss::EmptyRequest)
+        );
+    }
+
+    /// Only "play" gets the bare-command shortcut. Every other wake word still
+    /// has to be followed by the verb, so adding a name to WAKE_WORDS does not
+    /// make ordinary sentences starting with that name trigger a search.
+    #[test]
+    fn other_wake_words_still_require_the_play_verb() {
+        let parser = CommandParser::new(["lay", "plate"].into_iter().map(str::to_string));
+        assert_eq!(
+            parser.parse_with_reason("lay despacito"),
+            Err(ParseMiss::NoPlayVerb)
+        );
+        // "a silver plate" does contain the wake word, so it gets as far as
+        // wanting a verb. Either miss rejects it, which is the point: neither
+        // ordinary sentence becomes a request.
+        assert!(parser.parse("a silver plate").is_none());
+        assert!(parser.parse("i was laying the table").is_none());
+        assert_eq!(
+            parser.parse("lay play despacito").unwrap().query,
+            "despacito"
+        );
+        assert_eq!(
+            parser.parse("plate play despacito").unwrap().query,
+            "despacito"
+        );
+    }
+
+    /// Wake words are lowercased when configured, so a capitalised entry is not
+    /// a second word and does not change what is heard.
+    #[test]
+    fn a_capitalised_wake_word_is_the_same_word() {
+        let parser = CommandParser::new(["Plate", "LAY"].into_iter().map(str::to_string));
+        assert!(parser.parse("lay play despacito").is_some());
+        assert!(parser.parse("plate play despacito").is_some());
+    }
+
     #[test]
     fn short_wake_words_do_not_match_ordinary_speech() {
         let parser = parser();

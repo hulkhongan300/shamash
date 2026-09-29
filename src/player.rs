@@ -392,7 +392,13 @@ async fn start_track(
         _ => None,
     };
     if let Some(song) = &advanced.stopped {
-        let _ = std::fs::remove_file(&song.path);
+        // Songbird holds the file open, so on Linux the deletion always
+        // succeeds and the inode is released when the track is dropped. A
+        // failure here means the cache keeps a file nothing will reuse, which
+        // is why it is logged rather than ignored.
+        if let Err(e) = std::fs::remove_file(&song.path) {
+            tracing::warn!("could not remove played song {}: {e}", song.path.display());
+        }
     }
     started
 }

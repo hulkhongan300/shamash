@@ -3,7 +3,7 @@ use crate::dashboard;
 use crate::direct::DirectTranscriber;
 use crate::parakeet::HandyTranscriber;
 use crate::player::Player;
-use crate::state::{ConfigKey, HttpClientKey, PlayerKey, TranscriberKey};
+use crate::state::{ConfigKey, PlayerKey, TranscriberKey};
 use crate::transcriber::Transcriber;
 use crate::voice::{VoiceService, decode_config};
 use serenity::async_trait;
@@ -33,7 +33,6 @@ pub async fn start(config: Config) -> anyhow::Result<()> {
         .event_handler(Handler)
         .register_songbird_from_config(decode_config())
         .type_map_insert::<ConfigKey>(config)
-        .type_map_insert::<HttpClientKey>(reqwest::Client::new())
         .type_map_insert::<TranscriberKey>(transcriber)
         .await?;
 
