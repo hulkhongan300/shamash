@@ -6,8 +6,24 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The Handy model used when `PARAKEET_MODEL` is unset.
-pub const DEFAULT_MODEL: &str =
-    "handy-computer/parakeet-unified-en-0.6b-gguf/parakeet-unified-en-0.6b-Q8_0.gguf";
+///
+/// Chosen for the shape of this bot rather than for a leaderboard score. Every
+/// utterance spawns a fresh `handy` process, so model load time is paid on
+/// every command, and it dominates: this model loads in ~110 ms against
+/// ~600 ms for the 0.6B unified model, on a 129 MB file rather than 697 MB.
+///
+/// The larger alternatives were measured and rejected. `canary-180m-flash` is
+/// the fastest per-second-of-audio but returns *empty text* on short
+/// utterances, because it is a multitask AED that needs an explicit language
+/// hint (`-l en`) and `--transcribe-file` exposes no way to pass one.
+/// `nemotron-3.5-asr-streaming` is a streaming model and was empty on 4 of 6
+/// real VAD utterances. Both would drop commands.
+///
+/// Override with `PARAKEET_MODEL` to try another model without editing code.
+///
+/// Shared with the in-process engine, so `ASR_ENGINE=handy` and
+/// `ASR_ENGINE=direct` cannot silently drift onto different models.
+pub use crate::model::DEFAULT_MODEL_ID as DEFAULT_MODEL;
 
 /// Hands each utterance to the Handy app's headless batch mode and returns the
 /// text it prints.
@@ -57,7 +73,8 @@ impl HandyTranscriber {
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     anyhow::anyhow!(
-                        "could not find '{}' on path; install the Handy app or set ASR_ENGINE=whisper",
+                        "could not find '{}' on path; install the Handy app, or drop \
+                         ASR_ENGINE=handy to use the in-process engine, which does not need it",
                         self.program
                     )
                 } else {
@@ -230,7 +247,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(err.contains("could not find"), "unhelpful error: {err}");
         assert!(
-            err.contains("ASR_ENGINE=whisper"),
+            err.contains("in-process engine"),
             "no fallback named: {err}"
         );
     }
@@ -243,5 +260,26 @@ mod tests {
         assert_eq!(parsed.text, "bot play lofi");
         assert_eq!(parsed.load_ms, 5);
         let _ = &transcriber;
+    }
+
+    /// The default model has to stay one that `--transcribe-file` can actually
+    /// transcribe with. Every command spawns a fresh process, so the cost that
+    /// matters is load time, and a model that returns empty text fails the bot
+    /// silently rather than loudly. Canary and Nemotron both did; see the
+    /// comment on `DEFAULT_MODEL`.
+    #[test]
+    fn the_default_model_does_not_need_a_language_hint() {
+        // `handy --list-models` reports `supports_language_selection` for each
+        // model, and the CLI offers no `--language` for `--transcribe-file`.
+        // A model that needs one returns empty text for every utterance.
+        assert!(!DEFAULT_MODEL.contains("canary"), "needs -l <lang>");
+        assert!(
+            !DEFAULT_MODEL.contains("nemotron"),
+            "returns empty on short audio"
+        );
+        assert!(
+            DEFAULT_MODEL.contains("parakeet"),
+            "no language hint needed"
+        );
     }
 }

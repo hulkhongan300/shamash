@@ -1,11 +1,11 @@
 use crate::config::{AsrEngine, Config};
 use crate::dashboard;
+use crate::direct::DirectTranscriber;
 use crate::parakeet::HandyTranscriber;
 use crate::player::Player;
 use crate::state::{ConfigKey, HttpClientKey, PlayerKey, TranscriberKey};
 use crate::transcriber::Transcriber;
 use crate::voice::{VoiceService, decode_config};
-use crate::whisper::WhisperTranscriber;
 use serenity::async_trait;
 use serenity::builder::{
     CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage,
@@ -20,8 +20,11 @@ use std::sync::Arc;
 
 pub async fn start(config: Config) -> anyhow::Result<()> {
     let transcriber: Arc<dyn Transcriber> = match config.asr_engine {
+        AsrEngine::Direct => Arc::new(DirectTranscriber::new(
+            &config.parakeet_model,
+            config.asr_language.as_deref(),
+        )?),
         AsrEngine::Handy => Arc::new(HandyTranscriber::new(&config.parakeet_model)),
-        AsrEngine::Whisper => Arc::new(WhisperTranscriber::new(&config.whisper_model, 4)?),
     };
     log_configuration(&config);
 
@@ -44,13 +47,16 @@ fn log_configuration(config: &Config) {
     wake_words.sort_unstable();
     println!("Shamash starting up");
     match config.asr_engine {
-        AsrEngine::Handy => {
-            println!("  asr engine:    handy (parakeet)");
+        AsrEngine::Direct => {
+            println!("  asr engine:    transcribe.cpp (in-process, model resident)");
             println!("  parakeet model: {}", config.parakeet_model);
+            if let Some(language) = &config.asr_language {
+                println!("  asr language:  {language}");
+            }
         }
-        AsrEngine::Whisper => {
-            println!("  asr engine:    whisper (bundled)");
-            println!("  whisper model: {}", config.whisper_model);
+        AsrEngine::Handy => {
+            println!("  asr engine:    handy (parakeet, subprocess)");
+            println!("  parakeet model: {}", config.parakeet_model);
         }
     }
     println!("  wake words:    {}", wake_words.join(", "));
