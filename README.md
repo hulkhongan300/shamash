@@ -83,6 +83,19 @@ recording.wav` prints the same split.
 is resolved against the Hugging Face cache. Some models (Canary, Nemotron) need
 a language hint to produce text at all; set `ASR_LANGUAGE=en` for those.
 
+The default model depends on the engine, because they pay for loading it
+differently. `direct` holds one model for the whole process and so defaults to
+Parakeet TDT 0.6B v2, the strong English model. `handy` spawns a process per
+utterance and reloads the weights every time, where load time dominates a
+two-second command, so it defaults to the 110M model instead.
+
+The 0.6B default was chosen by measurement, not reputation: on the real
+recordings in the Handy's cache, the 110M model returned *empty text* on the
+utterances that crossed the voice gate, and the 0.6B model returned what was
+said. An earlier version of this file claimed the larger models were unusable
+here; that was measured through the `handy` subprocess, which cannot pass the
+language hint some of them need, and it did not describe the in-process engine.
+
 `ASR_ENGINE=handy` restores the old subprocess behaviour, which is slower but
 useful for comparing engines on the same audio.
 
@@ -98,7 +111,7 @@ of `ggml` and could not be linked alongside transcribe.cpp, so one had to go.
 | `DISCORD_TOKEN`   | yes      | Bot token from the Discord developer portal        |
 | `VOICE_CHANNEL_ID`| yes      | ID of the voice channel the bot watches and joins  |
 | `ASR_ENGINE`      | no       | `direct` (default, in-process transcribe.cpp) or `handy` (subprocess) |
-| `PARAKEET_MODEL`  | no       | Path to a `.gguf`, or a Handy model id; the Handy cache's Parakeet TDT+CTC 110M by default |
+| `PARAKEET_MODEL`  | no       | Path to a `.gguf`, or a Handy model id; Parakeet TDT 0.6B v2 for `direct`, Parakeet TDT+CTC 110M for `handy` |
 | `ASR_LANGUAGE`    | no       | Language hint for models that need one, e.g. `en` for Canary or Nemotron |
 | `WAKE_WORDS`      | no       | Comma-separated wake words (default `bot,play,ut,ot`) |
 | `ALERT_CHANNEL_ID`| no       | Text channel for the now-playing dashboard and every other bot message (defaults to the server's system channel, then to the first text channel) |

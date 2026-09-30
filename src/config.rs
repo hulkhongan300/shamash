@@ -57,8 +57,16 @@ impl Config {
             Ok(value) => AsrEngine::parse(&value)?,
             Err(_) => AsrEngine::Direct,
         };
-        let parakeet_model = std::env::var("PARAKEET_MODEL")
-            .unwrap_or_else(|_| crate::model::DEFAULT_MODEL_ID.into());
+        // The direct engine holds one model for the process lifetime, so the
+        // strongest model costs only a slower startup. Handy spawns a process
+        // per utterance and reloads the weights each time, where load time
+        // dominates a two-second command and the small model is the right trade.
+        let default_model = match asr_engine {
+            AsrEngine::Direct => crate::model::DEFAULT_MODEL_ID,
+            AsrEngine::Handy => crate::model::SMALL_MODEL_ID,
+        };
+        let parakeet_model =
+            std::env::var("PARAKEET_MODEL").unwrap_or_else(|_| default_model.into());
         // Only the models that cannot detect a language for themselves need
         // this; Canary and Nemotron return empty text without it.
         let asr_language = std::env::var("ASR_LANGUAGE")

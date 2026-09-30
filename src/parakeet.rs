@@ -7,23 +7,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The Handy model used when `PARAKEET_MODEL` is unset.
 ///
-/// Chosen for the shape of this bot rather than for a leaderboard score. Every
-/// utterance spawns a fresh `handy` process, so model load time is paid on
-/// every command, and it dominates: this model loads in ~110 ms against
-/// ~600 ms for the 0.6B unified model, on a 129 MB file rather than 697 MB.
+/// Chosen for the shape of this engine rather than for a leaderboard score.
+/// Every utterance spawns a fresh `handy` process, so the model is reloaded
+/// each time and that load dominates a two-second command: ~110 ms for this
+/// 129 MB model against ~600 ms for the 0.6B one. `ASR_ENGINE=direct` holds
+/// its model for the process lifetime and so defaults to the strong one instead;
+/// see [`crate::model`]. The two defaults are deliberately different.
 ///
-/// The larger alternatives were measured and rejected. `canary-180m-flash` is
-/// the fastest per-second-of-audio but returns *empty text* on short
+/// The larger alternatives were measured and rejected here. `canary-180m-flash`
+/// is the fastest per-second-of-audio but returns *empty text* on short
 /// utterances, because it is a multitask AED that needs an explicit language
 /// hint (`-l en`) and `--transcribe-file` exposes no way to pass one.
 /// `nemotron-3.5-asr-streaming` is a streaming model and was empty on 4 of 6
 /// real VAD utterances. Both would drop commands.
 ///
 /// Override with `PARAKEET_MODEL` to try another model without editing code.
-///
-/// Shared with the in-process engine, so `ASR_ENGINE=handy` and
-/// `ASR_ENGINE=direct` cannot silently drift onto different models.
-pub use crate::model::DEFAULT_MODEL_ID as DEFAULT_MODEL;
+pub use crate::model::SMALL_MODEL_ID as DEFAULT_MODEL;
 
 /// Hands each utterance to the Handy app's headless batch mode and returns the
 /// text it prints.
