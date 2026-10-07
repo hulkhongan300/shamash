@@ -1,9 +1,8 @@
-//! The per-guild play queue and the dashboard shown for it.
+//! The per-guild play queue.
 //!
 //! Songbird plays one track at a time and does not queue for us, so the order
-//! songs play in is kept here. A song reaching its end is reported by songbird
-//! as a track event, which the player turns into a call to [`advance`], so the
-//! next entry starts without a voice command.
+//! songs play in is kept here. A song reaching its end is reported as a track
+//! event, which the player turns into a call to [`advance`].
 //!
 //! [`advance`]: Queue::advance
 
@@ -14,8 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 /// How many songs one guild may have waiting.
 ///
-/// Unbounded, a long queue of downloads would fill the disk; voice commands
-/// arrive faster than songs end, so this is generous rather than tight.
+/// Unbounded, a long queue of downloads would fill the disk.
 pub const MAX_QUEUE: usize = 20;
 
 /// One song waiting to play, or playing now.
@@ -36,9 +34,7 @@ pub struct Queued {
 impl Queued {
     /// The thumbnail URL for this video.
     ///
-    /// YouTube serves a predictable still per video id. `hqdefault` is always
-    /// present, where the higher quality ones are not, so a missing thumbnail
-    /// is not something to fall back from.
+    /// `hqdefault` is always present, where the higher quality ones are not.
     pub fn thumbnail(&self) -> String {
         format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", self.video_id)
     }
@@ -57,9 +53,7 @@ struct State {
     ///
     /// Songbird reports a track ending both when it finishes and when it is
     /// stopped, so the callback for a song that ends on its own has to tell
-    /// itself apart from one already replaced by a skip. Each start takes the
-    /// next number, and a callback whose number has been superseded does
-    /// nothing.
+    /// itself apart from one already replaced by a skip.
     generation: u64,
 }
 
@@ -84,9 +78,8 @@ pub struct Queue(Arc<Mutex<State>>);
 impl Queue {
     /// Locks the queue, recovering from a panic elsewhere in the process.
     ///
-    /// A poisoned lock means some other thread panicked mid-update. The queue
-    /// is plain data with no invariant worth preserving across a panic, so
-    /// recovering beats refusing every later command.
+    /// The queue is plain data with no invariant worth preserving across a
+    /// panic, so recovering beats refusing every later command.
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -104,10 +97,8 @@ impl Queue {
         true
     }
 
-    /// Takes the next song, making it the current one.
-    ///
-    /// Bumps the generation, so a callback left over from the song that was
-    /// playing is told it has been superseded.
+    /// Takes the next song, making it the current one, and bumps the generation so
+    /// a callback left over from the previous song knows it is superseded.
     pub fn advance(&self) -> Advanced {
         let mut state = self.lock();
         let stopped = state.current.take();
@@ -121,13 +112,12 @@ impl Queue {
         }
     }
 
-    /// Takes the next song only if `generation` is still the current one.
+    /// Takes the next song only if `generation` is still the current one, or
+    /// `None` when the song has already been replaced.
     ///
-    /// This is what a song calling in its own ending uses. Skipping already
-    /// advanced the queue, and songbird reports the skipped song as ended
-    /// too, so without this check one skip would drop two songs.
-    ///
-    /// Returns `None` when the song has already been replaced.
+    /// This is what a song calling in its own ending uses: skipping advances
+    /// the queue already and songbird reports the skipped song as ended too, so
+    /// without the check one skip would drop two songs.
     pub fn advance_if_current(&self, generation: u64) -> Option<Advanced> {
         let mut state = self.lock();
         if state.generation != generation {

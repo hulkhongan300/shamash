@@ -1,9 +1,10 @@
 use crate::config::Config;
-use crate::listener::{VoiceTickHandler, run_listener};
+use crate::listener::VoiceTickHandler;
 use crate::parser::CommandParser;
 use crate::pipeline::ListenerPipeline;
 use crate::player::Player;
-use crate::state::{ConfigKey, PlayerKey, TranscriberKey};
+use crate::state::{BigModelsKey, ConfigKey, PlayerKey, TranscriberKey};
+use crate::wake::{WakeGate, run_wake_gate};
 use anyhow::Context;
 use serenity::model::id::{ChannelId, GuildId};
 use serenity::prelude::Context as SerenityContext;
@@ -110,15 +111,23 @@ impl VoiceService {
             );
         }
 
-        let transcriber = {
+        let wake_model = {
             let data = ctx.data.read().await;
             data.get::<TranscriberKey>()
                 .cloned()
-                .context("transcriber not present in type map")?
+                .context("wake word model not present in type map")?
         };
+        let big_models = {
+            let data = ctx.data.read().await;
+            data.get::<BigModelsKey>()
+                .cloned()
+                .context("larger model not present in type map")?
+        };
+        let parser = CommandParser::new(self.config.wake_words.clone());
+        let gate = WakeGate::new(wake_model, parser.clone());
         let pipeline = Arc::new(ListenerPipeline::new(
-            transcriber,
-            CommandParser::new(self.config.wake_words.clone()),
+            big_models,
+            parser,
             self.player(ctx).await?,
         ));
 
@@ -127,19 +136,20 @@ impl VoiceService {
         let mut wake_words: Vec<&str> = config.wake_words.iter().map(String::as_str).collect();
         wake_words.sort_unstable();
         println!("Listening in {channel} for: {}", wake_words.join(", "));
-        tokio::spawn(run_listener(rx, {
+        // The callback is awaited inside the gate loop rather than spawned, so a
+        // request cannot be acted on while the model for its wake word is still
+        // loading. Audio arriving in that window waits in the channel.
+        tokio::spawn(run_wake_gate(gate, rx, {
             let pipeline = pipeline.clone();
             let ctx = ctx.clone();
             let config = config.clone();
-            move |utterance| {
-                let pipeline = pipeline.clone();
+            move |heard| {
+                let pipeline = Arc::clone(&pipeline);
                 let ctx = ctx.clone();
                 let config = config.clone();
-                tokio::spawn(async move {
-                    pipeline
-                        .handle_utterance(&ctx, &config, guild_id, utterance)
-                        .await;
-                });
+                async move {
+                    pipeline.handle(&ctx, &config, guild_id, heard).await;
+                }
             }
         }));
         Ok(())

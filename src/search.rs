@@ -1,16 +1,34 @@
-//! Finds the YouTube video to play for a spoken request.
+//! Chooses which YouTube video to play for a spoken request.
 //!
 //! A YouTube search returns whatever matched the words: clips, live
-//! performances, lyric videos, 10-minute mixes. This module keeps the
-//! results that look like actual songs and picks the most-viewed one, so
-//! "play look at me" starts the popular track rather than a random upload.
+//! performances, lyric videos, 10-minute mixes. It also returns a *different
+//! song* with more views often enough to be the actual complaint, because a flat
+//! search has no way to tell "the studio recording" from "a remix of it" and
+//! popularity is all it has left to sort on.
+//!
+//! So the search is aimed at a known song rather than at a phrase. The
+//! transcript is first resolved against a music catalog (see
+//! [`crate::resolve`]), which supplies the song's canonical artist, title and
+//! running time. Those names are what the YouTube query is built from, and that
+//! running time is the strongest signal available when ranking the results:
+//!
+//! > Catalog: *Dracula* by Tame Impala, 205 s.
+//!
+//! | result | length | views | verdict |
+//! | --- | --- | --- | --- |
+//! | Official Video | 234 s | 75.5 M | wrong cut of the right song |
+//! | JENNIE Remix (Lyrics) | 210 s | 50.8 M | a different song entirely |
+//! | **Dracula** (artist channel) | **206 s** | 2.8 M | **the one asked for** |
+//!
+//! Ranking by views picks the 75 M video. Ranking by length alone picks the
+//! right one, and it does so from a number no uploader can misreport.
 
+use crate::parser::PlayRequest;
+use crate::resolve::{self, Resolution};
 use anyhow::Context;
 use serde::Deserialize;
 use tokio::process::Command;
 
-/// How many search results to consider.
-pub const DEFAULT_CANDIDATES: usize = 10;
 /// Shorter than this and it is a clip or sound effect, not a song.
 const MIN_DURATION_SECS: f64 = 30.0;
 /// Longer than this and it is a mix, compilation, or concert recording.
@@ -61,14 +79,82 @@ const AUDIO_MARKERS: [&str; 4] = ["official audio", "audio only", "audio", "offi
 /// song rather than anything that edits the music.
 const LYRIC_MARKERS: [&str; 2] = ["lyric video", "lyrics"];
 
-/// Title words that carry no meaning for matching, so they are not required to
-/// appear in a result.
-const TITLE_STOPWORDS: [&str; 13] = [
-    "the", "a", "an", "of", "by", "and", "ft", "feat", "official", "music", "video", "mv", "m/v",
+/// How far a candidate's length may be from the catalog's and still count as
+/// the same recording.
+///
+/// Four seconds absorbs the difference between an album track, an edited
+/// single and a video that runs a few seconds of silence at either end, which
+/// is normal and is not a different song.
+pub const DURATION_TOLERANCE_SECS: f64 = 4.0;
+
+/// Words in a title that mean this is not the recording that was asked for.
+///
+/// Each costs [`PENALTY`], unless the request itself used the word: someone who
+/// asked for the live version wants the live version, and penalising it would
+/// make the bot reliably play the studio cut instead.
+///
+/// Two matching rules keep the list honest. "mix" is matched as a whole word, so
+/// it does not also fire on "remix", which is listed separately and is a
+/// different mistake. "lyric" covers "lyrics" by prefix, so only one spelling is
+/// listed and a title reading "Lyrics [Lyric Video]" is charged once rather than
+/// twice for one fault.
+const PENALTY_MARKERS: [&str; 13] = [
+    "cover",
+    "live",
+    "remix",
+    "lyric",
+    "karaoke",
+    "sped up",
+    "slowed",
+    "reverb",
+    "instrumental",
+    "1 hour",
+    "mix",
+    "reaction",
+    "tutorial",
 ];
 
+/// Score awarded for a length within [`DURATION_TOLERANCE_SECS`] of the
+/// catalog's.
+///
+/// Large enough to outweigh everything else combined: it is the only signal
+/// that distinguishes the studio recording from every other version of the same
+/// title.
+const DURATION_EXACT: f64 = 100.0;
+/// Charged per second outside the tolerance.
+const DURATION_PENALTY_PER_SEC: f64 = 3.0;
+/// Ceiling on that penalty, so a 10-minute mix cannot dominate the arithmetic.
+const DURATION_PENALTY_MAX: f64 = 90.0;
+
+/// A "- Topic" channel is YouTube's own auto-generated artist channel, which is
+/// the most reliable provenance signal on the platform.
+const CHANNEL_TOPIC: f64 = 45.0;
+/// The upload is on the artist's own channel.
+const CHANNEL_ARTIST: f64 = 30.0;
+/// A VEVO channel, which is an official label channel.
+const CHANNEL_VEVO: f64 = 25.0;
+/// A channel that calls itself "official" without a VEVO handle.
+const CHANNEL_OFFICIAL: f64 = 15.0;
+/// Ceiling for matching the canonical title against the upload's title.
+const RELEVANCE_MAX: f64 = 25.0;
+/// The upload claims to be the audio on its own.
+const MEDIA_AUDIO: f64 = 12.0;
+/// A lyric video: video-shaped, but the same recording under a still image.
+const MEDIA_LYRIC: f64 = 6.0;
+/// An official MV, visualizer or dance video: the wrong shape for a request to
+/// hear a song.
+const MEDIA_VIDEO: f64 = -6.0;
+/// Charged per penalty marker.
+const PENALTY: f64 = 30.0;
+/// Weight on popularity. Logarithmic and small on purpose: views break ties
+/// between equally good uploads, they do not choose the song.
+const VIEWS_WEIGHT: f64 = 1.0;
+/// Ceiling on the popularity term, so 75 M views cannot outvote a length
+/// mismatch.
+const VIEWS_MAX: f64 = 12.0;
+
 /// One entry of a YouTube search result.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Candidate {
     /// Video title as shown on YouTube.
     pub title: Option<String>,
@@ -109,14 +195,28 @@ impl Candidate {
     }
 
     /// Whether the result looks like a song rather than a clip, cover, or mix.
-    fn is_song(&self) -> bool {
+    /// Whether this is worth ranking against `target`.
+    ///
+    /// Length is judged unconditionally: a ten-second clip and a six-hour
+    /// upload are not songs under any request. The disqualifying markers are
+    /// judged against the request, for the same reason the penalties are --
+    /// filtering every live recording out of the results would mean that asking
+    /// for the live version plays the studio cut, which is the failure this
+    /// ranking exists to prevent.
+    fn is_song_for(&self, target: &Target) -> bool {
         let plausible_length = match self.duration {
             Some(duration) => (MIN_DURATION_SECS..=MAX_DURATION_SECS).contains(&duration),
-            // Unknown duration: let popularity decide.
+            // Unknown duration: let the other signals decide.
             None => true,
         };
+        if !plausible_length {
+            return false;
+        }
         let title = self.title_lowercase();
-        plausible_length && !NON_SONG_MARKERS.iter().any(|m| title.contains(m))
+        let requested = resolve::normalize(&target.requested);
+        !NON_SONG_MARKERS
+            .iter()
+            .any(|marker| contains_marker(&title, marker) && !contains_marker(&requested, marker))
     }
 
     fn views(&self) -> u64 {
@@ -159,53 +259,333 @@ impl Candidate {
         1
     }
 
-    /// How many of the words in the request this result's title accounts for.
-    ///
-    /// Speech-to-text mangles proper nouns, so "bts hoolig" has to match
-    /// "Hooligan". A title word counts as matching a request word when either
-    /// starts the other, which covers both a dropped letter and a truncated
-    /// word without admitting the loose matches that a real edit distance
-    /// would.
-    fn matched_terms(&self, terms: &[String]) -> usize {
-        let title: Vec<String> = self
-            .title_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| !w.is_empty())
-            .map(str::to_string)
-            .collect();
-        terms
-            .iter()
-            .filter(|term| {
-                title
-                    .iter()
-                    .any(|word| word.starts_with(term.as_str()) || term.starts_with(word.as_str()))
-            })
-            .count()
+    fn channel_lowercase(&self) -> String {
+        self.channel().to_lowercase()
     }
 }
 
-/// The words of a spoken request that a result's title has to account for.
-///
-/// Words carrying no meaning for matching are dropped, so a request for
-/// "official music by tame impala" still only requires the name.
-fn query_terms(query: &str) -> Vec<String> {
-    query
-        .split(|c: char| !c.is_alphanumeric())
-        .map(str::to_ascii_lowercase)
-        .filter(|w| !w.is_empty() && !TITLE_STOPWORDS.contains(&w.as_str()))
-        .collect()
+/// `text` if it has anything in it, otherwise `None`.
+fn non_empty(text: &str) -> Option<String> {
+    (!text.trim().is_empty()).then(|| text.to_string())
 }
 
-/// Searches YouTube via `yt-dlp` and returns the most-viewed song.
-pub async fn most_popular_song(query: &str, candidates: usize) -> anyhow::Result<Candidate> {
-    anyhow::ensure!(candidates > 0, "need at least one search candidate");
-    let playlist_end = candidates.to_string();
-    let search = format!("ytsearch{candidates}:{query}");
+/// A form with spacing and punctuation removed, for containment tests.
+///
+/// An artist channel is as likely to be `TameImpala` as `Tame Impala`, and
+/// neither is something a band chose carefully, so neither can be relied on.
+fn squashed(text: &str) -> String {
+    resolve::normalize(text).replace(' ', "")
+}
+
+/// Whether a title or request contains `needle`.
+///
+/// Multi-word needles match as a substring, because "sped up" and "1 hour" are
+/// phrases. Single words match whole words only, so "mix" does not fire on
+/// "remix" -- a different mistake, penalised separately -- and "live" does not
+/// fire on "delivery". A longer word also matches its own extensions, so
+/// "lyric" catches "lyrics" and "remix" catches "remixes".
+fn contains_marker(haystack: &str, needle: &str) -> bool {
+    if needle.contains(' ') {
+        return haystack.contains(needle);
+    }
+    haystack
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word == needle || (needle.len() > 4 && word.starts_with(needle)))
+}
+
+/// A reference recording, as far as it is known, to score uploads against.
+///
+/// Built from a catalog match when there is one, and from the raw transcript
+/// when there is not. The two cases score differently because a request with no
+/// catalog match has no length to compare, which removes the strongest signal
+/// and has to be reflected in the threshold rather than silently ignored.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub artist: Option<String>,
+    pub title: Option<String>,
+    /// The catalog's running time, when a match was found.
+    pub duration_secs: Option<f64>,
+    /// The whole request, kept so a requested "live" is not penalised.
+    pub requested: String,
+    /// Whether a catalog match backed this target.
+    pub catalogued: bool,
+}
+
+impl Target {
+    /// A target backed by a catalog match, with the corrected names.
+    ///
+    /// An ambiguous match contributes its title and running time but *not* its
+    /// artist: several artists recorded the same title equally well, so
+    /// putting any one of their names in the query would aim the search at a
+    /// recording the listener never named.
+    pub fn from_resolution(resolution: &Resolution) -> Self {
+        Self {
+            artist: (!resolution.ambiguous).then(|| resolution.track.artist.clone()),
+            title: Some(resolution.track.title.clone()),
+            duration_secs: resolution.track.duration_secs,
+            requested: resolution.query.clone(),
+            catalogued: true,
+        }
+    }
+
+    /// A target from the transcript alone, used when no catalog match cleared
+    /// the bar.
+    ///
+    /// The request doubles as the title, because the parser only reports a
+    /// title when it heard "by" and most requests do not contain one. Without
+    /// this the title term would be zero for those requests, leaving relevance
+    /// -- the only signal left once there is no catalog length -- doing nothing.
+    pub fn from_request(request: &PlayRequest) -> Self {
+        Self {
+            artist: request.artist.clone(),
+            title: request.title.clone().or_else(|| non_empty(&request.query)),
+            duration_secs: None,
+            requested: request.query.clone(),
+            catalogued: false,
+        }
+    }
+
+    /// What to search YouTube for.
+    ///
+    /// Prefers the canonical `"<artist> <title>"`, which is how the song is
+    /// actually titled on YouTube, and falls back to the transcript otherwise.
+    pub fn search_query(&self) -> String {
+        match (&self.artist, &self.title) {
+            (Some(artist), Some(title)) => format!("{artist} {title}"),
+            (None, Some(title)) => title.clone(),
+            _ => self.requested.clone(),
+        }
+    }
+
+    /// The threshold that applies to this target.
+    ///
+    /// See [`UNRESOLVED_MATCH_THRESHOLD`]: the two cases are scored on
+    /// different scales, so one threshold cannot serve both.
+    pub fn effective_threshold(&self, threshold: f64) -> f64 {
+        if self.catalogued {
+            threshold
+        } else {
+            UNRESOLVED_MATCH_THRESHOLD
+        }
+    }
+}
+
+/// The bar for a request the catalog could not resolve, in points.
+///
+/// A separate constant rather than a fraction of
+/// [`crate::config::DEFAULT_MATCH_THRESHOLD`], because the two cases are not
+/// the same scale: with a catalog match a candidate can earn about 190 points,
+/// and without one the most it can earn is the 125 that do not depend on
+/// running time. A fraction would move this bar every time the weights in
+/// [`score`] were retuned, silently.
+const UNRESOLVED_MATCH_THRESHOLD: f64 = 20.0;
+
+/// A candidate's score, broken down so it can be logged and tuned.
+#[derive(Debug, Clone, Default)]
+pub struct ScoreParts {
+    pub duration: f64,
+    pub channel: f64,
+    pub relevance: f64,
+    pub media: f64,
+    pub views: f64,
+    /// The markers that cost this candidate points.
+    pub penalties: Vec<&'static str>,
+}
+
+impl ScoreParts {
+    /// The total, with one penalty per distinct marker.
+    ///
+    /// Markers are de-duplicated before charging so a title reading
+    /// "Lyrics (Lyric Video)" is not billed twice for the same fault.
+    pub fn total(&self) -> f64 {
+        self.duration + self.channel + self.relevance + self.media + self.views
+            - PENALTY * self.penalties.len() as f64
+    }
+
+    /// A one-line explanation, for the debug log.
+    pub fn explain(&self) -> String {
+        format!(
+            "total {:.1} (duration {:+.1}, channel {:+.1}, relevance {:+.1}, media {:+.1}, \
+             views {:+.1}{})",
+            self.total(),
+            self.duration,
+            self.channel,
+            self.relevance,
+            self.media,
+            self.views,
+            if self.penalties.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", penalties -{} for {:?}",
+                    self.penalties.len() * 30,
+                    self.penalties
+                )
+            }
+        )
+    }
+}
+
+/// A candidate with its score.
+#[derive(Debug, Clone)]
+pub struct ScoredCandidate {
+    pub candidate: Candidate,
+    pub parts: ScoreParts,
+}
+
+impl ScoredCandidate {
+    pub fn score(&self) -> f64 {
+        self.parts.total()
+    }
+}
+
+/// The outcome of choosing between candidates.
+#[derive(Debug, Clone)]
+pub struct Choice {
+    /// Ranked best first.
+    pub ranked: Vec<ScoredCandidate>,
+    /// Whether the best score cleared the threshold.
+    pub confident: bool,
+    /// The threshold that was applied, for logging.
+    pub threshold: f64,
+    /// The catalog match the query was built from, when there was one.
+    ///
+    /// Kept so the caller can say what it thinks was asked for, which is the
+    /// difference between "picked the wrong song" and "I could not tell which
+    /// song you meant".
+    pub resolved: Option<resolve::CatalogTrack>,
+    /// What the request was understood as.
+    pub requested: String,
+}
+
+impl Choice {
+    pub fn best(&self) -> Option<&ScoredCandidate> {
+        self.ranked.first()
+    }
+
+    /// The best `count` results, for the chooser.
+    ///
+    /// Includes the top result: when the bot is not sure enough to play, the
+    /// most likely answer is still the first button.
+    pub fn top(&self, count: usize) -> Vec<&ScoredCandidate> {
+        self.ranked.iter().take(count).collect()
+    }
+}
+
+/// Scores one candidate against a target.
+///
+/// The terms are deliberately lopsided. Length is worth more than everything
+/// else combined because it is the only signal that survives a correct title in
+/// a wrong place, and popularity is worth least because it is what made the old
+/// ranking wrong.
+pub fn score(candidate: &Candidate, target: &Target) -> ScoreParts {
+    let mut parts = ScoreParts::default();
+    let title = candidate.title_lowercase();
+
+    if let (Some(wanted), Some(found)) = (target.duration_secs, candidate.duration) {
+        let delta = (wanted - found).abs();
+        parts.duration = if delta <= DURATION_TOLERANCE_SECS {
+            DURATION_EXACT
+        } else {
+            -((delta - DURATION_TOLERANCE_SECS) * DURATION_PENALTY_PER_SEC)
+                .min(DURATION_PENALTY_MAX)
+        };
+    }
+
+    let channel = candidate.channel_lowercase();
+    if channel.ends_with("- topic") {
+        parts.channel += CHANNEL_TOPIC;
+    }
+    if let Some(artist) = target.artist.as_deref() {
+        let artist = squashed(artist);
+        if !artist.is_empty() && squashed(&channel).contains(&artist) {
+            parts.channel += CHANNEL_ARTIST;
+        }
+    }
+    if channel.contains("vevo") {
+        parts.channel += CHANNEL_VEVO;
+    }
+    if channel.contains("official") {
+        parts.channel += CHANNEL_OFFICIAL;
+    }
+
+    if let Some(wanted) = target.title.as_deref() {
+        let wanted = resolve::normalize(wanted);
+        let found = resolve::normalize(&title);
+        if !wanted.is_empty() && !found.is_empty() {
+            parts.relevance = resolve::similarity(&wanted, &found) as f64 * RELEVANCE_MAX;
+        }
+    }
+
+    parts.media = match candidate.media_rank() {
+        3 => MEDIA_AUDIO,
+        2 => MEDIA_LYRIC,
+        0 => MEDIA_VIDEO,
+        _ => 0.0,
+    };
+
+    let requested = resolve::normalize(&target.requested);
+    for marker in PENALTY_MARKERS {
+        if contains_marker(&title, marker)
+            && !contains_marker(&requested, marker)
+            && !parts.penalties.contains(&marker)
+        {
+            parts.penalties.push(marker);
+        }
+    }
+
+    let views = candidate.views() as f64;
+    parts.views = if views > 0.0 {
+        views.log10().min(VIEWS_MAX) * VIEWS_WEIGHT
+    } else {
+        0.0
+    };
+
+    parts
+}
+
+/// Ranks candidates against a target, best first.
+pub fn pick(candidates: &[Candidate], target: &Target, threshold: f64) -> Choice {
+    let threshold = target.effective_threshold(threshold);
+    let mut ranked: Vec<ScoredCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.is_song_for(target))
+        .map(|candidate| ScoredCandidate {
+            parts: score(candidate, target),
+            candidate: candidate.clone(),
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.score().total_cmp(&a.score()));
+
+    let confident = ranked.first().is_some_and(|best| best.score() >= threshold);
+    Choice {
+        ranked,
+        confident,
+        threshold,
+        // Filled in by `choose_match`, which is the only place the request and
+        // the catalog match are known.
+        resolved: None,
+        requested: target.requested.clone(),
+    }
+}
+
+/// Searches YouTube via `yt-dlp` and returns the raw candidates.
+///
+/// Metadata only: `--flat-playlist` reads the search page without opening each
+/// video, which is what keeps a spoken command's latency at about a second
+/// instead of half a minute.
+///
+/// Deliberately not `music.youtube.com`. Its flat search does return cleaner
+/// titles, but it reports `channel`, `duration` and `view_count` as null, which
+/// is exactly the data this module ranks on; recovering those means dropping
+/// `--flat-playlist`, at roughly 5 s per result.
+pub async fn youtube_candidates(query: &str, count: usize) -> anyhow::Result<Vec<Candidate>> {
+    anyhow::ensure!(count > 0, "need at least one search candidate");
 
     let output = Command::new("yt-dlp")
         .args(["-j", "--flat-playlist", "--no-warnings", "--playlist-end"])
-        .arg(playlist_end)
-        .arg(&search)
+        .arg(count.to_string())
+        .arg(format!("ytsearch{count}:{query}"))
         .output()
         .await
         .context("failed to run yt-dlp; is it installed and on PATH?")?;
@@ -215,53 +595,90 @@ pub async fn most_popular_song(query: &str, candidates: usize) -> anyhow::Result
         String::from_utf8_lossy(&output.stderr).trim()
     );
 
-    let entries: Vec<Candidate> = String::from_utf8_lossy(&output.stdout)
+    String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).context("failed to parse yt-dlp JSON output"))
-        .collect::<Result<_, _>>()?;
-
-    select(&entries, query)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no playable song found for '{query}'"))
+        .collect::<Result<_, _>>()
 }
 
-/// Picks the result that best answers the request.
+/// Resolves a spoken request, searches YouTube with the corrected names, and
+/// ranks the results.
 ///
-/// Order of preference, most significant first:
-///
-/// 1. **Relevance.** A result has to account for the words in the request.
-///    This is what stops a popular but unrelated video winning: asked for
-///    "bts hoolig", the official video for a different song can have twice
-///    the views and a title that never mentions the request at all.
-/// 2. **Audio over video.** Among relevant results, one that is the audio on
-///    its own beats an official MV.
-/// 3. **Views.** Popularity breaks the remaining ties.
-///
-/// Results that do not look like songs at all are only considered if nothing
-/// relevant survives, so a niche song with a modest upload still plays.
-fn select<'a>(entries: &'a [Candidate], query: &str) -> Option<&'a Candidate> {
-    let terms = query_terms(query);
-    let songs: Vec<&Candidate> = entries.iter().filter(|entry| entry.is_song()).collect();
-
-    // A request of only filler words ("play something") leaves nothing to
-    // match on, so relevance cannot discriminate and popularity decides.
-    if !terms.is_empty() {
-        let best = songs
-            .iter()
-            .map(|entry| (entry.matched_terms(&terms), entry))
-            .filter(|(matched, _)| *matched > 0)
-            .max_by_key(|(matched, entry)| (*matched, entry.media_rank(), entry.views()));
-        if let Some((_, entry)) = best {
-            return Some(entry);
+/// This is the whole selection path: catalog first, then the video search, then
+/// scoring. Download and playback are untouched.
+pub async fn choose_match(
+    request: &PlayRequest,
+    catalog: &resolve::Catalog,
+    candidate_count: usize,
+    threshold: f64,
+) -> anyhow::Result<Choice> {
+    let requested = request.query.clone();
+    let resolution = catalog
+        .resolve(&resolve::Target::from_request(request))
+        .await?;
+    let (target, resolution) = match resolution {
+        Some(resolution) => {
+            tracing::debug!(
+                provider = catalog.provider_name(),
+                catalog = %resolution.track.label(),
+                duration = ?resolution.track.duration_secs,
+                confidence = resolution.confidence,
+                query = %resolution.query,
+                ambiguous = resolution.ambiguous,
+                "resolved against the catalog"
+            );
+            (Target::from_resolution(&resolution), Some(resolution))
         }
-    }
+        None => {
+            tracing::debug!(
+                provider = catalog.provider_name(),
+                query = %requested,
+                "no catalog match; searching on the transcript alone"
+            );
+            (Target::from_request(request), None)
+        }
+    };
 
-    songs
-        .iter()
-        .max_by_key(|entry| (entry.media_rank(), entry.views()))
-        .copied()
-        .or_else(|| entries.iter().max_by_key(|entry| entry.views()))
+    let query = target.search_query();
+    let candidates = youtube_candidates(&query, candidate_count).await?;
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "YouTube returned no results for '{query}'"
+    );
+
+    let mut choice = pick(&candidates, &target, threshold);
+    choice.requested = requested;
+    choice.resolved = resolution.as_ref().map(|r| r.track.clone());
+    // The catalog could not tell which artist was meant, so the winning video is
+    // a guess among equally good ones and must not be played on its own.
+    if resolution.as_ref().is_some_and(|r| r.ambiguous) {
+        choice.confident = false;
+        tracing::debug!(
+            query = %query,
+            ranked = choice.ranked.len(),
+            "the catalog named several artists for this title; asking instead of guessing"
+        );
+    }
+    if let Some(best) = choice.best() {
+        tracing::debug!(
+            heard = %request.query,
+            searched = %query,
+            catalogued = target.catalogued,
+            picked = best.candidate.title(),
+            channel = best.candidate.channel(),
+            chosen = %best.parts.explain(),
+            runner_up = choice.ranked.get(1).map(|scored| format!(
+                "{} ({:.1})",
+                scored.candidate.title(),
+                scored.score()
+            )),
+            threshold = choice.threshold,
+            confident = choice.confident,
+            "chose a video"
+        );
+    }
+    Ok(choice)
 }
 
 /// Reads the video id out of a YouTube URL.
@@ -298,6 +715,7 @@ fn url_video_id(url: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_MATCH_THRESHOLD;
 
     fn candidate(title: &str, views: Option<u64>, duration: Option<f64>) -> Candidate {
         Candidate {
@@ -310,95 +728,460 @@ mod tests {
         }
     }
 
-    #[test]
-    fn picks_most_viewed_song() {
-        let entries = [
-            candidate("song a", Some(1_000), Some(200.0)),
-            candidate("song b", Some(900_000), Some(180.0)),
-            candidate("song c", Some(5_000), Some(210.0)),
-        ];
-        assert_eq!(select(&entries, "song").unwrap().title(), "song b");
+    fn on_channel(mut entry: Candidate, channel: &str) -> Candidate {
+        entry.channel = Some(channel.to_string());
+        entry
     }
 
-    #[test]
-    fn skips_clips_and_mixes() {
-        let entries = [
-            candidate("song intro clip", Some(9_000_000), Some(20.0)),
-            candidate("vlog about the song", Some(8_000_000), Some(600.0)),
-            candidate("full album mix", Some(7_000_000), Some(3_600.0)),
-            candidate("the real song", Some(50_000), Some(200.0)),
-        ];
-        assert_eq!(select(&entries, "song").unwrap().title(), "the real song");
+    /// The catalog said *Dracula* by Tame Impala, 205 s.
+    fn catalogued(requested: &str) -> Target {
+        Target {
+            artist: Some("Tame Impala".to_string()),
+            title: Some("Dracula".to_string()),
+            duration_secs: Some(205.0),
+            requested: requested.to_string(),
+            catalogued: true,
+        }
     }
 
-    #[test]
-    fn deprioritises_covers_remixes_and_karaoke() {
-        let entries = [
-            candidate("song (slowed + reverb)", Some(4_000_000), Some(200.0)),
-            candidate("song (nightcore)", Some(3_000_000), Some(200.0)),
-            candidate("song (Karaoke Version)", Some(2_000_000), Some(210.0)),
-            candidate("song", Some(100_000), Some(205.0)),
-        ];
-        assert_eq!(select(&entries, "song").unwrap().title(), "song");
+    /// The title of whichever candidate wins, for readable assertions.
+    fn best_title(candidates: &[Candidate], target: &Target) -> String {
+        pick(candidates, target, DEFAULT_MATCH_THRESHOLD)
+            .best()
+            .expect("at least one candidate should survive")
+            .candidate
+            .title()
+            .to_string()
     }
 
-    /// The reported bug: asked for one song, the most-viewed result was a
-    /// different song entirely, because nothing compared the title against the
-    /// request and "2.0" outranked the real track.
+    /// The reported bug: "play look at me" names no artist, and several artists
+    /// have recorded that title, so the catalog cannot say which was meant.
+    ///
+    /// It used to pick one and build the query from that name, which steered
+    /// YouTube straight at a song nobody asked for. The artist must not reach
+    /// the query at all when the catalog called the match ambiguous.
     #[test]
-    fn a_popular_unrelated_video_does_not_win() {
+    fn an_ambiguous_catalog_match_keeps_the_artist_out_of_the_query() {
+        let track = resolve::CatalogTrack {
+            artist: "Tems".to_string(),
+            title: "Look at Me".to_string(),
+            duration_secs: Some(191.0),
+            id: "1".to_string(),
+            provider: "test",
+        };
+        let resolution = Resolution {
+            track: track.clone(),
+            confidence: 0.7,
+            query: "look at me".to_string(),
+            ambiguous: true,
+        };
+        let target = Target::from_resolution(&resolution);
+        assert_eq!(target.artist, None, "a guessed artist must not be used");
+        assert_eq!(target.search_query(), "Look at Me");
+
+        // A confident match is the opposite case: the canonical name is the
+        // whole point of asking the catalog.
+        let confident = Resolution {
+            ambiguous: false,
+            ..resolution
+        };
+        let target = Target::from_resolution(&confident);
+        assert_eq!(target.search_query(), "Tems Look at Me");
+    }
+
+    /// The bug the whole module exists for, as a live search saw it.
+    ///
+    /// Every result names the requested song and is roughly its length. The
+    /// 75-million-view video is a different cut, and ranking by views -- what
+    /// the old selector did -- picks it. Only the running time separates them,
+    /// and only the penalty separates the two 206-second uploads.
+    #[test]
+    fn a_remix_with_twenty_times_the_views_still_loses_to_the_right_recording() {
         let entries = [
             candidate(
-                "BTS (방탄소년단) '2.0' Official MV",
-                Some(185_000_000),
-                Some(235.0),
+                "Tame Impala - Dracula (Official Video)",
+                Some(75_531_372),
+                Some(234.0),
             ),
             candidate(
-                "BTS 방탄소년단 'Hooligan' Official Audio",
-                Some(178_000),
-                Some(182.0),
+                "Tame Impala - Dracula (Lyrics)",
+                Some(24_438_628),
+                Some(206.0),
             ),
+            candidate(
+                "Tame Impala and JENNIE - Dracula (JENNIE Remix - Official Lyric Video)",
+                Some(50_831_672),
+                Some(211.0),
+            ),
+            candidate("Tame Impala - Dracula", Some(2_777_206), Some(206.0)),
         ];
         assert_eq!(
-            select(&entries, "bts hoolig").unwrap().title(),
-            "BTS 방탄소년단 'Hooligan' Official Audio"
+            best_title(&entries, &catalogued("dracula tame impala")),
+            "Tame Impala - Dracula"
         );
     }
 
-    /// The listener asked for a song, so the audio upload wins over the
-    /// official music video however much more popular the video is.
+    /// The tolerance is four seconds either way, so a video that padded the
+    /// start is not treated as a different recording.
     #[test]
-    fn official_audio_beats_the_official_music_video() {
-        let entries = [
-            candidate("Hooligan Official MV", Some(95_000_000), Some(244.0)),
-            candidate("Hooligan Official Audio", Some(178_000), Some(182.0)),
-        ];
+    fn a_length_within_tolerance_counts_as_a_match() {
+        let target = catalogued("dracula");
+        for duration in [201.0, 205.0, 209.0] {
+            let entry = candidate("Dracula", Some(1000), Some(duration));
+            assert_eq!(
+                score(&entry, &target).duration,
+                DURATION_EXACT,
+                "{duration}s should be within tolerance"
+            );
+        }
+    }
+
+    #[test]
+    fn a_length_outside_tolerance_is_penalised_proportionally() {
+        let target = catalogued("dracula");
+        // 210 s is 5 s out, so 1 s past the tolerance is charged.
         assert_eq!(
-            select(&entries, "hooligan").unwrap().title(),
-            "Hooligan Official Audio"
+            score(&candidate("Dracula", None, Some(210.0)), &target).duration,
+            -3.0
+        );
+        // 234 s is 29 s out, and 25 of those are past the tolerance.
+        assert_eq!(
+            score(&candidate("Dracula", None, Some(234.0)), &target).duration,
+            -75.0
         );
     }
 
-    /// Speech-to-text drops letters from proper nouns, so a request that is
-    /// nearly a title still has to match it.
+    /// A ten-minute mix is not a wrong answer, it is a different product, and
+    /// the penalty has to be capped so it cannot swamp the arithmetic.
     #[test]
-    fn a_misspelled_request_still_matches_the_song() {
+    fn the_length_penalty_is_capped() {
+        let target = catalogued("dracula");
+        let parts = score(&candidate("1 Hour Mix", Some(10), Some(3_600.0)), &target);
+        assert_eq!(parts.duration, -DURATION_PENALTY_MAX);
+    }
+
+    /// A duration-less upload cannot be scored on length and must not be
+    /// assumed wrong for it.
+    #[test]
+    fn an_unknown_length_is_neither_rewarded_nor_punished() {
+        let target = catalogued("dracula");
+        assert_eq!(
+            score(&candidate("Dracula", None, None), &target).duration,
+            0.0
+        );
+    }
+
+    #[test]
+    fn a_topic_channel_is_the_strongest_provenance_signal() {
+        let target = catalogued("dracula");
+        let parts = score(
+            &on_channel(candidate("Dracula", None, None), "Tame Impala - Topic"),
+            &target,
+        );
+        // A topic channel is YouTube's channel for the artist, so it earns
+        // both provenance bonuses; it is the best evidence available.
+        assert_eq!(parts.channel, CHANNEL_TOPIC + CHANNEL_ARTIST);
+        assert!(parts.channel > CHANNEL_ARTIST);
+    }
+
+    #[test]
+    fn the_artists_own_channel_is_rewarded() {
+        let target = catalogued("dracula");
+        let parts = score(
+            &on_channel(candidate("Dracula", None, None), "TameImpala"),
+            &target,
+        );
+        assert_eq!(parts.channel, CHANNEL_ARTIST);
+    }
+
+    #[test]
+    fn a_vevo_channel_is_rewarded() {
+        let target = catalogued("dracula");
+        let parts = score(
+            &on_channel(candidate("Dracula", None, None), "TameImpalaVEVO"),
+            &target,
+        );
+        // A VEVO channel is the artist's channel under a label handle, so it
+        // earns both provenance bonuses.
+        assert_eq!(parts.channel, CHANNEL_VEVO + CHANNEL_ARTIST);
+    }
+
+    /// An unrelated channel earns nothing, which is the point: the boost is for
+    /// provenance, not for having a channel at all.
+    #[test]
+    fn an_unrelated_channel_earns_nothing() {
+        let target = catalogued("dracula");
+        let parts = score(
+            &on_channel(candidate("Dracula", None, None), "7clouds"),
+            &target,
+        );
+        assert_eq!(parts.channel, 0.0);
+    }
+
+    /// Every version the spec lists, checked against the title that would carry
+    /// it.
+    #[test]
+    fn every_version_marker_is_penalised() {
+        let target = catalogued("dracula");
+        for (title, expected) in [
+            ("Dracula (Cover)", "cover"),
+            ("Dracula (Live)", "live"),
+            ("Dracula (Remix)", "remix"),
+            ("Dracula (Lyrics)", "lyric"),
+            ("Dracula (Lyric Video)", "lyric"),
+            ("Dracula (Karaoke)", "karaoke"),
+            ("Dracula (Sped Up)", "sped up"),
+            ("Dracula (Slowed)", "slowed"),
+            ("Dracula (Reverb)", "reverb"),
+            ("Dracula (Instrumental)", "instrumental"),
+            ("Dracula 1 Hour Mix", "1 hour"),
+            ("Dracula Mix", "mix"),
+            ("Dracula (Reaction)", "reaction"),
+            ("Dracula (Tutorial)", "tutorial"),
+        ] {
+            let parts = score(&candidate(title, None, None), &target);
+            assert!(
+                parts.penalties.contains(&expected),
+                "{title:?} should be penalised for {expected:?}, got {:?}",
+                parts.penalties
+            );
+        }
+    }
+
+    /// The listener is the reason for the conditional. Asking for the live
+    /// version and being given the studio cut is a worse failure than either
+    /// one alone.
+    #[test]
+    fn a_marker_the_request_asked_for_is_not_penalised() {
+        let target = catalogued("dracula live");
+        for title in ["Dracula (Live)", "Dracula - Live at Glastonbury"] {
+            let parts = score(&candidate(title, None, None), &target);
+            assert!(
+                parts.penalties.is_empty(),
+                "{title:?} was asked for: {parts:?}"
+            );
+        }
+    }
+
+    /// "remix" contains "mix", so a naive substring test would bill the same
+    /// title twice for one fault.
+    #[test]
+    fn mix_does_not_also_fire_on_remix() {
+        let target = catalogued("dracula");
+        let parts = score(&candidate("Dracula (Remix)", None, None), &target);
+        assert_eq!(parts.penalties, vec!["remix"]);
+    }
+
+    /// "live" is a whole word, so a title that merely contains the letters is
+    /// not mistaken for a live recording.
+    #[test]
+    fn markers_only_match_whole_words() {
+        let target = catalogued("delivery");
+        assert!(
+            score(&candidate("Dracula (Delivery)", None, None), &target)
+                .penalties
+                .is_empty()
+        );
+    }
+
+    /// One fault, one charge, however many ways the title spells it.
+    #[test]
+    fn a_repeated_marker_is_charged_once() {
+        let target = catalogued("dracula");
+        let parts = score(
+            &candidate("Dracula (Lyrics) [Lyric Video]", None, None),
+            &target,
+        );
+        assert_eq!(parts.penalties, vec!["lyric"]);
+    }
+
+    /// Views are a tie-breaker, not a ranking. 75 million views must not be
+    /// worth more than being the right length.
+    #[test]
+    fn views_cannot_outvote_a_length_mismatch() {
+        let target = catalogued("dracula");
+        let viral_mismatch = score(
+            &candidate("Dracula (Official Video)", Some(75_000_000), Some(240.0)),
+            &target,
+        );
+        let quiet_match = score(&candidate("Dracula", Some(900), Some(205.0)), &target);
+        assert!(quiet_match.total() > viral_mismatch.total());
+    }
+
+    #[test]
+    fn views_break_ties_between_equally_good_uploads() {
+        let target = catalogued("dracula");
+        let popular = score(&candidate("Dracula", Some(9_000_000), Some(205.0)), &target);
+        let obscure = score(&candidate("Dracula", Some(300), Some(205.0)), &target);
+        assert!(popular.total() > obscure.total());
+    }
+
+    /// An upload reporting zero views is odd, not infinitely bad.
+    #[test]
+    fn a_zero_view_count_does_not_produce_a_negative_infinity() {
+        let target = catalogued("dracula");
+        let parts = score(&candidate("Dracula", Some(0), Some(205.0)), &target);
+        assert!(parts.views.is_finite());
+        assert_eq!(parts.views, 0.0);
+    }
+
+    /// The threshold is the whole point of the chooser: a real match plays, a
+    /// near miss asks.
+    #[test]
+    fn a_confident_match_is_not_offered_as_a_choice() {
+        let entries = [on_channel(
+            candidate("Dracula", Some(2_777_206), Some(206.0)),
+            "Tame Impala - Topic",
+        )];
+        let choice = pick(&entries, &catalogued("dracula"), DEFAULT_MATCH_THRESHOLD);
+        assert!(choice.confident, "{:?}", choice.best().unwrap().parts);
+    }
+
+    /// Nothing close, nothing to play: the top three go to the user.
+    #[test]
+    fn a_low_score_offers_a_choice_instead_of_guessing() {
         let entries = [
-            candidate(
-                "BTS (방탄소년단) '2.0' Official MV",
-                Some(185_000_000),
-                Some(235.0),
-            ),
+            candidate("completely unrelated one", Some(1_000), Some(200.0)),
+            candidate("completely unrelated two", Some(9_000), Some(200.0)),
+            candidate("completely unrelated three", Some(5_000), Some(200.0)),
+        ];
+        let choice = pick(&entries, &catalogued("dracula"), DEFAULT_MATCH_THRESHOLD);
+        assert!(!choice.confident);
+        let offered: Vec<&str> = choice
+            .top(3)
+            .iter()
+            .map(|scored| scored.candidate.title())
+            .collect();
+        assert_eq!(
+            offered,
+            vec![
+                "completely unrelated two",
+                "completely unrelated three",
+                "completely unrelated one"
+            ]
+        );
+    }
+
+    /// A request the catalog could not resolve has no length to score on, so
+    /// holding it to the full threshold would ask about every song forever.
+    #[test]
+    fn an_unresolved_request_is_judged_on_a_lower_bar() {
+        let target = Target {
+            artist: Some("BTS".to_string()),
+            title: Some("Hooligan".to_string()),
+            duration_secs: None,
+            requested: "bts hoolig".to_string(),
+            catalogued: false,
+        };
+        let entry = [on_channel(
             candidate("BTS 방탄소년단 'Hooligan'", Some(178_000), Some(182.0)),
+            "BANGTANTV",
+        )];
+        let full = pick(&entry, &target, DEFAULT_MATCH_THRESHOLD);
+        assert!(
+            full.confident,
+            "an unresolved request should still play a good hit"
+        );
+        assert!(target.effective_threshold(DEFAULT_MATCH_THRESHOLD) < DEFAULT_MATCH_THRESHOLD);
+    }
+
+    /// The list is already ordered best first, so the best result is index zero
+    /// and the alternatives follow it.
+    #[test]
+    fn the_ranking_is_ordered_best_first() {
+        let entries = [
+            candidate("Dracula (Lyrics)", Some(24_000_000), Some(206.0)),
+            candidate("Dracula", Some(2_777_206), Some(206.0)),
+            candidate("Dracula (Official Video)", Some(75_531_372), Some(234.0)),
+        ];
+        let choice = pick(&entries, &catalogued("dracula"), DEFAULT_MATCH_THRESHOLD);
+        let titles: Vec<&str> = choice
+            .ranked
+            .iter()
+            .map(|scored| scored.candidate.title())
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["Dracula", "Dracula (Lyrics)", "Dracula (Official Video)"]
+        );
+    }
+
+    /// A remix of something nobody asked for is not a near miss, it is a
+    /// different song, so it is dropped before it is scored.
+    #[test]
+    fn an_unrequested_remix_is_dropped_rather_than_ranked() {
+        let entries = [
+            candidate("Dracula (Remix)", Some(50_000_000), Some(211.0)),
+            candidate("Dracula", Some(2_777_206), Some(206.0)),
+        ];
+        let choice = pick(&entries, &catalogued("dracula"), DEFAULT_MATCH_THRESHOLD);
+        assert_eq!(choice.ranked.len(), 1);
+        assert_eq!(choice.ranked[0].candidate.title(), "Dracula");
+    }
+
+    /// The query is the corrected one. Searching the transcript is what
+    /// produced the wrong song in the first place.
+    #[test]
+    fn the_query_uses_the_canonical_names() {
+        let target = catalogued("hoolig bts");
+        assert_eq!(target.search_query(), "Tame Impala Dracula");
+    }
+
+    #[test]
+    fn an_unresolved_request_searches_what_was_heard() {
+        let target = Target {
+            artist: None,
+            title: None,
+            duration_secs: None,
+            requested: "the name of that one song".to_string(),
+            catalogued: false,
+        };
+        assert_eq!(target.search_query(), "the name of that one song");
+    }
+
+    /// Search results are not curated: a ten-second clip and a six-hour upload
+    /// are not songs, whatever they score.
+    #[test]
+    fn clips_and_long_mixes_are_excluded() {
+        let entries = [
+            candidate("clip", Some(100), Some(10.0)),
+            candidate("long mix", Some(50), Some(4_000.0)),
         ];
         assert!(
-            select(&entries, "hooligan")
-                .unwrap()
-                .title()
-                .contains("Hooligan")
+            pick(&entries, &catalogued("dracula"), DEFAULT_MATCH_THRESHOLD)
+                .best()
+                .is_none()
         );
     }
 
+    /// The pre-catalog ranking still had to cope with junk arriving from the
+    /// search, so it degrades to popularity when nothing is relevant.
+    #[test]
+    fn an_unresolvable_request_falls_back_to_popularity() {
+        let entries = [
+            candidate("completely unrelated one", Some(1_000), Some(200.0)),
+            candidate("completely unrelated two", Some(9_000), Some(200.0)),
+        ];
+        let target = Target {
+            artist: None,
+            title: Some("hooligan".to_string()),
+            duration_secs: None,
+            requested: "hooligan".to_string(),
+            catalogued: false,
+        };
+        assert_eq!(best_title(&entries, &target), "completely unrelated two");
+    }
+
+    #[test]
+    fn no_results_selects_nothing() {
+        assert!(
+            pick(&[], &catalogued("dracula"), DEFAULT_MATCH_THRESHOLD)
+                .best()
+                .is_none()
+        );
+    }
+
+    /// A title claiming both is a video; the video markers have to win.
     #[test]
     fn media_rank_orders_audio_above_video() {
         let rank = |title: &str| candidate(title, Some(1), Some(200.0)).media_rank();
@@ -410,7 +1193,7 @@ mod tests {
         assert_eq!(rank("Song (Dance Practice)"), 0);
     }
 
-    /// A video marker wins over an audio marker when a title claims both, so
+    /// A video marker wins over an audio marker in the same title, so
     /// "Official Audio [Official MV]" is still treated as a video.
     #[test]
     fn a_video_marker_beats_an_audio_marker_in_the_same_title() {
@@ -418,69 +1201,26 @@ mod tests {
         assert_eq!(entry.media_rank(), 0);
     }
 
-    /// When no result mentions the request, the most-viewed plausible upload
-    /// still plays rather than the search failing outright.
+    /// Speech-to-text drops letters from proper nouns, so a request that is
+    /// nearly a title still has to match it.
     #[test]
-    fn falls_back_to_popularity_when_nothing_is_relevant() {
+    fn a_misspelled_request_still_matches_the_song() {
+        let target = Target {
+            artist: Some("BTS".to_string()),
+            title: Some("Hooligan".to_string()),
+            duration_secs: None,
+            requested: "bts hoolig".to_string(),
+            catalogued: false,
+        };
         let entries = [
-            candidate("completely unrelated one", Some(1_000), Some(200.0)),
-            candidate("completely unrelated two", Some(9_000), Some(200.0)),
+            candidate(
+                "BTS (방탄소년단) '2.0' Official MV",
+                Some(185_000_000),
+                Some(235.0),
+            ),
+            candidate("BTS 방탄소년단 'Hooligan'", Some(178_000), Some(182.0)),
         ];
-        assert_eq!(
-            select(&entries, "hooligan").unwrap().title(),
-            "completely unrelated two"
-        );
-    }
-
-    /// A request of only filler words leaves nothing to match on, so
-    /// popularity decides rather than relevance excluding everything.
-    #[test]
-    fn filler_only_requests_leave_popularity_to_decide() {
-        let entries = [
-            candidate("anything at all", Some(10), Some(200.0)),
-            candidate("something else", Some(500), Some(200.0)),
-        ];
-        assert_eq!(
-            select(&entries, "the official music").unwrap().title(),
-            "something else"
-        );
-    }
-
-    #[test]
-    fn stopwords_are_not_required_to_appear_in_a_title() {
-        let entries = [
-            candidate("something else entirely", Some(9_000_000), Some(200.0)),
-            candidate("Tame Impala - Dracula", Some(50_000), Some(200.0)),
-        ];
-        assert_eq!(
-            select(&entries, "official music by tame impala")
-                .unwrap()
-                .title(),
-            "Tame Impala - Dracula"
-        );
-    }
-
-    #[test]
-    fn keeps_unknown_duration_candidates() {
-        let entries = [
-            candidate("no duration", Some(10), None),
-            candidate("short but known", Some(99_999), Some(10.0)),
-        ];
-        assert_eq!(select(&entries, "song").unwrap().title(), "no duration");
-    }
-
-    #[test]
-    fn falls_back_when_everything_is_a_clip() {
-        let entries = [
-            candidate("clip", Some(100), Some(10.0)),
-            candidate("long mix", Some(50), Some(4_000.0)),
-        ];
-        assert_eq!(select(&entries, "song").unwrap().title(), "clip");
-    }
-
-    #[test]
-    fn no_results_selects_nothing() {
-        assert!(select(&[], "song").is_none());
+        assert!(best_title(&entries, &target).contains("Hooligan"));
     }
 
     #[test]
@@ -529,47 +1269,121 @@ mod tests {
         assert_eq!(entry.video_id(), Some("09839DpTctU"));
     }
 
+    /// The whole path, against the real catalog and the real YouTube.
+    ///
+    /// Ignored by default because it needs network access, the yt-dlp binary
+    /// and the Deezer API:
+    /// `cargo test -- --ignored search`.
+    #[tokio::test]
+    #[ignore = "needs network, yt-dlp and the Deezer API"]
+    async fn the_whole_path_picks_the_requested_recording() {
+        // Built directly rather than through `Config`, which would also want a
+        // Discord token and a voice channel id that a test has no use for.
+        let catalog = resolve::Catalog::new(
+            Box::new(resolve::Deezer::new().expect("HTTP client")),
+            crate::config::DEFAULT_CATALOG_MATCH_THRESHOLD,
+        );
+        for (heard, expected) in [
+            // Misheard proper nouns, and a video that outranks the real track.
+            ("drakula tame impala", "Dracula"),
+            ("hoolig bts", "Hooligan"),
+        ] {
+            let request = PlayRequest {
+                query: heard.to_string(),
+                title: None,
+                artist: None,
+            };
+            let choice = choose_match(&request, &catalog, 8, DEFAULT_MATCH_THRESHOLD)
+                .await
+                .unwrap_or_else(|e| panic!("{heard}: {e:#}"));
+            for scored in &choice.ranked {
+                println!(
+                    "{:7.1} {:7.1}s {}",
+                    scored.score(),
+                    scored.candidate.duration.unwrap_or(0.0),
+                    scored.candidate.title()
+                );
+            }
+            let best = choice.best().expect("a result");
+            assert!(
+                choice.confident,
+                "{heard:?} was not confident: {:?}",
+                best.parts
+            );
+            assert!(
+                best.candidate
+                    .title()
+                    .to_lowercase()
+                    .contains(&expected.to_lowercase()),
+                "{heard:?} picked {:?}, expected something naming {expected:?}",
+                best.candidate.title()
+            );
+        }
+    }
+
+    /// A request the catalog cannot resolve still plays when a result's title
+    /// genuinely matches, rather than asking about every song.
+    #[tokio::test]
+    #[ignore = "needs network, yt-dlp and the Deezer API"]
+    async fn an_unresolvable_request_still_plays_a_real_match() {
+        let catalog = resolve::Catalog::new(Box::new(Empty), 0.62);
+        let request = PlayRequest {
+            query: "hoolig bts".to_string(),
+            title: None,
+            artist: None,
+        };
+        let choice = choose_match(&request, &catalog, 8, DEFAULT_MATCH_THRESHOLD)
+            .await
+            .expect("search should run");
+        assert!(
+            choice.resolved.is_none(),
+            "the catalog was supposed to find nothing"
+        );
+        for scored in &choice.ranked {
+            println!("{:7.1} {}", scored.score(), scored.candidate.title());
+        }
+        let best = choice.best().expect("a result");
+        assert!(choice.confident, "{:?}", best.parts);
+        assert!(
+            best.candidate.title().contains("Hooligan"),
+            "{}",
+            best.candidate.title()
+        );
+    }
+
+    /// A provider that finds nothing, for the test above.
+    struct Empty;
+
+    #[async_trait::async_trait]
+    impl resolve::CatalogProvider for Empty {
+        fn name(&self) -> &'static str {
+            "empty"
+        }
+        async fn search(&self, _query: &str) -> anyhow::Result<Vec<resolve::CatalogTrack>> {
+            Ok(Vec::new())
+        }
+    }
+
     /// Hits the real YouTube via yt-dlp. Ignored by default because it needs
     /// network access and the yt-dlp binary:
     /// `cargo test -- --ignored search`.
     #[tokio::test]
     #[ignore = "needs network and yt-dlp"]
-    async fn finds_official_audio_for_real() {
-        for (query, expect) in [
-            ("bts hoolig", "Hooligan"),
-            ("dracula tame impala", "Dracula"),
-        ] {
-            let found = most_popular_song(query, DEFAULT_CANDIDATES)
-                .await
-                .expect("search should find a song");
-            println!(
-                "{query:>24} -> {} | {:?} | rank {}",
-                found.title(),
-                found.channel(),
-                found.media_rank()
-            );
-            assert!(
-                found
-                    .title()
-                    .to_lowercase()
-                    .contains(&expect.to_lowercase()),
-                "{query:?} picked {:?}, expected something naming {expect:?}",
-                found.title()
-            );
+    async fn ranks_a_live_search_against_the_catalog() {
+        // The search that motivated all of this, and its results as observed.
+        let target = catalogued("dracula tame impala");
+        let entries = youtube_candidates(&target.search_query(), 8).await.unwrap();
+        println!("searched: {}", target.search_query());
+        let choice = pick(&entries, &target, DEFAULT_MATCH_THRESHOLD);
+        for scored in &choice.ranked {
+            println!("{:7.1} {}", scored.score(), scored.parts.explain());
         }
-    }
-
-    #[tokio::test]
-    #[ignore = "needs network and yt-dlp"]
-    async fn finds_most_popular_song_for_real() {
-        let found = most_popular_song("look at me", DEFAULT_CANDIDATES)
-            .await
-            .expect("search should find a song");
-        println!("picked: {} ({:?})", found.title(), found.view_count);
-        assert!(!found.url.is_empty());
+        let best = choice.best().unwrap();
+        assert_eq!(best.candidate.duration, Some(206.0));
         assert!(
-            found.video_id().is_some(),
-            "a search hit must yield a thumbnail id"
+            choice.confident,
+            "the requested recording should have been recognised: {:?}",
+            best.parts
         );
     }
 }

@@ -3,12 +3,14 @@ use crate::dashboard;
 use crate::direct::DirectTranscriber;
 use crate::parakeet::HandyTranscriber;
 use crate::player::Player;
-use crate::state::{ConfigKey, HttpClientKey, PlayerKey, TranscriberKey};
+use crate::resolve;
+use crate::state::{BigModelsKey, ConfigKey, HttpClientKey, PlayerKey, TranscriberKey};
 use crate::transcriber::Transcriber;
 use crate::voice::{VoiceService, decode_config};
+use crate::wake::BigModels;
 use serenity::async_trait;
 use serenity::builder::{
-    CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage,
+    CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, EditMessage,
 };
 use serenity::model::application::{Command, ComponentInteraction, Interaction};
 use serenity::model::gateway::Ready;
@@ -19,14 +21,22 @@ use songbird::SerenityInit;
 use std::sync::Arc;
 
 pub async fn start(config: Config) -> anyhow::Result<()> {
-    let transcriber: Arc<dyn Transcriber> = match config.asr_engine {
-        AsrEngine::Direct => Arc::new(DirectTranscriber::new(
-            &config.parakeet_model,
-            config.asr_language.as_deref(),
-        )?),
-        AsrEngine::Handy => Arc::new(HandyTranscriber::new(&config.parakeet_model)),
-    };
-    log_configuration(&config);
+    // Two models, because they pay for being loaded differently. The wake model
+    // is resident from startup: it has to be ready before anyone speaks, and it
+    // runs on every window of speech, so a load per command would cost far more
+    // than it saves. The larger one is loaded on the first wake word instead,
+    // which is what lets the bot tell the speaker when it is ready for a request.
+    let wake_model: Arc<dyn Transcriber> = build_transcriber(
+        config.asr_engine,
+        &config.wake_model,
+        config.asr_language.as_deref(),
+    )?;
+    let big_models = Arc::new(BigModels::new(
+        config.asr_engine,
+        &config.parakeet_model,
+        config.asr_language.as_deref(),
+    ));
+    log_configuration(&config, &big_models);
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
     let mut client = Client::builder(&config.discord_token, intents)
@@ -34,37 +44,70 @@ pub async fn start(config: Config) -> anyhow::Result<()> {
         .register_songbird_from_config(decode_config())
         .type_map_insert::<ConfigKey>(config)
         .type_map_insert::<HttpClientKey>(reqwest::Client::new())
-        .type_map_insert::<TranscriberKey>(transcriber)
+        .type_map_insert::<TranscriberKey>(wake_model)
+        .type_map_insert::<BigModelsKey>(big_models)
         .await?;
 
     client.start().await?;
     Ok(())
 }
 
+/// Builds one speech-to-text engine from a model spec.
+fn build_transcriber(
+    engine: AsrEngine,
+    model: &str,
+    language: Option<&str>,
+) -> anyhow::Result<Arc<dyn Transcriber>> {
+    Ok(match engine {
+        AsrEngine::Direct => Arc::new(DirectTranscriber::new(model, language)?),
+        AsrEngine::Handy => Arc::new(HandyTranscriber::new(model)),
+    })
+}
+
 /// Prints the loaded settings so a misconfigured run is obvious at a glance.
-fn log_configuration(config: &Config) {
+fn log_configuration(config: &Config, big_models: &BigModels) {
     let mut wake_words: Vec<&str> = config.wake_words.iter().map(String::as_str).collect();
     wake_words.sort_unstable();
     println!("Shamash starting up");
     match config.asr_engine {
         AsrEngine::Direct => {
             println!("  asr engine:    transcribe.cpp (in-process, model resident)");
-            println!("  parakeet model: {}", config.parakeet_model);
+            println!("  wake model:    {}", config.wake_model);
+            println!(
+                "  request model: {} (loaded on the first wake word)",
+                config.parakeet_model
+            );
             if let Some(language) = &config.asr_language {
                 println!("  asr language:  {language}");
             }
         }
         AsrEngine::Handy => {
             println!("  asr engine:    handy (parakeet, subprocess)");
-            println!("  parakeet model: {}", config.parakeet_model);
+            println!("  wake model:    {}", config.wake_model);
+            println!(
+                "  request model: {} (loaded on the first wake word)",
+                config.parakeet_model
+            );
         }
     }
+    println!(
+        "  rewrite model: {}",
+        config
+            .llm_endpoint
+            .as_deref()
+            .map(|endpoint| format!("{} ({})", config.llm_model, endpoint))
+            .unwrap_or_else(|| "off, the transcript is used as heard".to_string())
+    );
     println!("  wake words:    {}", wake_words.join(", "));
     println!("  voice channel: {}", config.voice_channel_id);
     match config.alert_channel_id {
         Some(id) => println!("  text channel:  {id}"),
         None => println!("  text channel:  auto (system channel, else first text channel)"),
     }
+    println!(
+        "  request model loaded: {}",
+        if big_models.is_loaded() { "yes" } else { "no" }
+    );
     match std::process::Command::new("yt-dlp")
         .arg("--version")
         .output()
@@ -92,14 +135,30 @@ impl EventHandler for Handler {
         // One player for the whole process, so the voice listener and the
         // dashboard buttons act on the same queue. Built here because that is
         // the first point the songbird manager can be reached.
-        match songbird::get(&ctx).await {
-            Some(manager) => {
+        let manager = match songbird::get(&ctx).await {
+            Some(manager) => manager,
+            None => {
+                println!("songbird unavailable, playback is disabled");
+                return;
+            }
+        };
+        // The catalog turns a spoken request into a real song's names and
+        // running time before anything is searched for. A failure here is worth
+        // reporting rather than working around: without it the bot still plays
+        // songs, but it will pick the wrong one much more often.
+        let config = ctx.data.read().await.get::<ConfigKey>().cloned();
+        let Some(config) = config else {
+            println!("config unavailable, playback is disabled");
+            return;
+        };
+        match resolve::Catalog::from_config(&config) {
+            Ok(catalog) => {
                 ctx.data
                     .write()
                     .await
-                    .insert::<PlayerKey>(Arc::new(Player::new(manager)));
+                    .insert::<PlayerKey>(Arc::new(Player::new(manager, Arc::new(catalog))));
             }
-            None => println!("songbird unavailable, playback is disabled"),
+            Err(e) => println!("could not reach the song catalog, playback is disabled: {e:#}"),
         }
     }
 
@@ -177,7 +236,53 @@ impl Handler {
     /// The press is acknowledged straight away, because Discord fails an
     /// interaction that goes unanswered within three seconds and a skip may
     /// have to download nothing but still waits on the voice lock.
+    /// Plays the song behind a "which one did you mean" button.
+    async fn choose_song(&self, ctx: &Context, button: ComponentInteraction, video_id: &str) {
+        let Some(guild_id) = button.guild_id else {
+            return;
+        };
+        if let Err(e) = button.defer(&ctx.http).await {
+            println!("failed to acknowledge a song choice: {e}");
+            return;
+        }
+        let (config, player) = {
+            let data = ctx.data.read().await;
+            (
+                data.get::<ConfigKey>().cloned(),
+                data.get::<PlayerKey>().cloned(),
+            )
+        };
+        let (Some(config), Some(player)) = (config, player) else {
+            println!("song choice pressed before the bot was ready");
+            return;
+        };
+
+        match player.play_chosen(ctx, &config, guild_id, video_id).await {
+            Ok(()) => println!("[{guild_id}] played the chosen song"),
+            Err(e) => {
+                println!("[{guild_id}] could not play the chosen song: {e:#}");
+                // The choice is spent either way, so the buttons go rather than
+                // offering a second press that cannot do anything.
+                let edit = EditMessage::new().components(Vec::new());
+                if let Err(e) = ctx
+                    .http
+                    .edit_message(button.channel_id, button.message.id, &edit, Vec::new())
+                    .await
+                {
+                    println!("[{guild_id}] could not clear the song choice: {e}");
+                }
+            }
+        }
+    }
+
     async fn dashboard_button(&self, ctx: &Context, button: ComponentInteraction) {
+        // Checked before the playback actions, because a choice button is not
+        // one of them and would be rejected by `action_from_id`.
+        if let Some(video_id) =
+            dashboard::picked_video_id(&button.data.custom_id).map(str::to_owned)
+        {
+            return self.choose_song(ctx, button, &video_id).await;
+        }
         let Some(action) = dashboard::action_from_id(&button.data.custom_id) else {
             // Some other component's press; not ours to answer.
             return;

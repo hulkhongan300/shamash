@@ -100,7 +100,7 @@ impl std::fmt::Display for ParseMiss {
 }
 
 /// Turns transcripts into [`PlayRequest`]s using a wake word + "play" grammar.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CommandParser {
     wake_words: HashSet<String>,
 }
@@ -147,6 +147,16 @@ impl CommandParser {
     /// Like [`Self::parse`], but reports why the transcript was rejected.
     pub fn parse_with_reason(&self, transcript: &str) -> Result<PlayRequest, ParseMiss> {
         let text = normalize(transcript);
+        let tail = self.command_tail(&text)?;
+        build_request(&tail).ok_or(ParseMiss::EmptyRequest)
+    }
+
+    /// The words after the wake word and "play", if the grammar matched.
+    ///
+    /// Split out because two callers need the same index arithmetic: the parser
+    /// itself, and [`Self::strip_command`], which the transcript-rewriting stage
+    /// uses when a model returns a whole sentence instead of just the request.
+    fn command_tail(&self, text: &str) -> Result<String, ParseMiss> {
         let words: Vec<&str> = text.split(' ').collect();
 
         let wake_idx = words
@@ -163,8 +173,36 @@ impl CommandParser {
                 .ok_or(ParseMiss::NoPlayVerb)?
         };
 
-        let rest = words[play_at + 1..].join(" ");
-        build_request(&rest).ok_or(ParseMiss::EmptyRequest)
+        Ok(words[play_at + 1..].join(" "))
+    }
+
+    /// The request alone, with any wake word and "play" removed.
+    ///
+    /// A rewriting model asked to tidy a transcript tends to keep the wake word,
+    /// and the search would then be aimed at "bot dracula" rather than
+    /// "Dracula". Two passes, because what comes back from a model may be any of
+    /// three shapes: the command as it was spoken with the wake word somewhere in
+    /// it, the request on its own, or the wake word with no "play". The grammar
+    /// handles the first and the tolerant pass the other two, so all three come
+    /// back as the same request. `None` only when there is nothing to search for.
+    pub fn strip_command(&self, transcript: &str) -> Option<String> {
+        let text = normalize(transcript);
+
+        if let Ok(Some(request)) = self.command_tail(&text).map(|tail| build_request(&tail)) {
+            return Some(request.query);
+        }
+
+        let mut words: Vec<&str> = text.split(' ').collect();
+        if words.len() == 1 && words[0].is_empty() {
+            return None;
+        }
+        if self.is_wake_word(words[0]) {
+            words.remove(0);
+        }
+        if words.first() == Some(&PLAY_VERB) {
+            words.remove(0);
+        }
+        build_request(&words.join(" ")).map(|request| request.query)
     }
 
     /// Builds a request from text spoken after a "play" that was already heard.
@@ -486,6 +524,62 @@ mod tests {
             parser.parse_with_reason("chameleon play despacito").err(),
             Some(ParseMiss::NoWakeWord)
         );
+    }
+
+    #[test]
+    fn a_paused_request_without_a_wake_word_is_still_a_request() {
+        assert_eq!(
+            parser().strip_command("dracula by tame impala").as_deref(),
+            Some("dracula by tame impala")
+        );
+    }
+
+    /// The rewriting stage is handed whole sentences, wake word included, so the
+    /// grammar has to be reusable on what comes back from a model.
+    #[test]
+    fn stripping_the_command_leaves_the_request() {
+        let parser = parser();
+        assert_eq!(
+            parser
+                .strip_command("Shamash, play Dracula by Tame Impala!")
+                .as_deref(),
+            Some("dracula by tame impala")
+        );
+        assert_eq!(
+            parser.strip_command("play lofi hip hop").as_deref(),
+            Some("lofi hip hop")
+        );
+        // A model may drop "play", or keep the wake word without it.
+        assert_eq!(
+            parser
+                .strip_command("bot dracula by tame impala")
+                .as_deref(),
+            Some("dracula by tame impala")
+        );
+        assert_eq!(
+            parser.strip_command("shamash play").as_deref(),
+            None,
+            "nothing left to search for"
+        );
+        assert_eq!(parser.strip_command("   "), None);
+    }
+
+    /// Whatever the grammar accepts, stripping and parsing must agree on.
+    #[test]
+    fn stripping_agrees_with_parsing() {
+        let parser = parser_with_play_wake_word();
+        for transcript in [
+            "bot play dracula by tame impala",
+            "play despacito",
+            "shamash play us and them by pink floyd",
+            "play",
+        ] {
+            assert_eq!(
+                parser.strip_command(transcript),
+                parser.parse(transcript).map(|r| r.query),
+                "for {transcript:?}"
+            );
+        }
     }
 
     #[test]

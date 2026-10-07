@@ -3,29 +3,66 @@
 A wake-word Discord music bot written in Rust.
 
 Shamash joins a designated voice channel whenever a member enters it, listens
-to what people say, and plays music when it hears a request:
+for its name, and plays the song that is asked for:
 
 > **"Shamash, play Dracula by Tame Impala"**
 
 ## How it works
 
+The listening is staged, because a conversation in a voice channel should not
+cost a large transcription, and a person who says the bot's name should not have
+to wait for it to think before they know they were heard.
+
 ```
 Discord voice (Opus @ 48 kHz) ──► songbird receive
-        │  VoiceTick → PCM (mono f32 48 kHz)
+        │  VoiceTick → PCM (mono f32 16 kHz)
         ▼
-Resampler (48 kHz → 16 kHz) ──► VAD buffer (flushes on silence)
+┌─ always on ──────────────────────────────────────────────┐
+│  WAKE MODEL — small, loaded at startup, held resident     │
+│  rolling 2 s window, checked every 500 ms while speech    │
+└──────────────────────────────────────────────────────────┘
+        │ wake word heard
         ▼
-Parakeet (local, transcribe.cpp linked in) → transcript
-        ▼
-Parser: wake word + "play <title> by <artist>" → search query
-        ▼
-yt-dlp search + download ──► per-song file ──► songbird playback
+      tone 1  (880 Hz)  "I heard you"
         │
-        ├──► dashboard embed in the alert channel (title, thumbnail, buttons)
+        │ load the request model (once; then resident)
+        ▼
+      tone 2  (988 Hz)  "ready, go ahead"
+        │
+        │ capture up to 5 s, or until 500 ms of silence
+        ▼
+┌─ on demand ──────────────────────────────────────────────┐
+│  PARAKEET_MODEL — large, transcribes only what was said  │
+│        ▼                                                   │
+│  LLM rewrite (optional) — misheard names → likely names  │
+└──────────────────────────────────────────────────────────┘
+        │
+        ▼
+Parser: "play <title> by <artist>" → search query
+        ▼
+Catalog (Deezer): the song's real artist, title and length
+        ▼
+yt-dlp search, scored against that length ──► per-song file ──► songbird playback
+        │
+        ├──► if no result is convincing enough, three buttons to pick from
         ▼
 songbird reports the song ended ──► next song in the queue starts
 ```
 
+### The two tones
+
+The first tone means the wake word was heard. The second means the larger model
+is loaded and listening. They are a tone apart rather than a melody, so the pair
+is recognisably one acknowledgement, but a person who starts their request
+before the second finishes can still tell which stage answered them.
+
+The larger model is loaded *after* a wake word rather than at startup, which is
+what gives the second tone something true to report. It is then kept resident:
+reloading a 700 MB model per command would cost far more than holding it, and
+holding it is the whole reason the in-process engine is worth having.
+
+- **Always-on and cheap**: only the small model runs continuously, and only on
+  windows that contain speech. A quiet channel costs one RMS per frame.
 - **Autonomous joins**: joins when a user enters the configured channel, leaves
   when it is empty.
 - **Picks the popular song**: a request searches YouTube and plays the
@@ -46,16 +83,19 @@ songbird reports the song ended ──► next song in the queue starts
 - Rust (edition 2024)
 - System packages: `ffmpeg`, `yt-dlp`, `libopus-dev`, `pkg-config`, `cmake`,
   and a C/C++ toolchain (`transcribe-cpp` builds its engine from source)
-- A Parakeet GGUF model. The default one comes from the
+- **Two** Parakeet GGUF models: a small one for the wake word and a large one for
+  requests. The default ones come from the
   [Handy](https://github.com/cjpais/Handy) app's Hugging Face cache, so
-  installing Handy once is the easiest way to get it
+  installing Handy once is the easiest way to get them
 - A Discord application with a bot token (enable voice gateway intents)
+- Optional, for the rewrite stage: [Ollama](https://ollama.com) with a small
+  model pulled
 
 ## Setup
 
 Install the [Handy](https://github.com/cjpais/Handy) app once and pick a
 Parakeet model in it, so the weights land in the Hugging Face cache that
-`PARAKEET_MODEL` resolves against. Or skip it and point `PARAKEET_MODEL`
+`PARAKEET_MODEL` and `WAKE_MODEL` resolve against. Or skip it and point them
 straight at any transcribe.cpp GGUF.
 
 Then create a gitignored `.env` next to the binary with your own values:
@@ -72,37 +112,29 @@ EOF
 it writes to. With Developer Mode on in Discord, right-click either channel and
 choose "Copy Channel ID" to fill them in.
 
-Speech-to-text links [transcribe.cpp](https://github.com/cjpais/Handy) into
-the bot and keeps the model loaded, so an utterance costs inference time only.
-Measured here on a 2 s utterance with Parakeet TDT+CTC 110M: 90 ms in-process
-versus 346 ms through `handy --transcribe-file`, which reloads the model and
-starts a Tauri app every time. `cargo run --release --example bench_direct --
-recording.wav` prints the same split.
+### The two models
 
-`PARAKEET_MODEL` takes either a path to a `.gguf` or a Handy catalogue id, which
-is resolved against the Hugging Face cache. Some models (Canary, Nemotron) need
-a language hint to produce text at all; set `ASR_LANGUAGE=en` for those.
+They pay for being loaded differently, which is the whole reason there are two:
 
-The default model depends on the engine, because they pay for loading it
-differently. `direct` holds one model for the whole process and so defaults to
-Parakeet TDT 0.6B v2, the strong English model. `handy` spawns a process per
-utterance and reloads the weights every time, where load time dominates a
-two-second command, so it defaults to the 110M model instead.
+| | `WAKE_MODEL` | `PARAKEET_MODEL` |
+| --- | --- | --- |
+| Loaded | at startup, always resident | on the first wake word, then resident |
+| Runs | on every window of speech in the channel | only on a request, after a wake word |
+| Job | hear one short word | turn the request into text |
+| Default | `parakeet-tdt_ctc-110m` | `parakeet-tdt-0.6b-v2` |
 
-The 0.6B default was chosen by measurement, not reputation: on the real
-recordings in the Handy's cache, the 110M model returned *empty text* on the
-utterances that crossed the voice gate, and the 0.6B model returned what was
-said. An earlier version of this file claimed the larger models were unusable
-here; that was measured through the `handy` subprocess, which cannot pass the
-language hint some of them need, and it did not describe the in-process engine.
-
-`ASR_ENGINE=handy` restores the old subprocess behaviour, which is slower but
-useful for comparing engines on the same audio.
+`ASR_ENGINE=handy` swaps the in-process engine back to the Handy subprocess,
+which reloads a model per call. It is slower and kept for comparing engines on
+the same audio; the staged design assumes the resident one.
 
 Whisper models work the same way, as GGUFs, through this engine. The old
 `whisper-rs` engine and `scripts/setup.sh` are gone: it vendored its own copy
 of `ggml` and could not be linked alongside transcribe.cpp, so one had to go.
 `ASR_ENGINE=whisper` now fails with a message saying so.
+
+`PARAKEET_MODEL` takes either a path to a `.gguf` or a Handy catalogue id, which
+is resolved against the Hugging Face cache. Some models (Canary, Nemotron) need
+a language hint to produce text at all; set `ASR_LANGUAGE=en` for those.
 
 ### Environment variables
 
@@ -111,10 +143,21 @@ of `ggml` and could not be linked alongside transcribe.cpp, so one had to go.
 | `DISCORD_TOKEN`   | yes      | Bot token from the Discord developer portal        |
 | `VOICE_CHANNEL_ID`| yes      | ID of the voice channel the bot watches and joins  |
 | `ASR_ENGINE`      | no       | `direct` (default, in-process transcribe.cpp) or `handy` (subprocess) |
-| `PARAKEET_MODEL`  | no       | Path to a `.gguf`, or a Handy model id; Parakeet TDT 0.6B v2 for `direct`, Parakeet TDT+CTC 110M for `handy` |
+| `PARAKEET_MODEL`  | no       | The large model, loaded on a wake word: a `.gguf` path or Handy model id (default Parakeet TDT 0.6B v2) |
+| `WAKE_MODEL`      | no       | The small always-on model: a `.gguf` path or Handy model id (default Parakeet TDT+CTC 110M) |
 | `ASR_LANGUAGE`    | no       | Language hint for models that need one, e.g. `en` for Canary or Nemotron |
 | `WAKE_WORDS`      | no       | Comma-separated wake words (default `bot,play,ut,ot`) |
+| `LLM_ENDPOINT`    | no       | Ollama-compatible endpoint that rewrites a misheard transcript. Unset by default, which uses the words as heard |
+| `LLM_MODEL`       | no       | Model to ask at that endpoint (default `llama3.2`) |
 | `ALERT_CHANNEL_ID`| no       | Text channel for the now-playing dashboard and every other bot message (defaults to the server's system channel, then to the first text channel) |
+| `CATALOG_PROVIDER`| no       | Which music catalog resolves requests: `deezer` (default) or `itunes`. Both are keyless |
+| `CATALOG_MATCH_THRESHOLD` | no | How confident a catalog match must be to correct the transcript, 0–1 (default `0.62`) |
+| `MATCH_THRESHOLD` | no       | Lowest score a candidate may reach and still be played without asking, in points (default `90`) |
+| `SEARCH_CANDIDATES` | no     | How many YouTube results a request is scored against, 1–50 (default `8`) |
+
+A malformed value is a startup error rather than a silent default, so a typo in
+a threshold is reported instead of quietly reverting to the default. Each
+threshold is range-checked against the range its setting documents.
 
 Secrets live in a gitignored `.env` file next to the binary, loaded through
 [`dotenvy`](https://crates.io/crates/dotenvy). Real environment variables take
@@ -126,10 +169,111 @@ Shorter ones must be heard exactly, otherwise ordinary speech ("not", "boy")
 would trigger the bot — which is why "ut" and "ot" are listed alongside "bot":
 speech-to-text often drops the first consonant of a short word.
 
+### Tuning the wake word
+
+The always-on gate is the part most likely to need adjusting on a real voice,
+and `examples/transcribe.rs` is the instrument for it (see below). Three
+constants in `src/wake.rs` decide how it behaves:
+
+| Constant | Default | Raise it to |
+| --- | --- | --- |
+| `WAKE_WINDOW` | 2 s | hear a slower wake word, at the cost of more to transcribe each check |
+| `WAKE_HOP` | 500 ms | use less CPU on a busy channel, at the cost of missing more of a quick shout |
+| `WAKE_TAIL_FRAMES` | 500 ms | hear a wake word at the *end* of a sentence rather than the start |
+
+`WAKE_HOP` is the CPU dial. Each check is one inference on the small model, so a
+busy channel costs about two inferences a second.
+
 ## Run
 
 ```sh
 cargo run --release
+```
+
+### The rewrite stage
+
+Off by default, and deliberately: the catalog already corrects most mishearing
+for free and returns the track's real running time, so the rewrite has to earn
+its place on the requests the catalog cannot rescue.
+
+Speech-to-text renders a title and an artist as whatever letters it hears —
+"hoolig bts" for "Hooligan, BTS" — and everything downstream works from those
+letters. A music catalog can only match what it is given, so a title mangled
+past recognition can never be found no matter how good the matching is. A small
+instruction model is good at exactly that guess.
+
+Set `LLM_ENDPOINT` to switch it on:
+
+```sh
+LLM_ENDPOINT=http://localhost:11434
+LLM_MODEL=llama3.2
+cargo run --release
+```
+
+It is one HTTP request per command, bounded at three seconds, and every way it
+can fail — endpoint down, model not pulled, reply that is not a song request,
+reply that is an explanation rather than an answer — falls back to the words that
+were actually heard. It never becomes the reason a request goes unplayed.
+
+### How a request becomes a song
+
+Speech-to-text mishears proper nouns, so a request arrives as something like
+`hoolig bts` and a flat search hands back whatever matched those letters. Fixing
+that with more string matching against YouTube titles is guessing, because
+uploader-written titles are not a list of songs.
+
+A music catalog *is* a list of songs. Before anything is searched for, the
+request is resolved against one — `deezer` by default, `itunes` also available,
+neither needing a key — which returns the artist's own spelling of the title and
+the track's real running time. Both are fuzzy-matched against the transcript
+(lowercased, punctuation and "feat."/"remastered" noise stripped), and a match
+below `CATALOG_MATCH_THRESHOLD` is discarded in favour of the words that were
+actually heard.
+
+The lookup is bounded at two seconds. It is an improvement on the raw transcript
+and must never be the reason a command goes unanswered, so a slow or failed
+catalog call falls back to searching the transcript rather than blocking.
+
+A YouTube search returns whatever matched the words, and for a popular song that
+routinely includes other people's takes of it. Ranking those by view count picks
+the official video when the album track was meant, and a remix when the original
+was. A search for *Tame Impala Dracula* puts this plainly:
+
+| result                                  | length | views |
+| --------------------------------------- | ------ | ----- |
+| Official Video                          | 234 s  | 75.5 M |
+| JENNIE Remix (Lyrics)                   | 211 s  | 50.8 M |
+| **Dracula**, artist's channel           | **206 s** | 2.8 M |
+
+The catalog says the song runs 205 s, so the two rows above it are not that song.
+
+So the request is resolved against a music catalog first, which supplies the
+canonical artist, title and running time; the YouTube search is built from
+those names, and the results are scored against that running time rather than
+by popularity. Popularity is kept, log-scaled and capped, only to break ties
+between equally good uploads.
+
+Below `MATCH_THRESHOLD` the bot does not guess. It posts the three closest
+results in the alert channel as numbered buttons and waits.
+
+Some titles are simply not distinctive. "Look at Me" has been recorded by
+Naughty Boy, Tems, The Neighbourhood and others, and a request that named no
+artist gives the catalog nothing to tell them apart — every one of them scores
+identically. Naming one of those artists in the YouTube query would aim the
+search at a song the listener never asked for, so the bot does not: it keeps the
+title, drops the guessed artist, and offers the choices instead.
+
+Set `RUST_LOG=shamash=debug` to see what the wake model heard on each check, the
+resolution, the scores and the runner-up:
+
+```
+wake model heard: "shamash play dracula"
+resolved against the catalog provider=deezer catalog=Dracula — Tame Impala
+  duration=Some(205.0) confidence=0.94 query=Tame Impala Dracula
+chose a video heard=drakula tame impala picked=Dracula channel=Tame Impala
+  chosen=total 124.0 (duration +100.0, channel +30.0, relevance +18.0,
+  media +0.0, views +6.0) runner_up=Dracula (Lyrics) (101.4)
+  threshold=90.0 confident=true
 ```
 
 ### Controlling playback
@@ -143,6 +287,10 @@ The dashboard in the alert channel is the only control surface:
 | Skip     | Drops the current song and starts the next one queued       |
 | Stop     | Stops playback and clears the queue                         |
 
+When the bot cannot tell which song was meant, it posts the three closest
+results in the same channel as numbered buttons and plays nothing. Pressing one
+plays that song; the others stay selectable until one is used.
+
 `/stop` is separate: it also leaves the voice channel, so the bot stops
 transcribing until someone comes back.
 
@@ -153,19 +301,42 @@ instant and stops the cache growing without bound.
 
 ## Testing without Discord
 
-Record a WAV of yourself saying *"Bot, play Dracula by Tame Impala"* and
-run the transcriber end-to-end (resample → VAD → Whisper → parser):
+Record yourself saying a wake word, pausing, then *"play Dracula by Tame
+Impala"* — the pause matters, because it is where the bot's two tones fall:
 
 ```sh
 cargo run --release --example transcribe -- recording.wav
 ```
 
-It prints what the bot hears and which play request it would make, plus a level
-report: the loudest 20 ms frame against the voice-activity gate. If that frame
-sits below the gate, the bot cannot hear you at all, so the report is the first
-thing to check when it stays silent. `VAD_RMS_THRESHOLD` in `src/listener.rs`
-sets the gate; it defaults to 0.02, which is -34 dBFS against a typical
-conversational voice at -20 dBFS.
+This drives the real wake gate rather than a copy of it, so it measures the two
+things worth measuring: whether the small model can hear the wake word at all,
+and whether the large model turns what follows it into a playable request. It
+prints every window the small model was given and what it heard:
+
+```
+wake model heard: "so what do you think"
+wake model heard: "shamash play dracula"
+>>> wake word heard after 3 check(s), in 1.84 s of audio
+larger model ready in 412ms
+>>> captured 1.62 s of request
+request heard: "dracula by tame impala"
+play: dracula by tame impala
+```
+
+Models and wake words come from the same settings as the bot, so a change to
+`WAKE_MODEL` or `WAKE_WORDS` is measured by re-running this. `PARAKEET_MODEL`
+and `WAKE_MODEL` both default to the Handy cache.
+
+It also prints a level report: the loudest 20 ms frame against the
+voice-activity gate. If that frame sits below the gate, the bot cannot hear you
+at all, so the report is the first thing to check when it stays silent.
+`VAD_RMS_THRESHOLD` in `src/listener.rs` sets the gate; it defaults to 0.02,
+which is -34 dBFS against a typical conversational voice at -20 dBFS.
+
+If the wake word is never reported, the harness says how many checks were made:
+zero means the model never saw enough speech, and a non-zero count means the
+wake word is in there but not being recognised — which is a `WAKE_WORDS` or
+`WAKE_HOP` problem rather than a level one.
 
 ## Development
 
