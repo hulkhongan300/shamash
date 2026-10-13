@@ -322,6 +322,11 @@ When the bot cannot tell which song was meant, it posts the three closest
 results in the same channel as numbered buttons and plays nothing. Pressing one
 plays that song; the others stay selectable until one is used.
 
+Only members **currently in the voice channel the bot is playing in** can press
+any of these, or run `/stop`. Everyone else gets an ephemeral "join the voice
+channel first" and nothing happens. The dashboard is a text-channel message, so
+without that check anyone who could read it could stop someone else's music.
+
 `/stop` is separate: it also leaves the voice channel, so the bot stops
 transcribing until someone comes back.
 

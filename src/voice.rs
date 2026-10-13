@@ -6,7 +6,7 @@ use crate::player::Player;
 use crate::state::{BigModelsKey, ConfigKey, PlayerKey, TranscriberKey};
 use crate::wake::{WakeGate, run_wake_gate};
 use anyhow::Context;
-use serenity::model::id::{ChannelId, GuildId};
+use serenity::model::id::{ChannelId, GuildId, UserId};
 use serenity::prelude::Context as SerenityContext;
 use songbird::Songbird;
 use songbird::driver::{Channels, DecodeConfig, DecodeMode, SampleRate};
@@ -226,6 +226,47 @@ impl VoiceService {
         Err(last.expect("at least one join attempt is always made"))
     }
 
+    /// Whether `user_id` is currently in this guild's bot voice channel.
+    ///
+    /// The gate for every playback control. The dashboard is a text-channel
+    /// message, so without this anyone in the server — or anyone who can see
+    /// the message at all — could press Skip or Stop on someone else's music,
+    /// and `/stop` could be used to kick the bot out from under the people who
+    /// asked for it.
+    pub fn is_in_bot_channel(
+        &self,
+        ctx: &SerenityContext,
+        guild_id: GuildId,
+        user_id: UserId,
+    ) -> bool {
+        let target = ChannelId::new(self.config.voice_channel_id);
+        let channel = ctx.cache.guild(guild_id).and_then(|guild| {
+            guild
+                .voice_states
+                .get(&user_id)
+                .and_then(|state| state.channel_id)
+        });
+        Self::member_is_in(channel, target)
+    }
+
+    /// The rule itself.
+    ///
+    /// `channel` is the voice channel the member is in, or `None` when they are
+    /// not in one at all -- no cached voice state, or connected but deaf to
+    /// everything.
+    ///
+    /// Split from [`Self::is_in_bot_channel`] so it can be exercised without a
+    /// gateway: serenity's `Cache` populates itself from events and offers no
+    /// way to insert one in a test.
+    ///
+    /// `None` is refused rather than allowed. The cache can lag a join or a
+    /// move, and the cost of wrongly allowing is that anyone can stop anyone
+    /// else's music; the cost of wrongly refusing is one person has to press
+    /// the button again.
+    pub fn member_is_in(channel: Option<ChannelId>, target: ChannelId) -> bool {
+        channel == Some(target)
+    }
+
     /// Stops playback and removes the bot from the guild's voice channel.
     pub async fn stop(&self, guild_id: GuildId) -> anyhow::Result<()> {
         if self.manager.get(guild_id).is_none() {
@@ -236,5 +277,27 @@ impl VoiceService {
             .await
             .map_err(|e| anyhow::anyhow!("failed to leave voice channel: {e}"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const BOT_CHANNEL: u64 = 4242;
+    const OTHER_CHANNEL: u64 = 9;
+
+    fn may_drive(channel: Option<u64>) -> bool {
+        VoiceService::member_is_in(channel.map(ChannelId::new), ChannelId::new(BOT_CHANNEL))
+    }
+
+    /// The rule the dashboard needs: someone in the bot's channel may press
+    /// Skip, and nobody else may.
+    #[test]
+    fn only_members_in_the_bot_channel_may_drive_playback() {
+        assert!(may_drive(Some(BOT_CHANNEL)), "in the channel, so allowed");
+        assert!(!may_drive(Some(OTHER_CHANNEL)), "in another channel");
+        // Connected but nowhere to hear it, or not connected at all: both are a
+        // member the cache has no channel for.
+        assert!(!may_drive(None));
     }
 }

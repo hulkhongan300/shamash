@@ -14,7 +14,7 @@ use serenity::builder::{
 };
 use serenity::model::application::{Command, ComponentInteraction, Interaction};
 use serenity::model::gateway::Ready;
-use serenity::model::id::ChannelId;
+use serenity::model::id::{ChannelId, GuildId, UserId};
 use serenity::model::voice::VoiceState;
 use serenity::prelude::*;
 use songbird::SerenityInit;
@@ -195,6 +195,30 @@ impl EventHandler for Handler {
     }
 }
 
+/// The reply a member outside the bot's voice channel gets.
+///
+/// Ephemeral, because it answers one person and would otherwise be a public
+/// message about someone else's failed button press.
+pub const NOT_IN_VOICE: &str =
+    "Join the voice channel I'm in first — that's where playback is controlled.";
+
+/// Whether `user_id` may drive playback for this guild.
+///
+/// Everything that acts on playback — Skip, Stop, Pause/Resume, the "which song
+/// did you mean" buttons and `/stop` — is a control surface for the people in
+/// the channel the music is playing in, and for nobody else. The dashboard is a
+/// text-channel message, so without this anyone who can read it could stop
+/// someone else's music.
+async fn may_control(ctx: &Context, guild_id: GuildId, user_id: UserId) -> bool {
+    match VoiceService::from_ctx(ctx).await {
+        Ok(service) => service.is_in_bot_channel(ctx, guild_id, user_id),
+        Err(e) => {
+            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not check the voice channel");
+            false
+        }
+    }
+}
+
 /// The interaction handlers, split out of the [`EventHandler`] impl because
 /// they are plain methods rather than events.
 impl Handler {
@@ -208,26 +232,29 @@ impl Handler {
             return;
         }
 
-        let response = match VoiceService::from_ctx(ctx).await {
-            Ok(service) => match command.guild_id {
-                Some(guild_id) => {
-                    let was_connected = service.manager.get(guild_id).is_some();
-                    match service.stop(guild_id).await {
-                        Ok(()) if was_connected => "Left the voice channel.".to_string(),
-                        Ok(()) => "I wasn't in a voice channel.".to_string(),
-                        Err(e) => format!("Failed to leave: {e}"),
+        let response = match command.guild_id {
+            Some(guild_id) if may_control(ctx, guild_id, command.user.id).await => {
+                match VoiceService::from_ctx(ctx).await {
+                    Ok(service) => {
+                        let was_connected = service.manager.get(guild_id).is_some();
+                        match service.stop(guild_id).await {
+                            Ok(()) if was_connected => "Left the voice channel.".to_string(),
+                            Ok(()) => "I wasn't in a voice channel.".to_string(),
+                            Err(e) => format!("Failed to leave: {e}"),
+                        }
                     }
+                    Err(e) => format!("Internal error: {e:#}"),
                 }
-                None => "This command must be used in a server.".to_string(),
-            },
-            Err(e) => format!("Internal error: {e:#}"),
+            }
+            Some(_) => NOT_IN_VOICE.to_string(),
+            None => "This command must be used in a server.".to_string(),
         };
 
         let reply = CreateInteractionResponse::Message(
             CreateInteractionResponseMessage::new().content(response),
         );
         if let Err(e) = command.create_response(&ctx.http, reply).await {
-            println!("failed to respond to /stop: {e}");
+            tracing::warn!("failed to respond to /stop: {e}");
         }
     }
 
@@ -241,8 +268,17 @@ impl Handler {
         let Some(guild_id) = button.guild_id else {
             return;
         };
+        if !may_control(ctx, guild_id, button.user.id).await {
+            tracing::info!(
+                guild_id = %guild_id,
+                user = %button.user.id,
+                "a song choice was pressed from outside the voice channel"
+            );
+            refuse(ctx, button).await;
+            return;
+        }
         if let Err(e) = button.defer(&ctx.http).await {
-            println!("failed to acknowledge a song choice: {e}");
+            tracing::warn!("failed to acknowledge a song choice: {e}");
             return;
         }
         let (config, player) = {
@@ -253,14 +289,14 @@ impl Handler {
             )
         };
         let (Some(config), Some(player)) = (config, player) else {
-            println!("song choice pressed before the bot was ready");
+            tracing::warn!("song choice pressed before the bot was ready");
             return;
         };
 
         match player.play_chosen(ctx, &config, guild_id, video_id).await {
-            Ok(()) => println!("[{guild_id}] played the chosen song"),
+            Ok(()) => tracing::info!(guild_id = %guild_id, "played the chosen song"),
             Err(e) => {
-                println!("[{guild_id}] could not play the chosen song: {e:#}");
+                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not play the chosen song");
                 // The choice is spent either way, so the buttons go rather than
                 // offering a second press that cannot do anything.
                 let edit = EditMessage::new().components(Vec::new());
@@ -269,7 +305,7 @@ impl Handler {
                     .edit_message(button.channel_id, button.message.id, &edit, Vec::new())
                     .await
                 {
-                    println!("[{guild_id}] could not clear the song choice: {e}");
+                    tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not clear the song choice");
                 }
             }
         }
@@ -290,8 +326,18 @@ impl Handler {
         let Some(guild_id) = button.guild_id else {
             return;
         };
+        if !may_control(ctx, guild_id, button.user.id).await {
+            tracing::info!(
+                guild_id = %guild_id,
+                user = %button.user.id,
+                action = action,
+                "a dashboard button was pressed from outside the voice channel"
+            );
+            refuse(ctx, button).await;
+            return;
+        }
         if let Err(e) = button.defer(&ctx.http).await {
-            println!("failed to acknowledge a dashboard button: {e}");
+            tracing::warn!("failed to acknowledge a dashboard button: {e}");
             return;
         }
 
@@ -304,16 +350,16 @@ impl Handler {
             data.get::<PlayerKey>().cloned()
         };
         let (Some(config), Some(player)) = (config, player) else {
-            println!("dashboard button pressed before the bot was ready");
+            tracing::warn!("dashboard button pressed before the bot was ready");
             return;
         };
 
         match action {
             dashboard::ACTION_PAUSE | dashboard::ACTION_RESUME => {
                 match player.toggle_pause(guild_id).await {
-                    Some(true) => println!("[{guild_id}] paused"),
-                    Some(false) => println!("[{guild_id}] resumed"),
-                    None => println!("[{guild_id}] nothing to pause"),
+                    Some(true) => tracing::info!(guild_id = %guild_id, "paused"),
+                    Some(false) => tracing::info!(guild_id = %guild_id, "resumed"),
+                    None => tracing::info!(guild_id = %guild_id, "nothing to pause"),
                 }
                 player.draw_dashboard(ctx, &config, guild_id).await;
             }
@@ -326,5 +372,20 @@ impl Handler {
             // `action_from_id` only returns the four above.
             _ => {}
         }
+    }
+}
+
+/// Tells one person, privately, that they cannot drive playback from here.
+///
+/// Ephemeral rather than a public reply, so pressing Skip from the wrong
+/// channel does not announce itself to the room.
+async fn refuse(ctx: &Context, button: ComponentInteraction) {
+    let reply = CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new()
+            .content(NOT_IN_VOICE)
+            .ephemeral(true),
+    );
+    if let Err(e) = button.create_response(&ctx.http, reply).await {
+        tracing::warn!("could not refuse a button press: {e}");
     }
 }
