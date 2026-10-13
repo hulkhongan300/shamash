@@ -92,17 +92,36 @@ impl Default for Listener {
 
 /// Mixes per-speaker i16 frames into a single normalized f32 frame.
 ///
-/// All frames must have the same length (they are always 20 ms at the
-/// configured decode rate).
+/// Frames are normally all the same length — they are 20 ms at the configured
+/// decode rate — but nothing guarantees it: a decode can yield a short final
+/// packet, and a longer one would have indexed past the end of `out` and
+/// panicked in a release build. Only the samples every frame has are mixed, so
+/// a ragged set of frames produces a short frame rather than a crash.
+///
+/// The sum is clamped to [-1, 1]. Two people speaking at once must not sum to
+/// a sample the decoder would read as louder than full scale, which clips and
+/// sounds like a crack rather than like two voices.
 pub fn mix_frames(frames: &[&[i16]]) -> Vec<f32> {
-    let len = frames.first().map_or(0, |f| f.len());
+    let len = frames.iter().map(|frame| frame.len()).min().unwrap_or(0);
+    if len == 0 {
+        return Vec::new();
+    }
+    if let Some(shortest) = frames.iter().find(|frame| frame.len() != len) {
+        tracing::warn!(
+            expected = len,
+            found = shortest.len(),
+            "speaker frames differ in length; mixing only what all of them have"
+        );
+    }
+
     let mut out = vec![0.0f32; len];
     for frame in frames {
-        debug_assert_eq!(frame.len(), len, "speaker frame sizes must match");
-        for (i, sample) in frame.iter().enumerate() {
-            out[i] += *sample as f32 / 32768.0;
+        for (mixed, sample) in out.iter_mut().zip(*frame) {
+            *mixed += *sample as f32 / 32768.0;
         }
     }
+    out.iter_mut()
+        .for_each(|mixed| *mixed = mixed.clamp(-1.0, 1.0));
     out
 }
 
@@ -501,6 +520,71 @@ mod tests {
     #[test]
     fn mixes_empty_frame_set() {
         assert!(mix_frames(&[]).is_empty());
+    }
+
+    /// A longer speaker frame used to index past the end of the output and
+    /// panic in a release build — the length check was a `debug_assert`, which
+    /// only runs in a debug build. A ragged tick is now a shorter frame.
+    #[test]
+    fn a_longer_speaker_frame_does_not_panic_or_overrun() {
+        let short = vec![1000i16; 320];
+        let long = vec![2000i16; 640];
+        let mixed = mix_frames(&[&short, &long]);
+        assert_eq!(mixed.len(), 320, "only what every frame has is mixed");
+        assert!((mixed[0] - (1000.0 + 2000.0) / 32768.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_shorter_speaker_frame_is_the_limit() {
+        let short = vec![1000i16; 160];
+        let long = vec![2000i16; 320];
+        let mixed = mix_frames(&[&short, &long]);
+        assert_eq!(mixed.len(), 160);
+    }
+
+    /// A frame of nothing at all cannot contribute, so a decoder hiccup that
+    /// yields an empty buffer does not throw the whole tick away.
+    #[test]
+    fn an_empty_frame_still_lets_the_others_through() {
+        let full = vec![1000i16; 320];
+        let empty: Vec<i16> = Vec::new();
+        assert!(mix_frames(&[&full, &empty]).is_empty());
+        assert_eq!(mix_frames(&[&empty, &full]).len(), 0);
+    }
+
+    /// The result is documented as normalized, and two loud speakers really do
+    /// sum past full scale. Unclamped, the decoder reads that as a hard clip and
+    /// it sounds like a crack rather than like two voices.
+    #[test]
+    fn the_mixed_frame_is_clamped_to_full_scale() {
+        let loud = vec![i16::MAX; 320];
+        let also_loud = vec![i16::MAX; 320];
+        let mixed = mix_frames(&[&loud, &also_loud]);
+        assert!(
+            mixed.iter().all(|s| (-1.0..=1.0).contains(s)),
+            "{:?} is outside full scale",
+            &mixed[..4]
+        );
+        assert_eq!(mixed[0], 1.0);
+    }
+
+    #[test]
+    fn clipping_does_not_distort_quiet_audio() {
+        let quiet = vec![100i16; 320];
+        let mixed = mix_frames(&[&quiet]);
+        assert!((mixed[0] - 100.0 / 32768.0).abs() < 1e-6);
+    }
+
+    /// A negative peak clamps to the bottom rather than the top, which an
+    /// `abs()`-based clamp would get wrong.
+    #[test]
+    fn a_negative_overload_clamps_to_minus_one() {
+        let loud = vec![i16::MIN; 320];
+        assert_eq!(mix_frames(&[&loud, &loud])[0], -1.0);
+        // Just below full scale, so one speaker alone is not clamped: this
+        // checks the result is clamped rather than hard-set to -1.
+        let almost = vec![i16::MIN + 1; 320];
+        assert!(mix_frames(&[&almost])[0] > -1.0);
     }
 
     #[test]
