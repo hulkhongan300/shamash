@@ -274,6 +274,13 @@ identically. Naming one of those artists in the YouTube query would aim the
 search at a song the listener never asked for, so the bot does not: it keeps the
 title, drops the guessed artist, and offers the choices instead.
 
+" by " belongs to more song titles than it separates artists — *Stand By Me*,
+*Take Me By The Hand*, *By The Way* — so splitting on the last one is a guess and
+only a guess. The bot keeps every reading of what was said and tries each in
+turn, under one shared time budget: "stand by me by ben e king" is first tried
+as *Ben E. King — Stand By Me*, and as *Stand* by *Me by Ben E King* only if
+that finds nothing.
+
 Set `RUST_LOG=shamash=debug` to see what the wake model heard on each check, the
 resolution, the scores and the runner-up:
 

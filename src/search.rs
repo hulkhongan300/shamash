@@ -1441,11 +1441,7 @@ mod tests {
             ("drakula tame impala", "Dracula"),
             ("hoolig bts", "Hooligan"),
         ] {
-            let request = PlayRequest {
-                query: heard.to_string(),
-                title: None,
-                artist: None,
-            };
+            let request = request(heard);
             let choice = choose_match(
                 &request,
                 &catalog,
@@ -1493,11 +1489,7 @@ mod tests {
     #[ignore = "needs network, yt-dlp and the Deezer API"]
     async fn an_unresolvable_request_still_plays_a_real_match() {
         let catalog = resolve::Catalog::new(Box::new(Empty), 0.62);
-        let request = PlayRequest {
-            query: "hoolig bts".to_string(),
-            title: None,
-            artist: None,
-        };
+        let request = request("hoolig bts");
         let choice = choose_match(
             &request,
             &catalog,
@@ -1567,11 +1559,17 @@ mod tests {
         }
     }
 
+    /// A request with nothing split out of it, as speech-to-text usually
+    /// delivers it.
     fn request(query: &str) -> PlayRequest {
         PlayRequest {
             query: query.to_string(),
             title: None,
             artist: None,
+            splits: crate::parser::readings(query)
+                .into_iter()
+                .filter_map(|(title, artist)| Some((title?, artist?)))
+                .collect(),
         }
     }
 
@@ -1704,9 +1702,8 @@ mod tests {
         );
         let choice = choose_match(
             &PlayRequest {
-                query: "hoolig by bts".into(),
-                title: Some("hoolig".into()),
-                artist: Some("bts".into()),
+                splits: vec![("hoolig".to_string(), "bts".to_string())],
+                ..request("hoolig by bts")
             },
             &catalog,
             &searcher,

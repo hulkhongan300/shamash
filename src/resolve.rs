@@ -304,35 +304,101 @@ fn catalog_http_client() -> anyhow::Result<reqwest::Client> {
 }
 
 /// What a spoken request asked for, before the catalog corrected it.
+///
+/// The request is kept as a *list* of readings rather than one title and one
+/// artist, because " by " belongs to more song titles than it separates
+/// artists: *Stand By Me*, *Take Me By The Hand*, *By The Way*. Each reading
+/// is tried in turn, so a phrase the last-" by "-split reads badly still has
+/// the right reading available behind it.
 #[derive(Debug, Clone)]
 pub struct Target {
-    pub title: Option<String>,
-    pub artist: Option<String>,
+    /// Plausible readings, most likely first, never empty for a non-empty
+    /// request.
+    pub readings: Vec<Reading>,
     /// The whole request text, kept so scoring can tell "asked for the remix"
     /// from "a remix was in the way".
     pub raw: String,
 }
 
-impl Target {
-    pub fn from_request(request: &PlayRequest) -> Self {
+/// One way of reading a request as "<title> by <artist>".
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    /// What the speaker said before the " by ", if the reading has one.
+    pub title: Option<String>,
+    /// What the speaker said after it.
+    pub artist: Option<String>,
+    /// What to ask the catalog for this reading.
+    ///
+    /// `"<artist> <title>"` ranks far better than the raw phrase, and falls
+    /// back to the phrase whenever the reading names no artist.
+    pub query: String,
+}
+
+/// How many readings one request may ask the catalog about.
+///
+/// Three is generous: a phrase with more than three " by " in it is being read
+/// as a conversation, not a song title, and the readings past this point are
+/// increasingly absurd.
+const MAX_READINGS: usize = 3;
+
+impl Reading {
+    fn new(title: Option<String>, artist: Option<String>, raw: &str) -> Self {
+        let query = match (title.as_deref(), artist.as_deref()) {
+            (Some(artist), Some(title)) => format!("{title} {artist}"),
+            (_, Some(artist)) => artist.to_string(),
+            _ => raw.to_string(),
+        };
         Self {
-            title: request.title.clone(),
-            artist: request.artist.clone(),
-            raw: request.query.clone(),
+            title,
+            artist,
+            query,
         }
     }
+}
 
-    /// The query to send to the catalog.
-    ///
-    /// Prefers the structured pair the parser found, because `"<artist>
-    /// <title>"` ranks far better than the raw phrase, and falls back to
-    /// whatever was heard when the grammar produced no "by" clause.
-    pub fn query(&self) -> String {
-        match (&self.artist, &self.title) {
-            (Some(artist), Some(title)) => format!("{artist} {title}"),
-            (None, Some(title)) => title.clone(),
-            _ => self.raw.clone(),
+impl Target {
+    /// Every reading of `request`, most likely first.
+    pub fn from_request(request: &PlayRequest) -> Self {
+        let raw = request.query.clone();
+        // The parser's own split comes first: it is the last " by ", which is
+        // the reading that can express a multi-word artist. Its other
+        // positions follow, and the last entry is the "no artist was named at
+        // all" reading, which is what most requests actually are.
+        let guessed = (request.title.clone(), request.artist.clone());
+        let mut readings: Vec<Reading> = Vec::new();
+        for (title, artist) in std::iter::once(guessed.clone()).chain(
+            request
+                .splits
+                .iter()
+                .map(|(title, artist)| (Some(title.clone()), Some(artist.clone()))),
+        ) {
+            push_reading(&mut readings, Reading::new(title, artist, &raw));
         }
+        push_reading(&mut readings, Reading::new(None, None, &raw));
+        Self { readings, raw }
+    }
+
+    /// The reading to build a YouTube query from: the most likely one.
+    pub fn primary(&self) -> &Reading {
+        // `readings` is never empty for a request, and `resolve` only calls
+        // this after checking the query is not blank.
+        self.readings
+            .first()
+            .expect("a target always has at least one reading")
+    }
+}
+
+/// Adds a reading unless it says the same thing as one already there.
+///
+/// Duplicates matter more than they look: "stand by me" splits identically at
+/// either " by ", and asking Deezer the same question twice costs a request
+/// from its quota for nothing.
+fn push_reading(out: &mut Vec<Reading>, reading: Reading) {
+    if out.len() >= MAX_READINGS {
+        return;
+    }
+    if !out.iter().any(|kept| kept.query == reading.query) {
+        out.push(reading);
     }
 }
 
@@ -478,55 +544,74 @@ impl Catalog {
     /// Deezer quota body arriving with HTTP 200 used to abort the whole
     /// request, and the listener heard nothing at all.
     pub async fn resolve(&self, target: &Target) -> Option<Resolution> {
-        let query = target.query();
-        if query.trim().is_empty() {
-            return None;
-        }
-
-        let hits = match timeout(LOOKUP_TIMEOUT, self.provider.search(&query)).await {
-            Ok(Ok(hits)) => hits,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    provider = self.provider.name(),
-                    query = %query,
-                    error = %format!("{e:#}"),
-                    "the catalog could not answer; continuing on the transcript alone"
-                );
-                return None;
+        // One budget for the whole lookup, however many readings it takes, so
+        // trying three readings cannot triple the wait before the YouTube
+        // search starts.
+        let deadline = tokio::time::Instant::now() + LOOKUP_TIMEOUT;
+        for reading in &target.readings {
+            let query = &reading.query;
+            if query.trim().is_empty() {
+                continue;
             }
-            Err(_) => {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
                 tracing::debug!(
                     provider = self.provider.name(),
-                    query = %query,
+                    query = %target.raw,
                     budget = ?LOOKUP_TIMEOUT,
-                    "catalog lookup timed out; searching on the transcript alone"
+                    "out of catalog budget; searching on the transcript alone"
                 );
                 return None;
             }
-        };
-        let tied = tied_hits(target, &hits)?;
-        let (confidence, track) = tied.best[0].clone();
-        tracing::debug!(
-            provider = self.provider.name(),
-            query = %query,
-            artist = %track.artist,
-            title = %track.title,
-            duration = ?track.duration_secs,
-            confidence = confidence,
-            threshold = self.threshold,
-            ambiguous = tied.ambiguous,
-            "catalog match"
-        );
 
-        if confidence < self.threshold {
-            return None;
+            let hits = match timeout(left, self.provider.search(query)).await {
+                Ok(Ok(hits)) => hits,
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        provider = self.provider.name(),
+                        query = %query,
+                        error = %format!("{e:#}"),
+                        "the catalog could not answer; continuing on the transcript alone"
+                    );
+                    return None;
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        provider = self.provider.name(),
+                        query = %query,
+                        left = ?left,
+                        "catalog lookup timed out; trying the next reading"
+                    );
+                    continue;
+                }
+            };
+            let Some(tied) = tied_hits(reading, &target.raw, &hits) else {
+                continue;
+            };
+            let (confidence, track) = tied.best[0].clone();
+            tracing::debug!(
+                provider = self.provider.name(),
+                query = %query,
+                artist = %track.artist,
+                title = %track.title,
+                duration = ?track.duration_secs,
+                confidence = confidence,
+                threshold = self.threshold,
+                ambiguous = tied.ambiguous,
+                "catalog match"
+            );
+
+            if confidence < self.threshold {
+                continue;
+            }
+            return Some(Resolution {
+                track,
+                confidence,
+                query: query.clone(),
+                ambiguous: tied.ambiguous,
+            });
         }
-        Some(Resolution {
-            track,
-            confidence,
-            query,
-            ambiguous: tied.ambiguous,
-        })
+        None
     }
 }
 
@@ -543,11 +628,11 @@ struct Tied {
 /// every one of those recordings identically, so this reports the tie instead of
 /// picking a winner: choosing one silently is how "play look at me" ends up
 /// playing whichever artist happened to have the shortest name.
-fn tied_hits(target: &Target, hits: &[CatalogTrack]) -> Option<Tied> {
+fn tied_hits(reading: &Reading, raw: &str, hits: &[CatalogTrack]) -> Option<Tied> {
     let mut best: Vec<(f32, CatalogTrack)> = Vec::new();
     let mut top = 0.0f32;
     for track in hits {
-        let score = confidence(target, track);
+        let score = confidence(reading, raw, track);
         if score <= 0.0 {
             continue;
         }
@@ -564,7 +649,7 @@ fn tied_hits(target: &Target, hits: &[CatalogTrack]) -> Option<Tied> {
     }
     // Only an unstated artist can make two records ambiguous: naming one has
     // already separated them.
-    let ambiguous = target.artist.is_none()
+    let ambiguous = reading.artist.is_none()
         && best
             .iter()
             .map(|(_, track)| normalize(&track.artist))
@@ -574,7 +659,7 @@ fn tied_hits(target: &Target, hits: &[CatalogTrack]) -> Option<Tied> {
     Some(Tied { best, ambiguous })
 }
 
-fn confidence(target: &Target, track: &CatalogTrack) -> f32 {
+fn confidence(reading: &Reading, raw: &str, track: &CatalogTrack) -> f32 {
     let got_title = normalize(&track.title);
     if got_title.is_empty() {
         return 0.0;
@@ -583,17 +668,17 @@ fn confidence(target: &Target, track: &CatalogTrack) -> f32 {
     // The best evidence available. Most requests have no "by" clause -- the
     // parser only fills the title when it sees one -- so the common case is a
     // bare phrase that has to be matched without a title to compare.
-    let title_score = match target
+    let title_score = match reading
         .title
         .as_deref()
         .map(normalize)
         .filter(|title| !title.is_empty())
     {
         Some(wanted) => similarity(&wanted, &got_title),
-        None => phrase_title_score(&normalize(&target.raw), track),
+        None => phrase_title_score(&normalize(raw), track),
     };
 
-    let score = match target
+    let score = match reading
         .artist
         .as_deref()
         .map(normalize)
@@ -669,15 +754,40 @@ mod tests {
     }
 
     fn target(title: Option<&str>, artist: Option<&str>) -> Target {
-        Target {
+        let raw = [title, artist]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+        Target::from_request(&PlayRequest {
+            query: raw.clone(),
             title: title.map(str::to_string),
             artist: artist.map(str::to_string),
-            raw: [title, artist]
+            splits: crate::parser::readings(&raw)
                 .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" "),
-        }
+                .filter_map(|(title, artist)| Some((title?, artist?)))
+                .collect(),
+        })
+    }
+
+    /// A target built from words as heard, with the same readings the parser
+    /// would have produced for the phrase.
+    fn heard(phrase: &str) -> Target {
+        Target::from_request(&PlayRequest {
+            query: phrase.to_string(),
+            title: None,
+            artist: None,
+            splits: crate::parser::readings(phrase)
+                .into_iter()
+                .filter_map(|(title, artist)| Some((title?, artist?)))
+                .collect(),
+        })
+    }
+
+    /// Scores a track against a target's primary reading, which is what the
+    /// resolver does.
+    fn against(target: &Target, track: &CatalogTrack) -> f32 {
+        confidence(target.primary(), &target.raw, track)
     }
 
     #[test]
@@ -722,7 +832,7 @@ mod tests {
     fn a_decorated_catalog_title_matches_a_plain_request() {
         let t = target(Some("dracula"), None);
         let got = track("Tame Impala", "Dracula (Remastered 2020)", Some(205.0));
-        assert!(confidence(&t, &got) > 0.95, "got {}", confidence(&t, &got));
+        assert!(against(&t, &got) > 0.95, "got {}", against(&t, &got));
     }
 
     #[test]
@@ -732,9 +842,9 @@ mod tests {
             let t = target(Some(heard), Some("bts"));
             let got = track("BTS", "Hooligan", Some(182.0));
             assert!(
-                confidence(&t, &got) > 0.62,
+                against(&t, &got) > 0.62,
                 "{heard:?} scored {}",
-                confidence(&t, &got)
+                against(&t, &got)
             );
         }
     }
@@ -743,21 +853,21 @@ mod tests {
     fn a_shared_token_keeps_a_reordered_title_matching() {
         let t = target(Some("dark side of the moon"), None);
         let got = track("Pink Floyd", "The Dark Side of the Moon", Some(413.0));
-        assert!(confidence(&t, &got) > 0.72);
+        assert!(against(&t, &got) > 0.72);
     }
 
     #[test]
     fn a_different_song_scores_too_low_to_trust() {
         let t = target(Some("dracula"), Some("tame impala"));
         let got = track("BTS", "2.0", Some(235.0));
-        assert!(confidence(&t, &got) < 0.62);
+        assert!(against(&t, &got) < 0.62);
     }
 
     #[test]
     fn a_right_title_with_a_wrong_artist_still_clears_the_bar() {
         let t = target(Some("shape of you"), Some("ed sheeran"));
         let got = track("Ed Sheeran", "Shape of You", Some(234.0));
-        assert!(confidence(&t, &got) > 0.9);
+        assert!(against(&t, &got) > 0.9);
     }
 
     /// The parser only fills a title when it hears "by", so most requests
@@ -765,24 +875,16 @@ mod tests {
     /// catalog did nothing for the most common request there is.
     #[test]
     fn a_request_with_no_title_is_still_matched() {
-        let t = Target {
-            title: None,
-            artist: None,
-            raw: "drakula tame impala".to_string(),
-        };
-        let score = confidence(&t, &track("Tame Impala", "Dracula", Some(205.0)));
+        let t = heard("drakula tame impala");
+        let score = against(&t, &track("Tame Impala", "Dracula", Some(205.0)));
         assert!(score > 0.62, "a misheard title should still match: {score}");
     }
 
     /// A title on its own is enough; the request need not name the artist.
     #[test]
     fn a_bare_title_matches_without_naming_the_artist() {
-        let t = Target {
-            title: None,
-            artist: None,
-            raw: "dracula".to_string(),
-        };
-        let score = confidence(&t, &track("Tame Impala", "Dracula", Some(205.0)));
+        let t = heard("dracula");
+        let score = against(&t, &track("Tame Impala", "Dracula", Some(205.0)));
         assert!(score > 0.62, "{score}");
     }
 
@@ -790,20 +892,12 @@ mod tests {
     /// request that only says the title still resolves.
     #[test]
     fn an_unnamed_artist_is_discounted_rather_than_rejected() {
-        let named = confidence(
-            &Target {
-                title: None,
-                artist: None,
-                raw: "dracula tame impala".to_string(),
-            },
+        let named = against(
+            &heard("dracula tame impala"),
             &track("Tame Impala", "Dracula", Some(205.0)),
         );
-        let unnamed = confidence(
-            &Target {
-                title: None,
-                artist: None,
-                raw: "dracula".to_string(),
-            },
+        let unnamed = against(
+            &heard("dracula"),
             &track("Tame Impala", "Dracula", Some(205.0)),
         );
         assert!(unnamed > 0.62, "should still resolve: {unnamed}");
@@ -817,24 +911,16 @@ mod tests {
     /// different artist is not disqualified for containing it.
     #[test]
     fn a_phrase_containing_a_wrong_artist_still_matches_the_title() {
-        let t = Target {
-            title: None,
-            artist: None,
-            raw: "drakula tye digger".to_string(),
-        };
-        let score = confidence(&t, &track("Tame Impala", "Dracula", Some(205.0)));
+        let t = heard("drakula tye digger");
+        let score = against(&t, &track("Tame Impala", "Dracula", Some(205.0)));
         assert!(score > 0.62, "the title should carry it: {score}");
     }
 
     /// A phrase with nothing like the title in it must not be forced to match.
     #[test]
     fn an_unrelated_phrase_is_not_confident() {
-        let t = Target {
-            title: None,
-            artist: None,
-            raw: "that one about the weather".to_string(),
-        };
-        let score = confidence(&t, &track("Tame Impala", "Dracula", Some(205.0)));
+        let t = heard("that one about the weather");
+        let score = against(&t, &track("Tame Impala", "Dracula", Some(205.0)));
         assert!(score < 0.62, "{score}");
     }
 
@@ -843,11 +929,7 @@ mod tests {
     /// is what stops a remix displacing it.
     #[test]
     fn a_tie_between_versions_by_one_artist_is_not_ambiguous() {
-        let t = Target {
-            title: None,
-            artist: None,
-            raw: "drakula tame impala".to_string(),
-        };
+        let t = heard("drakula tame impala");
         // As Deezer returns it: the original once, the remix three times.
         let hits = [
             track("Tame Impala", "Dracula", Some(205.0)),
@@ -855,7 +937,7 @@ mod tests {
             track("Tame Impala", "Dracula (with JENNIE)", Some(241.0)),
             track("Tame Impala", "Dracula (with JENNIE)", Some(209.0)),
         ];
-        let tied = tied_hits(&t, &hits).expect("a hit");
+        let tied = tied_hits(t.primary(), &t.raw, &hits).expect("a hit");
         assert!(!tied.ambiguous, "one artist is one song");
         let (_, best) = &tied.best[0];
         assert_eq!(best.duration_secs, Some(205.0), "picked {best:?}");
@@ -867,17 +949,13 @@ mod tests {
     /// than resolved -- the caller asks instead.
     #[test]
     fn a_title_claimed_by_several_artists_is_ambiguous() {
-        let t = Target {
-            title: None,
-            artist: None,
-            raw: "look at me".to_string(),
-        };
+        let t = heard("look at me");
         let hits = [
             track("Naughty Boy", "Look at Me", Some(200.0)),
             track("Tems", "Look at Me", Some(191.0)),
             track("The Neighbourhood", "Look at Me", Some(180.0)),
         ];
-        let tied = tied_hits(&t, &hits).expect("a hit");
+        let tied = tied_hits(t.primary(), &t.raw, &hits).expect("a hit");
         assert!(tied.ambiguous, "three artists answered to one title");
         assert_eq!(tied.best.len(), 3);
     }
@@ -891,7 +969,7 @@ mod tests {
             track("Naughty Boy", "Look at Me", Some(200.0)),
             track("Tems", "Look at Me", Some(191.0)),
         ];
-        let tied = tied_hits(&t, &hits).expect("a hit");
+        let tied = tied_hits(t.primary(), &t.raw, &hits).expect("a hit");
         assert!(!tied.ambiguous);
         assert_eq!(tied.best[0].1.artist, "Naughty Boy");
     }
@@ -904,7 +982,7 @@ mod tests {
             track("BTS", "OK", Some(200.0)),
             track("BTS", "Hooligan", Some(182.0)),
         ];
-        let tied = tied_hits(&t, &hits).expect("a hit");
+        let tied = tied_hits(t.primary(), &t.raw, &hits).expect("a hit");
         let (score, best) = &tied.best[0];
         assert_eq!(best.title, "Hooligan");
         assert_eq!(tied.best.len(), 1, "only one hit tied");
@@ -915,10 +993,7 @@ mod tests {
     #[test]
     fn a_track_with_no_title_is_never_confident() {
         let t = target(Some("dracula"), None);
-        assert_eq!(
-            confidence(&t, &track("Tame Impala", "  ", Some(205.0))),
-            0.0
-        );
+        assert_eq!(against(&t, &track("Tame Impala", "  ", Some(205.0))), 0.0);
     }
 
     /// The bug this whole module exists for: the flat search handed back a
@@ -926,15 +1001,81 @@ mod tests {
     #[test]
     fn the_corrected_artist_steers_the_query() {
         let t = target(Some("hoolig"), Some("bts"));
-        assert_eq!(t.query(), "bts hoolig");
+        assert_eq!(t.primary().query, "bts hoolig");
     }
 
-    /// A request with no "by" clause still reaches the catalog.
+    /// A request with no "by" clause still reaches the catalog, and the whole
+    /// phrase is the only reading there is.
     #[test]
     fn the_query_falls_back_to_whatever_was_heard() {
         let t = target(Some("dracula"), None);
-        assert_eq!(t.query(), "dracula");
-        assert_eq!(target(None, None).query(), "");
+        assert_eq!(t.primary().query, "dracula");
+        assert_eq!(target(None, None).primary().query, "");
+    }
+
+    /// " by " belongs to more song titles than it separates artists. Every
+    /// position is tried, best first, so the last-" by "-split being wrong is
+    /// no longer the end of the matter -- and one request costs one budget, not
+    /// one per reading.
+    #[test]
+    fn every_reading_is_tried_under_one_budget() {
+        let request = PlayRequest {
+            query: "stand by me by ben e king".to_string(),
+            title: Some("stand by me".to_string()),
+            artist: Some("ben e king".to_string()),
+            splits: vec![
+                ("stand by me".to_string(), "ben e king".to_string()),
+                ("stand".to_string(), "me by ben e king".to_string()),
+            ],
+        };
+        let target = Target::from_request(&request);
+        let queries: Vec<&str> = target
+            .readings
+            .iter()
+            .map(|reading| reading.query.as_str())
+            .collect();
+        assert_eq!(
+            queries,
+            [
+                "ben e king stand by me",
+                "me by ben e king stand",
+                "stand by me by ben e king"
+            ]
+        );
+    }
+
+    /// The whole phrase is always the last resort, and it is the only reading
+    /// for a request that named no artist.
+    #[test]
+    fn the_whole_phrase_is_always_the_final_reading() {
+        let request = PlayRequest {
+            query: "despacito".to_string(),
+            title: None,
+            artist: None,
+            splits: Vec::new(),
+        };
+        let target = Target::from_request(&request);
+        assert_eq!(target.readings.len(), 1);
+        assert_eq!(target.primary().query, "despacito");
+        assert_eq!(target.primary().artist, None);
+    }
+
+    /// Asking the same question twice costs Deezer quota for nothing, so
+    /// "stand by me" -- which splits identically at either " by " -- asks once.
+    #[test]
+    fn duplicate_readings_are_not_asked_twice() {
+        let request = PlayRequest {
+            query: "stand by me".to_string(),
+            title: Some("stand".to_string()),
+            artist: Some("me".to_string()),
+            splits: vec![("stand".to_string(), "me".to_string())],
+        };
+        let queries: Vec<String> = Target::from_request(&request)
+            .readings
+            .into_iter()
+            .map(|reading| reading.query)
+            .collect();
+        assert_eq!(queries, ["me stand", "stand by me"]);
     }
 
     /// Both built providers have to answer to their configured name, since
@@ -1064,7 +1205,7 @@ mod tests {
         .unwrap();
         let t = target(Some("dracula"), Some("tame impala"));
         assert!(
-            confidence(&t, &hit.into_track().unwrap()) > 0.95,
+            against(&t, &hit.into_track().unwrap()) > 0.95,
             "the parenthetical should be ignored"
         );
     }
