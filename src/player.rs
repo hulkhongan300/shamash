@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::dashboard;
 use crate::fetch;
 use crate::parser::PlayRequest;
-use crate::queue::{Advanced, Queued, Queues};
+use crate::queue::{Advanced, Queue, Queued, Queues};
 use crate::resolve;
 use crate::search;
 use anyhow::Context;
@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::OwnedMutexGuard;
 use tokio::sync::mpsc;
 
 /// Length of the acknowledgement tone.
@@ -52,6 +53,22 @@ impl Tone {
     }
 }
 
+/// What became of a request once it had been resolved and downloaded.
+///
+/// Carried out of [`Player::resolve_and_queue`] rather than logged inside it, so
+/// the Discord-facing part of a request (drawing the dashboard, posting the
+/// chooser) is separable from the part that decides which song it was.
+#[derive(Debug)]
+pub enum Outcome {
+    /// The song joined the queue. `starting` says whether nothing was playing,
+    /// in which case playback begins now rather than when the queue reaches it.
+    Played { starting: bool },
+    /// Nothing was convincing enough to play; the caller should offer these.
+    Offered(search::Choice),
+    /// Playback was stopped while this was still downloading.
+    Cancelled,
+}
+
 /// Plays queued music and keeps the text channel dashboard in step.
 pub struct Player {
     pub manager: Arc<Songbird>,
@@ -62,7 +79,8 @@ pub struct Player {
     /// Two commands handled at once would each download and then start a
     /// track, and the second would replace the first mid-flight, so the song
     /// that was asked for would be heard as the one before it.
-    busy: Busy,
+    /// How requests in flight and playback controls share this guild.
+    coordination: Coordination,
     /// The track playing per guild, needed to pause and resume it.
     tracks: Tracks,
     /// Where each guild's dashboard lives, so a new song edits the existing
@@ -72,6 +90,43 @@ pub struct Player {
     catalog: Arc<resolve::Catalog>,
     /// The "which one did you mean" buttons currently on offer.
     choices: Choices,
+    /// Downloads the audio for a chosen video.
+    fetch: Arc<dyn AudioFetcher>,
+}
+
+/// Turns a search result into a queued song.
+///
+/// Behind a trait so the download can be made slow, slow-and-failing, or
+/// instant in tests: the bug this seam exists for is about *when* the download
+/// happens relative to the locks, which cannot be observed with a real yt-dlp.
+#[serenity::async_trait]
+pub trait AudioFetcher: Send + Sync {
+    async fn fetch(&self, guild_id: GuildId, found: &search::Candidate) -> anyhow::Result<Queued>;
+}
+
+/// The real download, through yt-dlp.
+pub struct YtDlpFetch;
+
+#[serenity::async_trait]
+impl AudioFetcher for YtDlpFetch {
+    async fn fetch(&self, guild_id: GuildId, found: &search::Candidate) -> anyhow::Result<Queued> {
+        // A video with no id cannot be cached or given a thumbnail, but the
+        // audio is still worth playing.
+        let video_id = found.video_id().unwrap_or_default().to_string();
+        // Downloaded before the song joins the queue, so a failed fetch leaves
+        // the queue and whatever is playing alone.
+        let path = fetch::fetch(&video_id, &found.url, &fetch::cache_dir(guild_id.get()))
+            .await
+            .with_context(|| format!("could not fetch '{}'", found.title()))?;
+
+        Ok(Queued {
+            path,
+            title: found.title().to_string(),
+            artist: found.channel().to_string(),
+            url: found.url.clone(),
+            video_id,
+        })
+    }
 }
 
 /// How many candidates the chooser offers.
@@ -129,6 +184,141 @@ impl Busy {
     fn get(&self, guild_id: GuildId) -> Arc<AsyncMutex<()>> {
         let mut locks = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(locks.entry(guild_id).or_default())
+    }
+}
+
+/// Per-guild coordination between the requests in flight and the playback
+/// controls.
+///
+/// Split out of `Player` because `Songbird` cannot be constructed without a
+/// voice connection, and the thing that went wrong here is entirely about which
+/// lock is held when -- which needs no connection to test.
+#[derive(Debug, Clone, Default)]
+struct Coordination {
+    /// Held for a whole request: the catalog lookup, the video search and the
+    /// download. Two commands spoken at once would each start a track, and the
+    /// second would replace the first mid-flight, so the song that was asked
+    /// for would be heard as the one before it. It is FIFO, so requests are
+    /// served in the order they were spoken.
+    order: Busy,
+    /// Held only while the queue changes: `commit`, `skip`, `stop` and the
+    /// follower that plays songs on. Nothing slow ever holds it, which is what
+    /// keeps Skip and Stop answering during a three-minute download.
+    busy: Busy,
+    /// Bumped by Stop, so a request still downloading knows it was cancelled.
+    generations: Generations,
+}
+
+/// What adding a downloaded song to the queue did.
+#[derive(Debug, PartialEq)]
+enum Commit {
+    /// Queued. `starting` says whether nothing was playing, in which case
+    /// playback begins now rather than when the queue reaches it.
+    Played { starting: bool },
+    /// Stopped while this was downloading.
+    Cancelled,
+    /// Another request filled the queue while this one was downloading.
+    QueueFull,
+}
+
+/// One guild's cancellation counter.
+///
+/// Named rather than spelled out at each use, because the type of the thing
+/// being compared is not the point of any of these comparisons.
+#[derive(Debug, Default)]
+struct Cancellation(std::sync::atomic::AtomicU64);
+
+impl Cancellation {
+    fn now(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn cancel(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A per-guild counter bumped whenever playback is cancelled.
+///
+/// A `stop` bumps it; a request still downloading compares against the number
+/// it started with and drops its result rather than queueing a song into a
+/// queue the listener just emptied. This is what makes Stop actually cancel a
+/// pending request rather than merely clearing what is there now.
+#[derive(Debug, Clone, Default)]
+struct Generations(Arc<Mutex<HashMap<GuildId, Arc<Cancellation>>>>);
+
+impl Generations {
+    fn get(&self, guild_id: GuildId) -> Arc<Cancellation> {
+        let mut all = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(all.entry(guild_id).or_default())
+    }
+
+    /// Cancels everything in flight for this guild.
+    fn bump(&self, guild_id: GuildId) {
+        self.get(guild_id).cancel();
+    }
+}
+
+impl Coordination {
+    /// Claims the right to resolve one request for `guild_id`.
+    ///
+    /// The returned guard is held for the whole request and must be dropped at
+    /// the end of it; `started_at` is the cancellation number to hand back to
+    /// [`Self::commit`]. Read *after* the lock is taken, so a Stop that lands
+    /// while this request waits its turn still counts against it.
+    async fn begin(&self, guild_id: GuildId) -> (OwnedMutexGuard<()>, u64) {
+        let order = self.order.get(guild_id);
+        let guard = order.lock_owned().await;
+        let started_at = self.generations.get(guild_id).now();
+        (guard, started_at)
+    }
+
+    /// The lock a playback control takes.
+    fn busy(&self, guild_id: GuildId) -> Arc<AsyncMutex<()>> {
+        self.busy.get(guild_id)
+    }
+
+    /// Cancels every request in flight for `guild_id`.
+    fn cancel(&self, guild_id: GuildId) {
+        self.generations.bump(guild_id);
+    }
+
+    /// Adds an already-downloaded song to the queue.
+    ///
+    /// The only place a spoken request takes the playback lock, and it is taken
+    /// after the search and the download rather than around them.
+    async fn commit(
+        &self,
+        guild_id: GuildId,
+        queue: &Queue,
+        song: Queued,
+        started_at: u64,
+    ) -> Commit {
+        let busy = self.busy.get(guild_id);
+        let _held = busy.lock().await;
+        if self.generations.get(guild_id).now() != started_at {
+            tracing::info!(
+                guild_id = %guild_id,
+                title = %song.title,
+                "stopped while this was downloading, so it is not being queued"
+            );
+            return Commit::Cancelled;
+        }
+
+        // An empty queue means nothing is playing, so this is the first song
+        // and should start rather than wait.
+        let starting = queue.is_idle();
+        if !queue.push(song.clone()) {
+            return Commit::QueueFull;
+        }
+        tracing::info!(
+            guild_id = %guild_id,
+            title = %song.title,
+            artist = %song.artist,
+            queued = queue.pending(),
+            "queued a song"
+        );
+        Commit::Played { starting }
     }
 }
 
@@ -190,11 +380,12 @@ impl Player {
         Self {
             manager,
             queues: Queues::default(),
-            busy: Busy::default(),
+            coordination: Coordination::default(),
             tracks: Tracks::default(),
             dashboards: Dashboards::default(),
             catalog,
             choices: Choices::default(),
+            fetch: Arc::new(YtDlpFetch),
         }
     }
 
@@ -236,31 +427,47 @@ impl Player {
         guild_id: GuildId,
         request: &PlayRequest,
     ) -> anyhow::Result<()> {
-        let lock = self.busy.get(guild_id);
-        let _guard = lock.lock().await;
-        self.play_locked(ctx, config, guild_id, request).await
+        self.manager
+            .get(guild_id)
+            .context("bot is not in a voice channel")?;
+
+        match self.resolve_and_queue(config, guild_id, request).await? {
+            Outcome::Offered(choice) => self.offer_choice(ctx, config, guild_id, &choice).await,
+            // Either way the dashboard is redrawn: a played song needs naming,
+            // and a cancelled one may have moved the queue along underneath it.
+            Outcome::Played { starting: true } => {
+                self.start_next(ctx, config, guild_id).await;
+            }
+            _ => self.draw_dashboard(ctx, config, guild_id).await,
+        }
+        Ok(())
     }
 
-    /// The body of [`Self::play`], for callers that already hold the lock.
+    /// Turns a spoken request into a queued song, without touching Discord.
     ///
-    /// Split out because a chooser press goes through the same queue, dashboard
-    /// and lock as a spoken request, and taking the lock twice would deadlock.
-    async fn play_locked(
+    /// The catalog lookup, the video search and the download all run here, and
+    /// none of them holds the playback lock. Only
+    /// [`Coordination::commit`] takes it, for the one step that changes the
+    /// queue -- so a three-minute download cannot make Skip or Stop stop
+    /// answering.
+    async fn resolve_and_queue(
         &self,
-        ctx: &SerenityContext,
         config: &Config,
         guild_id: GuildId,
         request: &PlayRequest,
-    ) -> anyhow::Result<()> {
-        // Checked before searching, so a full queue fails without a download.
+    ) -> anyhow::Result<Outcome> {
         let queue = self.queues.get(guild_id);
+        // Checked before searching, so a full queue fails without a download.
+        // `commit` checks again, since another request may have filled it.
         anyhow::ensure!(
             !queue.is_full(),
             "the queue is full, try again once a song finishes"
         );
-        self.manager
-            .get(guild_id)
-            .context("bot is not in a voice channel")?;
+
+        // Claims the request ordering lock and reads the cancellation number to
+        // hand back to `commit`. Read after the lock is taken, so a Stop that
+        // lands while this request waits its turn still counts against it.
+        let (_serialised, started_at) = self.coordination.begin(guild_id).await;
 
         let choice = search::choose_match(
             request,
@@ -273,16 +480,40 @@ impl Player {
         .await
         .with_context(|| format!("no match for '{}'", request.query))?;
 
-        let best = choice
-            .best()
-            .context("no playable song found for the request")?;
-
+        let Some(best) = choice.best() else {
+            anyhow::bail!("no playable song found for the request");
+        };
         if !choice.confident {
-            self.offer_choice(ctx, config, guild_id, &choice).await;
-            return Ok(());
+            return Ok(Outcome::Offered(choice));
         }
 
-        self.enqueue(ctx, config, guild_id, &best.candidate).await
+        let song = self.fetch.fetch(guild_id, &best.candidate).await?;
+        Ok(self.outcome(guild_id, &queue, song, started_at).await)
+    }
+
+    /// Adds a downloaded song and reports what became of it.
+    async fn outcome(
+        &self,
+        guild_id: GuildId,
+        queue: &Queue,
+        song: Queued,
+        started_at: u64,
+    ) -> Outcome {
+        match self
+            .coordination
+            .commit(guild_id, queue, song, started_at)
+            .await
+        {
+            Commit::Played { starting } => Outcome::Played { starting },
+            Commit::Cancelled => Outcome::Cancelled,
+            Commit::QueueFull => {
+                tracing::warn!(
+                    guild_id = %guild_id,
+                    "the queue filled up while this was downloading"
+                );
+                Outcome::Cancelled
+            }
+        }
     }
 
     /// Posts the "which one did you mean" question in the alert channel.
@@ -342,54 +573,18 @@ impl Player {
         guild_id: GuildId,
         video_id: &str,
     ) -> anyhow::Result<()> {
-        let lock = self.busy.get(guild_id);
-        let _guard = lock.lock().await;
         let candidate = self.choices.take_video(guild_id, video_id).with_context(
             || "that choice is no longer on offer; say the request again for new options",
         )?;
-        self.enqueue(ctx, config, guild_id, &candidate).await
-    }
+        // The download runs outside the playback lock for the same reason the
+        // spoken path does: a press on "1" must not freeze the Skip button.
+        let started_at = self.coordination.generations.get(guild_id).now();
+        let song = self.fetch.fetch(guild_id, &candidate).await?;
+        let outcome = self
+            .outcome(guild_id, &self.queues.get(guild_id), song, started_at)
+            .await;
 
-    /// Downloads a chosen video and queues it, starting playback if idle.
-    ///
-    /// Unchanged from the pre-catalog path: the chooser only changes which video
-    /// gets here, not what happens to it.
-    async fn enqueue(
-        &self,
-        ctx: &SerenityContext,
-        config: &Config,
-        guild_id: GuildId,
-        found: &search::Candidate,
-    ) -> anyhow::Result<()> {
-        let queue = self.queues.get(guild_id);
-
-        // A video with no id cannot be cached or given a thumbnail, but the
-        // audio is still worth playing.
-        let video_id = found.video_id().unwrap_or_default().to_string();
-        // Downloaded before the song joins the queue, so a failed fetch leaves
-        // the queue and whatever is playing alone.
-        let path = fetch::fetch(&video_id, &found.url, &fetch::cache_dir(guild_id.get()))
-            .await
-            .with_context(|| format!("could not fetch '{}'", found.title()))?;
-
-        let song = Queued {
-            path,
-            title: found.title().to_string(),
-            artist: found.channel().to_string(),
-            url: found.url.clone(),
-            video_id,
-        };
-        println!(
-            "[{guild_id}] queued \u{201c}{}\u{201d} by {}",
-            song.title, song.artist
-        );
-
-        // An empty queue means nothing is playing, so this is the first song
-        // and should start rather than wait.
-        let starting = queue.is_idle();
-        anyhow::ensure!(queue.push(song), "the queue is full");
-
-        if starting {
+        if matches!(outcome, Outcome::Played { starting: true }) {
             self.start_next(ctx, config, guild_id).await;
         } else {
             self.draw_dashboard(ctx, config, guild_id).await;
@@ -399,7 +594,7 @@ impl Player {
 
     /// Skips the song playing, starting the next one queued.
     pub async fn skip(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
-        let lock = self.busy.get(guild_id);
+        let lock = self.coordination.busy(guild_id);
         let _guard = lock.lock().await;
         self.start_next(ctx, config, guild_id).await;
     }
@@ -426,8 +621,15 @@ impl Player {
     }
 
     /// Stops playback and clears the queue.
+    ///
+    /// The cancellation counter is bumped *before* the lock is taken, so a
+    /// request still downloading will already see itself as cancelled by the
+    /// time it tries to queue its song. Taking the lock first would leave a
+    /// window in which a download commits and is then cleared anyway, which
+    /// works but wastes the download.
     pub async fn stop(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
-        let lock = self.busy.get(guild_id);
+        self.coordination.cancel(guild_id);
+        let lock = self.coordination.busy(guild_id);
         let _guard = lock.lock().await;
         if let Some(call) = self.manager.get(guild_id) {
             let mut handler = call.lock().await;
@@ -474,7 +676,7 @@ impl Player {
             queues: self.queues.clone(),
             tracks: self.tracks.clone(),
             dashboards: self.dashboards.clone(),
-            busy: self.busy.clone(),
+            coordination: self.coordination.clone(),
             ctx: ctx.clone(),
             config: config.clone(),
             guild_id,
@@ -485,7 +687,7 @@ impl Player {
                 // The same lock the commands take, so a song ending and a skip
                 // arriving together settle in one order or the other instead
                 // of interleaving.
-                let lock = this.busy.get(guild_id);
+                let lock = this.coordination.busy(guild_id);
                 let _held = lock.lock().await;
 
                 // A skip moves the queue on itself, so this song may already
@@ -539,7 +741,7 @@ struct Follower {
     queues: Queues,
     tracks: Tracks,
     dashboards: Dashboards,
-    busy: Busy,
+    coordination: Coordination,
     ctx: SerenityContext,
     config: Config,
     guild_id: GuildId,
@@ -705,6 +907,226 @@ fn resolve_alert_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this commit exists for: `play` held the playback lock across the
+    /// catalog lookup, the YouTube search *and the whole download*, and `skip()`
+    /// and `stop()` take the same lock. A slow download therefore froze every
+    /// playback control for that guild.
+    ///
+    /// `Songbird` cannot be constructed without a voice connection, so the
+    /// coordination is exercised on its own. That is not a workaround: the
+    /// whole bug is about which lock is held when, and none of it needs a
+    /// connection to observe.
+    #[tokio::test]
+    async fn a_request_in_flight_does_not_hold_the_playback_lock() {
+        let guild = GuildId::new(7);
+        let coordination = Coordination::default();
+        let queue = Queue::default();
+
+        // What `resolve_and_queue` holds across the search and the download.
+        let (_serialised, _started_at) = coordination.begin(guild).await;
+
+        // What a Skip press needs, while that request is still in flight.
+        let lock = coordination.busy(guild);
+        let guard = tokio::time::timeout(Duration::from_millis(500), lock.lock_owned())
+            .await
+            .expect("a request in flight must not hold the playback lock");
+        drop(guard);
+        drop(_serialised);
+
+        assert_eq!(queue.pending(), 0);
+    }
+
+    /// The same, from the fetcher's side: a download that takes the playback
+    /// lock would block if the download were running inside it.
+    #[tokio::test]
+    async fn a_download_can_take_the_playback_lock_itself() {
+        let guild = GuildId::new(7);
+        let coordination = Coordination::default();
+        let probe = LockProbe {
+            coordination: coordination.clone(),
+        };
+        probe
+            .fetch(guild, &candidate("https://youtu.be/x"))
+            .await
+            .unwrap();
+    }
+
+    /// Stop really cancels: a request that was still downloading when Stop was
+    /// pressed must not queue its song afterwards.
+    #[tokio::test]
+    async fn stop_cancels_a_request_that_is_still_downloading() {
+        let guild = GuildId::new(7);
+        let coordination = Coordination::default();
+        let queue = Queue::default();
+
+        let (_serialised, started_at) = coordination.begin(guild).await;
+        // What `stop` does first, before it takes the playback lock.
+        coordination.cancel(guild);
+
+        let outcome = coordination
+            .commit(guild, &queue, queued("Dracula"), started_at)
+            .await;
+        assert_eq!(
+            outcome,
+            Commit::Cancelled,
+            "a song queued after a stop is a song nobody asked for"
+        );
+        assert!(queue.is_idle(), "the cancelled song must not be queued");
+    }
+
+    /// The other half: a request that was not cancelled still queues, and starts
+    /// playing because nothing else is.
+    #[tokio::test]
+    async fn an_uncancelled_request_still_queues_and_starts() {
+        let guild = GuildId::new(7);
+        let coordination = Coordination::default();
+        let queue = Queue::default();
+        let (_serialised, started_at) = coordination.begin(guild).await;
+
+        assert_eq!(
+            coordination
+                .commit(guild, &queue, queued("Dracula"), started_at)
+                .await,
+            Commit::Played { starting: true }
+        );
+        assert_eq!(queue.pending(), 1);
+    }
+
+    /// A song queued behind another does not start playing; it waits its turn.
+    #[tokio::test]
+    async fn a_second_song_waits_rather_than_starting() {
+        let guild = GuildId::new(7);
+        let coordination = Coordination::default();
+        let queue = Queue::default();
+        let (_serialised, started_at) = coordination.begin(guild).await;
+
+        coordination
+            .commit(guild, &queue, queued("First"), started_at)
+            .await;
+        assert_eq!(
+            coordination
+                .commit(guild, &queue, queued("Second"), started_at)
+                .await,
+            Commit::Played { starting: false }
+        );
+        assert_eq!(queue.pending(), 2);
+    }
+
+    /// Cancellation is per request, not per guild: a request that began after a
+    /// Stop is unaffected by it.
+    #[tokio::test]
+    async fn a_request_started_after_a_stop_is_not_cancelled_by_it() {
+        let guild = GuildId::new(7);
+        let coordination = Coordination::default();
+        let queue = Queue::default();
+        coordination.cancel(guild);
+
+        let (_serialised, started_at) = coordination.begin(guild).await;
+        assert_eq!(
+            coordination
+                .commit(guild, &queue, queued("Dracula"), started_at)
+                .await,
+            Commit::Played { starting: true }
+        );
+    }
+
+    /// Two requests for one guild do not overlap: the second waits its turn
+    /// rather than both downloading and both starting a track.
+    #[tokio::test]
+    async fn two_requests_for_one_guild_are_served_in_order() {
+        let guild = GuildId::new(7);
+        let coordination = Coordination::default();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let first = tokio::spawn({
+            let coordination = coordination.clone();
+            let order = Arc::clone(&order);
+            async move {
+                let (_guard, _at) = coordination.begin(guild).await;
+                order.lock().unwrap().push("first");
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        });
+        // Wait until the first request is definitely holding the lock.
+        while order.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let second = tokio::spawn({
+            let coordination = coordination.clone();
+            let order = Arc::clone(&order);
+            async move {
+                let (_guard, _at) = coordination.begin(guild).await;
+                order.lock().unwrap().push("second");
+            }
+        });
+
+        first.await.unwrap();
+        second.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), ["first", "second"]);
+    }
+
+    /// Requests for different guilds never wait on each other.
+    #[tokio::test]
+    async fn requests_for_different_guilds_do_not_wait() {
+        let coordination = Coordination::default();
+        let (_one, _at) = coordination.begin(GuildId::new(1)).await;
+        let other = coordination.busy(GuildId::new(2));
+        tokio::time::timeout(Duration::from_millis(500), other.lock_owned())
+            .await
+            .expect("another guild's request must not block this one");
+    }
+
+    /// A full queue is reported rather than silently dropping the song.
+    #[tokio::test]
+    async fn a_queue_that_filled_up_while_downloading_is_reported() {
+        let guild = GuildId::new(7);
+        let coordination = Coordination::default();
+        let queue = Queue::default();
+        let (_serialised, started_at) = coordination.begin(guild).await;
+        for i in 0..crate::queue::MAX_QUEUE {
+            assert!(queue.push(queued(&format!("filler{i}"))));
+        }
+
+        assert_eq!(
+            coordination
+                .commit(guild, &queue, queued("Dracula"), started_at)
+                .await,
+            Commit::QueueFull
+        );
+    }
+
+    /// Records whether the playback lock was free while it ran.
+    struct LockProbe {
+        coordination: Coordination,
+    }
+
+    #[async_trait]
+    impl AudioFetcher for LockProbe {
+        async fn fetch(
+            &self,
+            guild_id: GuildId,
+            found: &search::Candidate,
+        ) -> anyhow::Result<Queued> {
+            let lock = self.coordination.busy(guild_id);
+            let guard = tokio::time::timeout(Duration::from_millis(500), lock.lock_owned())
+                .await
+                .expect("the playback lock was held while the audio downloaded");
+            drop(guard);
+            Ok(queued(found.title()))
+        }
+    }
+
+    /// A song already in hand, as `commit` receives one.
+    fn queued(title: &str) -> Queued {
+        Queued {
+            path: std::path::PathBuf::from(format!("/tmp/{title}.m4a")),
+            title: title.to_string(),
+            artist: "someone".to_string(),
+            url: "https://youtu.be/only".to_string(),
+            video_id: "only".to_string(),
+        }
+    }
 
     /// Reads a little-endian `u32` at `offset`.
     fn u32_at(wav: &[u8], offset: usize) -> u32 {
