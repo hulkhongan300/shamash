@@ -23,6 +23,7 @@
 use anyhow::{Context, bail};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::process::Command;
 
 /// Audio formats to try, best first.
@@ -164,13 +165,53 @@ fn download_args(url: &str, dir: &Path, stem: &str, format: &str) -> Vec<OsStrin
     .collect()
 }
 
+/// How long one yt-dlp download may take before it is treated as failed.
+///
+/// A few minutes for a slow connection on a long track, and bounded regardless:
+/// the download runs while a request is in flight, and an unbounded yt-dlp would
+/// leave the request unresolved rather than reporting a failure the listener
+/// could hear about.
+pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long one ffmpeg transcode may take.
+///
+/// Shorter than the download because it is only a CPU-bound local rewrite of a
+/// file that has already arrived, so ninety seconds of that means something is
+/// wrong rather than slow.
+pub const TRANSCODE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Runs `command` to completion under a deadline, killing it if it overruns.
+///
+/// Every subprocess this crate spawns goes through here. Two properties matter
+/// and neither comes from the timeout alone: `kill_on_drop` so a cancelled or
+/// timed-out call does not leave the child running with the guild's ordering
+/// still held, and a named command in the error so a stalled yt-dlp can be told
+/// from a stalled ffmpeg in the log.
+async fn run(
+    mut command: Command,
+    what: &str,
+    budget: Duration,
+) -> anyhow::Result<std::process::Output> {
+    let output = tokio::time::timeout(budget, command.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("{what} took longer than {budget:?}"))??;
+    Ok(output)
+}
+
 /// Downloads one format into `dir` and returns the path yt-dlp wrote.
 async fn download(url: &str, dir: &Path, stem: &str, format: &str) -> anyhow::Result<PathBuf> {
-    let output = Command::new("yt-dlp")
-        .args(download_args(url, dir, stem, format))
-        .output()
-        .await
-        .with_context(|| format!("could not run yt-dlp to fetch {url}"))?;
+    let mut command = Command::new("yt-dlp");
+    command
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .args(download_args(url, dir, stem, format));
+    let output = run(
+        command,
+        &format!("yt-dlp download of {url}"),
+        DOWNLOAD_TIMEOUT,
+    )
+    .await
+    .with_context(|| format!("could not run yt-dlp to fetch {url}"))?;
 
     anyhow::ensure!(
         output.status.success(),
@@ -205,15 +246,22 @@ async fn download(url: &str, dir: &Path, stem: &str, format: &str) -> anyhow::Re
 /// Songbird resamples to its own 48 kHz stereo output, so the sample rate and
 /// channel count are left as they are and only the codec is replaced.
 async fn transcode(source: &Path, dest: &Path) -> anyhow::Result<()> {
-    let output = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    command
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
         .args(["-nostdin", "-loglevel", "error", "-y"])
         .arg("-i")
         .arg(source)
         .args(["-c:a", "pcm_s16le"])
-        .arg(dest)
-        .output()
-        .await
-        .context("could not run ffmpeg; is it installed and on PATH?")?;
+        .arg(dest);
+    let output = run(
+        command,
+        &format!("ffmpeg transcode of {}", source.display()),
+        TRANSCODE_TIMEOUT,
+    )
+    .await
+    .context("could not run ffmpeg; is it installed and on PATH?")?;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -397,6 +445,50 @@ mod tests {
             .expect("write");
 
         assert_eq!(existing("abc", &dir).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_subprocess_that_never_finishes_is_killed_at_the_deadline() {
+        // The point of the deadlines: `Player::play` holds the guild's request
+        // ordering while a fetch runs, so a subprocess that hangs forever must
+        // become an error the listener can be told about rather than a request
+        // that never completes.
+        let budget = Duration::from_millis(200);
+        let mut command = Command::new("sh");
+        command.kill_on_drop(true).arg("-c").arg("sleep 30");
+        let started = std::time::Instant::now();
+        let err = run(command, "a sleeping test process", budget)
+            .await
+            .expect_err("the sleep outlives the budget");
+        assert!(
+            err.to_string().contains("longer than"),
+            "the error must say it timed out: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline did not apply"
+        );
+    }
+
+    /// A command that finishes inside the budget is not disturbed by the
+    /// wrapper, or every normal fetch would report a timeout.
+    #[tokio::test]
+    async fn a_subprocess_that_finishes_in_time_is_not_disturbed() {
+        let mut command = Command::new("sh");
+        command.kill_on_drop(true).arg("-c").arg("exit 0");
+        let output = run(command, "a test process", Duration::from_secs(30))
+            .await
+            .expect("a quick process must be allowed through");
+        assert!(output.status.success());
+    }
+
+    /// The durations are the documented contract for how long a spoken command
+    /// can wait on a subprocess, so they are pinned here rather than only in
+    /// the README.
+    #[test]
+    fn every_subprocess_has_a_bounded_budget() {
+        assert_eq!(DOWNLOAD_TIMEOUT, Duration::from_secs(90));
+        assert_eq!(TRANSCODE_TIMEOUT, Duration::from_secs(60));
     }
 
     #[tokio::test]

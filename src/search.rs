@@ -577,6 +577,14 @@ pub fn pick(candidates: &[Candidate], target: &Target, threshold: f64) -> Choice
     }
 }
 
+/// How long a yt-dlp search may take before it is treated as having failed.
+///
+/// Generous: this is metadata for a handful of results and normally returns in
+/// about a second. It has to be bounded regardless, because `Player::play`
+/// holds the guild's request ordering while it runs, and a yt-dlp that hangs on
+/// a stalled connection would leave that guild unable to skip or stop.
+const YOUTUBE_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Searches YouTube via `yt-dlp` and returns the raw candidates.
 ///
 /// Metadata only: `--flat-playlist` reads the search page without opening each
@@ -590,13 +598,26 @@ pub fn pick(candidates: &[Candidate], target: &Target, threshold: f64) -> Choice
 pub async fn youtube_candidates(query: &str, count: usize) -> anyhow::Result<Vec<Candidate>> {
     anyhow::ensure!(count > 0, "need at least one search candidate");
 
-    let output = Command::new("yt-dlp")
+    // `kill_on_drop` matters as much as the timeout: without it, dropping the
+    // future on timeout would leave the yt-dlp process running, holding the
+    // network and eventually answering a socket nobody is reading.
+    let mut command = Command::new("yt-dlp");
+    command
+        .kill_on_drop(true)
         .args(["-j", "--flat-playlist", "--no-warnings", "--playlist-end"])
         .arg(count.to_string())
         .arg(format!("ytsearch{count}:{query}"))
-        .output()
+        .stdin(std::process::Stdio::null());
+
+    let output = tokio::time::timeout(YOUTUBE_SEARCH_TIMEOUT, command.output())
         .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "yt-dlp search for '{query}' took longer than {YOUTUBE_SEARCH_TIMEOUT:?}"
+            )
+        })?
         .context("failed to run yt-dlp; is it installed and on PATH?")?;
+
     anyhow::ensure!(
         output.status.success(),
         "yt-dlp search failed: {}",
@@ -1514,6 +1535,14 @@ mod tests {
             "{}",
             best.candidate.title()
         );
+    }
+
+    /// The search deadline is pinned, because it is the longest a spoken command
+    /// waits on yt-dlp before the request fails, and the reason the guild's
+    /// request ordering has to be short.
+    #[test]
+    fn the_search_has_a_bounded_budget() {
+        assert_eq!(YOUTUBE_SEARCH_TIMEOUT, std::time::Duration::from_secs(10));
     }
 
     /// A provider that finds nothing, for the test above.
