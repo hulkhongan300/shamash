@@ -103,7 +103,8 @@ fn log_configuration(config: &Config, big_models: &BigModels) {
         wake_words = %wake_words.join(", "),
         voice_channel = config.voice_channel_id,
         text_channel = %text_channel,
-        catalog_provider = %config.catalog_provider,
+        catalog_providers = %config.catalog_providers.join(","),
+        resolve_budget_ms = config.resolve_budget.as_millis() as u64,
         catalog_match_threshold = config.catalog_match_threshold,
         yt_dlp = %yt_dlp,
         "Shamash starting up"
@@ -256,7 +257,7 @@ impl Handler {
     /// interaction that goes unanswered within three seconds and a skip may
     /// have to download nothing but still waits on the voice lock.
     /// Plays the song behind a "which one did you mean" button.
-    async fn choose_song(&self, ctx: &Context, button: ComponentInteraction, video_id: &str) {
+    async fn choose_song(&self, ctx: &Context, button: ComponentInteraction, key: &str) {
         let Some(guild_id) = button.guild_id else {
             return;
         };
@@ -285,7 +286,7 @@ impl Handler {
             return;
         };
 
-        match player.play_chosen(ctx, &config, guild_id, video_id).await {
+        match player.play_chosen(ctx, &config, guild_id, key).await {
             Ok(()) => tracing::info!(guild_id = %guild_id, "played the chosen song"),
             Err(e) => {
                 tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not play the chosen song");
@@ -306,9 +307,7 @@ impl Handler {
     async fn dashboard_button(&self, ctx: &Context, button: ComponentInteraction) {
         // Checked before the playback actions, because a choice button is not
         // one of them and would be rejected by `action_from_id`.
-        if let Some(video_id) =
-            dashboard::picked_video_id(&button.data.custom_id).map(str::to_owned)
-        {
+        if let Some(video_id) = dashboard::picked_key(&button.data.custom_id).map(str::to_owned) {
             return self.choose_song(ctx, button, &video_id).await;
         }
         let Some(action) = dashboard::action_from_id(&button.data.custom_id) else {
@@ -360,6 +359,26 @@ impl Handler {
             }
             dashboard::ACTION_STOP => {
                 player.stop(ctx, &config, guild_id).await;
+            }
+            // "None of these": the listener said no, so the question goes.
+            // Handled after the player lookup because it is not a playback
+            // action and needs no dashboard.
+            dashboard::ACTION_NONE => {
+                if !player.dismiss_choice(guild_id) {
+                    return;
+                }
+                let edit = EditMessage::new().components(Vec::new());
+                if let Err(e) = ctx
+                    .http
+                    .edit_message(button.channel_id, button.message.id, &edit, Vec::new())
+                    .await
+                {
+                    tracing::debug!(
+                        guild_id = %guild_id,
+                        error = %format!("{e:#}"),
+                        "could not clear the dismissed question"
+                    );
+                }
             }
             // `action_from_id` only returns the four above.
             _ => {}

@@ -197,11 +197,16 @@ impl ListenerPipeline {
             tracing::info!(guild_id = %guild_id, transcript = %transcript, "request heard");
         }
 
-        let Some(request) = self.request_for(ctx, config, guild_id, &transcript).await else {
+        let (Some(request), rewritten) = self.request_for(ctx, config, guild_id, &transcript).await
+        else {
             return;
         };
         tracing::info!(guild_id = %guild_id, request = %request.query, "playing a request");
-        if let Err(e) = self.player.play(ctx, config, guild_id, &request).await {
+        if let Err(e) = self
+            .player
+            .play(ctx, config, guild_id, &request, rewritten.as_deref())
+            .await
+        {
             tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "playback failed");
         }
     }
@@ -218,22 +223,25 @@ impl ListenerPipeline {
         config: &Config,
         guild_id: GuildId,
         transcript: &str,
-    ) -> Option<PlayRequest> {
-        if let Some(rewritten) = self.rewrite(ctx, config, guild_id, transcript).await {
+    ) -> (Option<PlayRequest>, Option<String>) {
+        // The rewrite is a *second candidate transcript*, not a replacement.
+        // Both are resolved and the better verdict wins, so a rewriting model
+        // can rescue a request the catalog cannot read, while still never being
+        // able to talk the bot into a song the catalog did not find.
+        let rewritten = self
+            .rewrite(ctx, config, guild_id, transcript)
+            .await
             // The reply may still carry a wake word, which is why the grammar is
             // applied to it rather than trusting it to have stripped one.
-            if let Some(query) = self.parser.strip_command(&rewritten) {
-                let request = self.parser.request_from_query(&query)?;
-                tracing::info!(guild_id = %guild_id, request = %request.query, "the transcript rewrite changed the request");
-                return Some(request);
-            }
+            .and_then(|text| self.parser.strip_command(&text));
+        if let Some(rewritten) = &rewritten {
             tracing::info!(
                 guild_id = %guild_id,
                 rewrite = %rewritten,
-                "the rewrite was not a song request; using the words as heard"
+                "the transcript rewrite is a second candidate for this request"
             );
         }
-        self.parse_heard(guild_id, transcript)
+        (self.parse_heard(guild_id, transcript), rewritten)
     }
 
     /// The rewriting stage, or `None` when it is off or produced nothing better.

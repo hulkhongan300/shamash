@@ -25,6 +25,13 @@ pub const ACTION_RESUME: &str = "resume";
 pub const ACTION_SKIP: &str = "skip";
 pub const ACTION_STOP: &str = "stop";
 
+/// The button on a chooser that means "none of these".
+///
+/// A question with no way to say no is a question that has to be answered. The
+/// listener who asked for something the bot did not offer gets a way to say so
+/// rather than leaving a question on offer forever.
+pub const ACTION_NONE: &str = "none";
+
 /// The longest a title may be before it is trimmed.
 ///
 /// Discord rejects an over-long embed rather than truncating it, which would
@@ -47,27 +54,28 @@ fn button_id(action: &str) -> String {
 pub fn action_from_id(custom_id: &str) -> Option<&str> {
     let action = custom_id.strip_prefix(&format!("{PREFIX}:"))?;
     match action {
-        ACTION_PAUSE | ACTION_RESUME | ACTION_SKIP | ACTION_STOP => Some(action),
+        ACTION_PAUSE | ACTION_RESUME | ACTION_SKIP | ACTION_STOP | ACTION_NONE => Some(action),
         _ => None,
     }
 }
 
-/// Builds the custom id for a "which song did you mean" button.
+/// Builds the custom id for a "which one did you mean" button.
 ///
-/// The video id rides in the custom id rather than being looked up, so a press
-/// needs no state. An 11-character id stays well inside the 100-character
-/// limit.
-pub fn pick_id(video_id: &str) -> String {
-    format!("{PREFIX}:{PICK_PREFIX}:{video_id}")
+/// The key rides in the custom id rather than being looked up, so a press needs
+/// no state. It is opaque: a video's id, or the index of a song in the guild's
+/// current question. Either way what it means is decided by the choice store and
+/// by nothing that arrived from the client.
+pub fn pick_id(key: &str) -> String {
+    format!("{PREFIX}:{PICK_PREFIX}:{key}")
 }
 
-/// Recovers the video id from a choice button's custom id. Separate from
-/// [`action_from_id`], which only reports the four playback actions.
-pub fn picked_video_id(custom_id: &str) -> Option<&str> {
+/// Recovers the key from a choice button's custom id. Separate from
+/// [`action_from_id`], which only reports the playback actions.
+pub fn picked_key(custom_id: &str) -> Option<&str> {
     let action = custom_id.strip_prefix(&format!("{PREFIX}:"))?;
-    let video_id = action.strip_prefix(&format!("{PICK_PREFIX}:"))?;
-    // An empty id would match everything and then fetch nothing.
-    (!video_id.is_empty()).then_some(video_id)
+    let key = action.strip_prefix(&format!("{PICK_PREFIX}:"))?;
+    // An empty key would match nothing and then do nothing.
+    (!key.is_empty()).then_some(key)
 }
 
 /// Shortens `text` to at most `max` characters on a word boundary.
@@ -200,17 +208,43 @@ pub fn choice(
             .collect::<Vec<_>>(),
     );
 
-    let buttons = options
+    let mut buttons: Vec<CreateButton> = options
         .iter()
         .enumerate()
         .map(|(index, option)| {
-            CreateButton::new(pick_id(option.video_id)).label((index + 1).to_string())
+            CreateButton::new(pick_id(option.key)).label((index + 1).to_string())
         })
         .collect();
+    buttons.push(
+        CreateButton::new(action_id(ACTION_NONE))
+            .label("None of these")
+            .style(ButtonStyle::Secondary),
+    );
 
     CreateMessage::new()
         .embed(embed)
         .components(vec![CreateActionRow::Buttons(buttons)])
+}
+
+/// The custom id for a dashboard action button.
+pub fn action_id(action: &str) -> String {
+    format!("{PREFIX}:{action}")
+}
+
+/// The edit that removes the buttons from a question nobody answered.
+///
+/// Used after the chooser expires: the question stays readable, but a press on
+/// a button from ten minutes ago must not start a download.
+pub fn expired(question: &str) -> EditMessage {
+    EditMessage::new()
+        .embed(
+            CreateEmbed::new()
+                .title("Which one did you mean?")
+                .description(trim(question, MAX_DESCRIPTION))
+                .footer(CreateEmbedFooter::new("This question timed out."))
+                .color(0x60_6a_76),
+        )
+        .components(Vec::new())
 }
 
 /// A one-line notice for something that did not work.
@@ -230,10 +264,14 @@ pub fn notice(text: &str) -> View {
 #[derive(Clone, Copy)]
 pub struct ChoiceOption<'a> {
     pub title: &'a str,
+    /// Who recorded or uploaded it, shown as the second line.
     pub channel: &'a str,
     pub duration_secs: Option<f64>,
-    /// The video to play when this is chosen.
-    pub video_id: &'a str,
+    /// The opaque key this button stands for, in the guild's choice store.
+    ///
+    /// Opaque on purpose: a press carries a key, and the store decides what it
+    /// means. Nothing a client sends is treated as a video id to play.
+    pub key: &'a str,
 }
 
 impl ChoiceOption<'_> {
@@ -341,7 +379,7 @@ mod tests {
     #[test]
     fn a_choice_button_round_trips_through_its_custom_id() {
         let id = pick_id("dQw4w9WgXcQ");
-        assert_eq!(picked_video_id(&id), Some("dQw4w9WgXcQ"));
+        assert_eq!(picked_key(&id), Some("dQw4w9WgXcQ"));
     }
 
     /// A choice button is not a playback action, and `action_from_id` is what
@@ -350,9 +388,12 @@ mod tests {
     fn a_choice_button_is_not_a_playback_action() {
         let id = pick_id("dQw4w9WgXcQ");
         assert_eq!(action_from_id(&id), None);
-        assert_eq!(picked_video_id("shamash:pause"), None);
-        assert_eq!(picked_video_id("other:pick:abc"), None);
-        assert_eq!(picked_video_id("shamash:pick:"), None);
+        assert_eq!(picked_key("shamash:pause"), None);
+        assert_eq!(picked_key("other:pick:abc"), None);
+        assert_eq!(picked_key("shamash:pick:"), None);
+        // A catalog question's key is an index, and the store is what says what
+        // index 0 means.
+        assert_eq!(picked_key(&pick_id("song:0")), Some("song:0"));
     }
 
     /// The custom id has a 100-character limit in Discord, and the video id is
@@ -368,7 +409,7 @@ mod tests {
             title: Box::leak(title.to_string().into_boxed_str()),
             channel: Box::leak(channel.to_string().into_boxed_str()),
             duration_secs: duration,
-            video_id: "vid",
+            key: "vid",
         }
     }
 

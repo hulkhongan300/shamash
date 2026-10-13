@@ -74,7 +74,12 @@ pub enum Outcome {
     /// in which case playback begins now rather than when the queue reaches it.
     Played { starting: bool },
     /// Nothing was convincing enough to play; the caller should offer these.
-    Offered(search::Choice),
+    Asked { tracks: Vec<resolve::CatalogTrack> },
+    /// Uploads of one known song, none of which the scorer was sure enough
+    /// about. Offering them is a choice between *recordings*, not between songs.
+    Uploads(search::Choice),
+    /// Nothing matched at all.
+    Unknown,
     /// Playback was stopped while this was still downloading.
     Cancelled,
 }
@@ -221,6 +226,13 @@ impl AudioFetcher for YtDlpFetch {
 /// How many candidates the chooser offers.
 const CHOICE_COUNT: usize = 3;
 
+/// How long a chooser's buttons stay on offer.
+///
+/// A question left on offer forever is not a question. After this the message
+/// stays readable and the buttons go, so a press from an hour ago cannot start
+/// a download.
+const CHOICE_TTL: Duration = Duration::from_secs(60);
+
 /// A pending question, and what each of its buttons would play.
 ///
 /// The custom id on the buttons carries the video id, so this only has to
@@ -228,7 +240,28 @@ const CHOICE_COUNT: usize = 3;
 /// recover on its own without another search.
 #[derive(Debug, Clone)]
 struct ChoiceEntry {
-    candidates: Vec<search::Candidate>,
+    /// The offered options, each with the opaque key its button carries.
+    options: Vec<(String, Offer)>,
+}
+
+/// What one button on a chooser would play.
+///
+/// Two kinds, because there are two questions. A catalog question offers
+/// *songs* — "Stand By Me" by Ben E. King or by Oasis — and pressing one means
+/// going and finding that song's upload, so the button stores the track rather
+/// than a video. A video question offers *uploads of one known song*, and
+/// pressing one plays it directly.
+#[derive(Debug, Clone)]
+enum Offer {
+    /// A specific upload, from a search nothing catalog-backed produced.
+    Video(search::Candidate),
+    /// A catalog song. The user has already chosen the song by pressing it, so
+    /// its best upload is taken even when the upload's own score is modest: the
+    /// hard part, deciding which song it is, has already been answered.
+    Song {
+        track: resolve::CatalogTrack,
+        requested: String,
+    },
 }
 
 /// The chooser on offer per guild.
@@ -240,29 +273,47 @@ struct ChoiceEntry {
 struct Choices(Arc<Mutex<HashMap<GuildId, ChoiceEntry>>>);
 
 impl Choices {
-    fn set(&self, guild_id: GuildId, candidates: Vec<search::Candidate>) {
-        self.lock().insert(guild_id, ChoiceEntry { candidates });
+    /// Puts a question on offer, replacing whatever was there.
+    fn set(&self, guild_id: GuildId, options: Vec<(String, Offer)>) {
+        self.lock().insert(guild_id, ChoiceEntry { options });
     }
 
-    /// Takes the offered choice for a video, removing it so a second press of
-    /// the same button does nothing.
-    fn take_video(&self, guild_id: GuildId, video_id: &str) -> Option<search::Candidate> {
+    /// Takes the offered choice for `key`, removing it so a second press of the
+    /// same button does nothing.
+    ///
+    /// The key is looked up rather than acted on, so a crafted button cannot be
+    /// pressed into playing something that was not on offer.
+    fn take(&self, guild_id: GuildId, key: &str) -> Option<Offer> {
         let mut lock = self.lock();
         let entry = lock.get_mut(&guild_id)?;
         let index = entry
-            .candidates
+            .options
             .iter()
-            .position(|c| c.video_id() == Some(video_id))?;
-        let candidate = entry.candidates.remove(index);
-        if entry.candidates.is_empty() {
+            .position(|(offered, _)| offered == key)?;
+        let (_, offer) = entry.options.remove(index);
+        if entry.options.is_empty() {
             lock.remove(&guild_id);
         }
-        Some(candidate)
+        Some(offer)
+    }
+
+    /// Throws a question away, for "None of these".
+    fn clear(&self, guild_id: GuildId) -> bool {
+        self.lock().remove(&guild_id).is_some()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<GuildId, ChoiceEntry>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// The custom id a press carries, and the key it names in the choice store.
+///
+/// The index is part of the id so a stale press from an older question cannot
+/// land on a different option of a newer one: the store is replaced wholesale,
+/// and the key is only meaningful alongside the question that offered it.
+fn song_key(index: usize) -> String {
+    format!("song:{index}")
 }
 
 /// One lock per guild, so a command in one guild cannot hold up another.
@@ -515,16 +566,37 @@ impl Player {
         config: &Config,
         guild_id: GuildId,
         request: &PlayRequest,
+        rewrite: Option<&str>,
     ) -> anyhow::Result<()> {
         self.manager
             .get(guild_id)
             .context("bot is not in a voice channel")?;
 
         let heard = request.query.clone();
-        match self.resolve_and_queue(config, guild_id, request).await {
-            Ok(Outcome::Offered(choice)) => {
+        match self
+            .resolve_and_queue(config, guild_id, request, rewrite)
+            .await
+        {
+            Ok(Outcome::Asked { tracks }) => {
+                self.offer_songs(ctx, config, guild_id, request, &tracks)
+                    .await
+            }
+            // Nothing was verified. Say so, and offer unverified results only if
+            // the operator asked for them -- clearly labelled, and never played
+            // on their own.
+            Ok(Outcome::Unknown) => {
+                let failure = Failure::new(
+                    Problem::NoMatch,
+                    anyhow::anyhow!("nothing in the catalog matched '{heard}'"),
+                );
+                self.report(ctx, config, guild_id, &heard, &failure).await;
+                if config.unverified_chooser {
+                    self.offer_unverified(ctx, config, guild_id, request).await;
+                }
+            }
+            Ok(Outcome::Uploads(choice)) => {
                 let asked = choice.requested.clone();
-                self.offer_choice(ctx, config, guild_id, &asked, &choice)
+                self.offer_uploads(ctx, config, guild_id, &asked, &choice)
                     .await
             }
             Ok(Outcome::Played { starting: true }) => {
@@ -599,6 +671,7 @@ impl Player {
         config: &Config,
         guild_id: GuildId,
         request: &PlayRequest,
+        rewrite: Option<&str>,
     ) -> Result<Outcome, Failure> {
         let queue = self.queues.get(guild_id);
         // Checked before searching, so a full queue fails without a download.
@@ -615,30 +688,44 @@ impl Player {
         // lands while this request waits its turn still counts against it.
         let (_serialised, started_at) = self.coordination.begin(guild_id).await;
 
-        let choice = search::choose_match(
-            request,
-            &self.catalog,
+        let resolved = search::resolve_request(request, &self.catalog, rewrite).await;
+        if matches!(resolved, search::Resolved::Unknown { .. }) {
+            return Ok(Outcome::Unknown);
+        }
+        if let search::Resolved::Ask(tracks) = resolved {
+            return Ok(Outcome::Asked { tracks });
+        }
+
+        let label = resolved
+            .as_track()
+            .map(|track| track.label())
+            .unwrap_or_default();
+        let choice = search::find_video(
+            &resolved,
+            &request.query,
             &search::YtDlpSearch,
             config.search_candidates,
             config.match_threshold,
-            config.allow_unverified_autoplay,
         )
         .await
         .map_err(|e| {
             Failure::new(
                 Problem::NoMatch,
-                e.context(format!("no match for '{}'", request.query)),
+                e.context(format!("no upload for '{label}'")),
             )
         })?;
 
         let Some(best) = choice.best() else {
             return Err(Failure::new(
                 Problem::NoMatch,
-                anyhow::anyhow!("no playable song found for the request"),
+                anyhow::anyhow!("no playable upload of '{label}'"),
             ));
         };
         if !choice.confident {
-            return Ok(Outcome::Offered(choice));
+            // The song is known; the upload is not. Offering the closest
+            // uploads of *this* song is a much better question than asking which
+            // song, and the answer is never wrong about which song it is.
+            return Ok(Outcome::Uploads(choice));
         }
 
         let song = self
@@ -674,12 +761,89 @@ impl Player {
         }
     }
 
-    /// Posts the "which one did you mean" question in the alert channel.
+    /// Posts "which song did you mean" in the alert channel.
     ///
-    /// A question that cannot be asked is itself reported: a listener who gets
-    /// neither music nor buttons would otherwise have no way to tell a bad
-    /// match from a bot that never saw their request.
-    async fn offer_choice(
+    /// The options are *songs* — "Stand By Me" by Ben E. King or by Oasis —
+    /// because that is the question the listener was actually asking. Offering
+    /// video titles instead answers a question about uploads they never asked.
+    async fn offer_songs(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        request: &PlayRequest,
+        tracks: &[resolve::CatalogTrack],
+    ) {
+        let keys: Vec<String> = (0..tracks.len()).map(song_key).collect();
+        let options: Vec<dashboard::ChoiceOption<'_>> = tracks
+            .iter()
+            .zip(&keys)
+            .map(|(track, key)| dashboard::ChoiceOption {
+                title: &track.title,
+                channel: &track.artist,
+                duration_secs: track.duration_secs,
+                key,
+            })
+            .collect();
+        let offered: Vec<(String, Offer)> = tracks
+            .iter()
+            .zip(&keys)
+            .map(|(track, key)| {
+                (
+                    key.clone(),
+                    Offer::Song {
+                        track: track.clone(),
+                        requested: request.query.clone(),
+                    },
+                )
+            })
+            .collect();
+        self.choices.set(guild_id, offered);
+        let question = request.query.clone();
+        self.ask(ctx, config, guild_id, &question, None, &options)
+            .await;
+    }
+
+    /// Offers raw YouTube results for a request nothing matched.
+    ///
+    /// These were never checked against a catalog, so they are labelled
+    /// unverified and are never played on their own -- the user pressing one is
+    /// the only thing that can start it. Better than silence when the catalog
+    /// has never heard of the song, and worse than silence would be if any of
+    /// them could start playing by themselves.
+    async fn offer_unverified(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        request: &PlayRequest,
+    ) {
+        match search::find_unverified(
+            request,
+            &search::YtDlpSearch,
+            config.search_candidates,
+            config.match_threshold,
+        )
+        .await
+        {
+            Ok(choice) => {
+                let heard = request.query.clone();
+                self.offer_uploads(ctx, config, guild_id, &heard, &choice)
+                    .await
+            }
+            Err(e) => tracing::debug!(
+                guild_id = %guild_id,
+                error = %format!("{e:#}"),
+                "nothing on YouTube either, so there was nothing to offer"
+            ),
+        }
+    }
+
+    /// Posts "which upload of this song did you mean".
+    ///
+    /// Used when the catalog named the song and the scorer was not sure which
+    /// recording of it an upload actually is.
+    async fn offer_uploads(
         &self,
         ctx: &SerenityContext,
         config: &Config,
@@ -696,25 +860,49 @@ impl Player {
                     title: scored.candidate.title(),
                     channel: scored.candidate.channel(),
                     duration_secs: scored.candidate.duration,
-                    video_id,
+                    key: video_id,
                 })
             })
             .collect();
+        let offered: Vec<(String, Offer)> = choice
+            .top(CHOICE_COUNT)
+            .iter()
+            .filter_map(|scored| {
+                Some((
+                    scored.candidate.video_id()?.to_string(),
+                    Offer::Video(scored.candidate.clone()),
+                ))
+            })
+            .collect();
+        self.choices.set(guild_id, offered);
+        let resolved = choice.resolved.as_ref().map(|track| track.label());
+        self.ask(ctx, config, guild_id, heard, resolved.as_deref(), &options)
+            .await;
+    }
+
+    /// Posts the question, and takes the buttons away again after
+    /// [`CHOICE_TTL`].
+    ///
+    /// A question left on offer forever is not a question. The message stays
+    /// readable, but the buttons go, so a press from ten minutes ago cannot
+    /// start a download.
+    async fn ask(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        heard: &str,
+        resolved: Option<&str>,
+        options: &[dashboard::ChoiceOption<'_>],
+    ) {
         if options.is_empty() {
             let failure = Failure::new(
                 Problem::NoMatch,
-                anyhow::anyhow!("no candidate had a video id, so there was nothing to offer"),
+                anyhow::anyhow!("there was nothing to offer"),
             );
             self.report(ctx, config, guild_id, heard, &failure).await;
             return;
         }
-
-        let candidates: Vec<search::Candidate> = choice
-            .top(CHOICE_COUNT)
-            .iter()
-            .map(|scored| scored.candidate.clone())
-            .collect();
-        self.choices.set(guild_id, candidates);
 
         let Some(channel_id) = resolve_alert_channel(ctx, config, guild_id) else {
             let failure = Failure::new(
@@ -724,40 +912,87 @@ impl Player {
             self.report(ctx, config, guild_id, heard, &failure).await;
             return;
         };
-        // Built before the send so the borrowed label outlives the call.
-        let resolved = choice.resolved.as_ref().map(|track| track.label());
-        let message = dashboard::choice(&choice.requested, resolved.as_deref(), &options);
-        if let Err(e) = channel_id.send_message(&ctx.http, message).await {
-            tracing::warn!(
-                guild_id = %guild_id,
-                error = %format!("{e:#}"),
-                "could not ask which song was meant"
-            );
-        }
+        let question = format!("I heard \u{201c}{heard}\u{201d}");
+        let message = dashboard::choice(&question, resolved, options);
+        let Ok(sent) = channel_id.send_message(&ctx.http, message).await else {
+            tracing::warn!(guild_id = %guild_id, "could not ask which song was meant");
+            return;
+        };
+
+        let http = ctx.http.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CHOICE_TTL).await;
+            if let Err(e) = http
+                .edit_message(
+                    channel_id,
+                    sent.id,
+                    &dashboard::expired(&question),
+                    Vec::new(),
+                )
+                .await
+            {
+                tracing::debug!(
+                    channel_id = %channel_id,
+                    error = %format!("{e:#}"),
+                    "could not take the chooser buttons away"
+                );
+            }
+        });
     }
 
-    /// Plays one of the offered candidates.
+    /// Plays whatever a chooser button stands for.
     ///
-    /// The candidate is looked up by video id rather than rebuilt from the
-    /// button, so this cannot be pressed into playing something other than what
-    /// was offered.
+    /// The key is looked up in the guild's choice store rather than acted on, so
+    /// a crafted button cannot be pressed into playing something that was never
+    /// offered, and a press is spent so a second one does nothing.
     pub async fn play_chosen(
         &self,
         ctx: &SerenityContext,
         config: &Config,
         guild_id: GuildId,
-        video_id: &str,
+        key: &str,
     ) -> anyhow::Result<()> {
-        let candidate = self.choices.take_video(guild_id, video_id).with_context(
+        let offer = self.choices.take(guild_id, key).with_context(
             || "that choice is no longer on offer; say the request again for new options",
         )?;
+
+        // The user has already chosen the song by pressing this button, so the
+        // best upload of it is taken even when the upload's own score is modest.
+        // The hard part -- deciding which song it is -- was answered by the
+        // catalog and by them.
+        let candidate = match offer {
+            Offer::Video(candidate) => candidate,
+            Offer::Song { track, requested } => {
+                let resolved = search::Resolved::Track {
+                    track,
+                    durations: Vec::new(),
+                };
+                let choice = search::find_video(
+                    &resolved,
+                    &requested,
+                    &search::YtDlpSearch,
+                    config.search_candidates,
+                    // The user chose; the threshold is not what is in question
+                    // any more.
+                    0.0,
+                )
+                .await
+                .with_context(|| "could not find that song on YouTube")?;
+                choice
+                    .best()
+                    .map(|scored| scored.candidate.clone())
+                    .context("YouTube returned nothing for that song")?
+            }
+        };
+
         // The download runs outside the playback lock for the same reason the
         // spoken path does: a press on "1" must not freeze the Skip button.
         let started_at = self.coordination.generations.get(guild_id).now();
         let song = self
             .fetch
             .fetch(guild_id, &candidate, &self.queues.get(guild_id).in_use())
-            .await?;
+            .await
+            .context("could not download that song")?;
         let outcome = self
             .outcome(guild_id, &self.queues.get(guild_id), song, started_at)
             .await;
@@ -768,6 +1003,14 @@ impl Player {
             self.draw_dashboard(ctx, config, guild_id).await;
         }
         Ok(())
+    }
+
+    /// Throws the guild's question away, for "None of these".
+    ///
+    /// Returns whether there was one, so the caller only says anything when the
+    /// press did something.
+    pub fn dismiss_choice(&self, guild_id: GuildId) -> bool {
+        self.choices.clear(guild_id)
     }
 
     /// Skips the song playing, starting the next one queued.
@@ -1419,20 +1662,69 @@ mod tests {
         }
     }
 
-    /// A press has to find the video it stands for among the offered ones.
+    /// One offered option: the key its button carries, and what it would play.
+    fn video_offer(url: &str) -> (String, Offer) {
+        (url.to_string(), Offer::Video(candidate(url)))
+    }
+
+    fn song_offer(key: &str, artist: &str, title: &str) -> (String, Offer) {
+        (
+            key.to_string(),
+            Offer::Song {
+                track: resolve::CatalogTrack {
+                    artist: artist.to_string(),
+                    title: title.to_string(),
+                    duration_secs: Some(191.0),
+                    id: String::new(),
+                    provider: "stub",
+                    popularity: None,
+                },
+                requested: "stand by me".to_string(),
+            },
+        )
+    }
+
+    fn url_of(offer: Offer) -> String {
+        match offer {
+            Offer::Video(candidate) => candidate.url,
+            Offer::Song { track, .. } => track.label(),
+        }
+    }
+
+    /// A press has to find the option it stands for among the offered ones.
     #[test]
-    fn a_press_finds_the_video_it_stands_for() {
+    fn a_press_finds_the_option_it_stands_for() {
         let choices = Choices::default();
         let guild = GuildId::new(7);
         choices.set(
             guild,
             vec![
-                candidate("https://youtu.be/first"),
-                candidate("https://youtu.be/second"),
+                video_offer("https://youtu.be/first"),
+                video_offer("https://youtu.be/second"),
             ],
         );
-        let picked = choices.take_video(guild, "second").expect("was offered");
-        assert_eq!(picked.url, "https://youtu.be/second");
+        let picked = choices
+            .take(guild, "https://youtu.be/second")
+            .expect("was offered");
+        assert_eq!(url_of(picked), "https://youtu.be/second");
+    }
+
+    /// A catalog question offers songs, and the press carries a key that means
+    /// nothing outside the store. That is the point: the button says "song 1",
+    /// and the store says what song 1 is.
+    #[test]
+    fn a_song_press_resolves_to_the_song_it_named() {
+        let choices = Choices::default();
+        let guild = GuildId::new(7);
+        choices.set(
+            guild,
+            vec![
+                song_offer(&song_key(0), "Ben E. King", "Stand By Me"),
+                song_offer(&song_key(1), "Oasis", "Stand By Me"),
+            ],
+        );
+        let picked = choices.take(guild, &song_key(1)).expect("was offered");
+        assert_eq!(url_of(picked), "Oasis — Stand By Me");
     }
 
     /// The buttons are spent by a press, so a second one must not replay the
@@ -1441,19 +1733,20 @@ mod tests {
     fn a_press_is_spent_once() {
         let choices = Choices::default();
         let guild = GuildId::new(7);
-        choices.set(guild, vec![candidate("https://youtu.be/only")]);
-        assert!(choices.take_video(guild, "only").is_some());
-        assert!(choices.take_video(guild, "only").is_none());
+        choices.set(guild, vec![video_offer("https://youtu.be/only")]);
+        assert!(choices.take(guild, "https://youtu.be/only").is_some());
+        assert!(choices.take(guild, "https://youtu.be/only").is_none());
     }
 
-    /// A video that was never offered must not be playable, or the button
-    /// could be crafted into playing something else.
+    /// Something that was never offered must not be playable, or a crafted
+    /// button could be pressed into playing anything at all.
     #[test]
-    fn a_video_that_was_never_offered_is_refused() {
+    fn something_that_was_never_offered_is_refused() {
         let choices = Choices::default();
         let guild = GuildId::new(7);
-        choices.set(guild, vec![candidate("https://youtu.be/offered")]);
-        assert!(choices.take_video(guild, "smuggled").is_none());
+        choices.set(guild, vec![video_offer("https://youtu.be/offered")]);
+        assert!(choices.take(guild, "smuggled").is_none());
+        assert!(choices.take(guild, &song_key(0)).is_none());
     }
 
     /// Asking again replaces the question, so a stale button cannot be pressed
@@ -1462,10 +1755,29 @@ mod tests {
     fn a_second_question_replaces_the_first() {
         let choices = Choices::default();
         let guild = GuildId::new(7);
-        choices.set(guild, vec![candidate("https://youtu.be/old")]);
-        choices.set(guild, vec![candidate("https://youtu.be/new")]);
-        assert!(choices.take_video(guild, "old").is_none());
-        assert!(choices.take_video(guild, "new").is_some());
+        choices.set(guild, vec![video_offer("https://youtu.be/old")]);
+        choices.set(guild, vec![video_offer("https://youtu.be/new")]);
+        assert!(choices.take(guild, "https://youtu.be/old").is_none());
+        assert!(choices.take(guild, "https://youtu.be/new").is_some());
+    }
+
+    /// The song keys restart at zero with every question, so a stale press from
+    /// an older catalog question must not land on a song from a newer one.
+    #[test]
+    fn a_stale_song_key_cannot_reach_a_newer_question() {
+        let choices = Choices::default();
+        let guild = GuildId::new(7);
+        choices.set(
+            guild,
+            vec![song_offer(&song_key(0), "Oasis", "Stand By Me")],
+        );
+        choices.set(guild, vec![song_offer(&song_key(0), "Tems", "Look at Me")]);
+        let picked = choices.take(guild, &song_key(0)).expect("was offered");
+        assert_eq!(
+            url_of(picked),
+            "Tems — Look at Me",
+            "the key means whatever the current question says it means"
+        );
     }
 
     /// One question per guild, so the map cannot grow with every ambiguous
@@ -1473,16 +1785,28 @@ mod tests {
     #[test]
     fn questions_are_kept_per_guild() {
         let choices = Choices::default();
-        choices.set(GuildId::new(1), vec![candidate("https://youtu.be/one")]);
-        choices.set(GuildId::new(2), vec![candidate("https://youtu.be/two")]);
-        assert_eq!(choices.take_video(GuildId::new(2), "one"), None);
+        choices.set(GuildId::new(1), vec![video_offer("https://youtu.be/one")]);
+        choices.set(GuildId::new(2), vec![video_offer("https://youtu.be/two")]);
+        assert!(
+            choices
+                .take(GuildId::new(2), "https://youtu.be/one")
+                .is_none()
+        );
         assert_eq!(
-            choices.take_video(GuildId::new(1), "one").unwrap().url,
+            url_of(
+                choices
+                    .take(GuildId::new(1), "https://youtu.be/one")
+                    .unwrap()
+            ),
             "https://youtu.be/one"
         );
         // The untouched guild is unaffected by the other guild's press.
         assert_eq!(
-            choices.take_video(GuildId::new(2), "two").unwrap().url,
+            url_of(
+                choices
+                    .take(GuildId::new(2), "https://youtu.be/two")
+                    .unwrap()
+            ),
             "https://youtu.be/two"
         );
     }
@@ -1493,9 +1817,22 @@ mod tests {
     fn a_fully_spent_question_is_forgotten() {
         let choices = Choices::default();
         let guild = GuildId::new(7);
-        choices.set(guild, vec![candidate("https://youtu.be/only")]);
-        assert!(choices.take_video(guild, "only").is_some());
+        choices.set(guild, vec![video_offer("https://youtu.be/only")]);
+        assert!(choices.take(guild, "https://youtu.be/only").is_some());
         assert!(choices.lock().is_empty());
+    }
+
+    /// "None of these" throws the question away, and says whether there was
+    /// one so the caller only replies when the press did something.
+    #[test]
+    fn none_of_these_clears_the_question() {
+        let choices = Choices::default();
+        let guild = GuildId::new(7);
+        assert!(!choices.clear(guild), "nothing was on offer");
+        choices.set(guild, vec![video_offer("https://youtu.be/only")]);
+        assert!(choices.clear(guild));
+        assert!(!choices.clear(guild), "and not twice");
+        assert!(choices.take(guild, "https://youtu.be/only").is_none());
     }
 
     #[test]

@@ -23,8 +23,9 @@
 //! Ranking by views picks the 75 M video. Ranking by length alone picks the
 //! right one, and it does so from a number no uploader can misreport.
 
+use crate::matcher;
 use crate::parser::PlayRequest;
-use crate::resolve::{self, Resolution};
+use crate::resolve::{self, CatalogTrack};
 use anyhow::Context;
 use serde::Deserialize;
 use tokio::process::Command;
@@ -213,7 +214,7 @@ impl Candidate {
             return false;
         }
         let title = self.title_lowercase();
-        let requested = resolve::normalize(&target.requested);
+        let requested = matcher::normalize(&target.requested);
         !NON_SONG_MARKERS
             .iter()
             .any(|marker| contains_marker(&title, marker) && !contains_marker(&requested, marker))
@@ -274,7 +275,7 @@ fn non_empty(text: &str) -> Option<String> {
 /// An artist channel is as likely to be `TameImpala` as `Tame Impala`, and
 /// neither is something a band chose carefully, so neither can be relied on.
 fn squashed(text: &str) -> String {
-    resolve::normalize(text).replace(' ', "")
+    matcher::normalize(text).replace(' ', "")
 }
 
 /// Whether a title or request contains `needle`.
@@ -303,8 +304,14 @@ fn contains_marker(haystack: &str, needle: &str) -> bool {
 pub struct Target {
     pub artist: Option<String>,
     pub title: Option<String>,
-    /// The catalog's running time, when a match was found.
-    pub duration_secs: Option<f64>,
+    /// Every running time the catalog reported for this song.
+    ///
+    /// A set rather than one number, because providers disagree: one counts the
+    /// outro and one does not, and an upload is the right recording if it matches
+    /// *any* of them. The smallest gap to any of them is the score, so a
+    /// straggling provider cannot drag the comparison away from the recording
+    /// the others agree on.
+    pub durations: Vec<f64>,
     /// The whole request, kept so a requested "live" is not penalised.
     pub requested: String,
     /// Whether a catalog match backed this target.
@@ -312,18 +319,13 @@ pub struct Target {
 }
 
 impl Target {
-    /// A target backed by a catalog match, with the corrected names.
-    ///
-    /// An ambiguous match contributes its title and running time but *not* its
-    /// artist: several artists recorded the same title equally well, so
-    /// putting any one of their names in the query would aim the search at a
-    /// recording the listener never named.
-    pub fn from_resolution(resolution: &Resolution) -> Self {
+    /// A target backed by a catalog hit, with the corrected names.
+    pub fn from_track(track: &CatalogTrack, durations: Vec<f64>, requested: &str) -> Self {
         Self {
-            artist: (!resolution.ambiguous).then(|| resolution.track.artist.clone()),
-            title: Some(resolution.track.title.clone()),
-            duration_secs: resolution.track.duration_secs,
-            requested: resolution.query.clone(),
+            artist: Some(track.artist.clone()),
+            title: Some(track.title.clone()),
+            durations,
+            requested: requested.to_string(),
             catalogued: true,
         }
     }
@@ -339,7 +341,7 @@ impl Target {
         Self {
             artist: request.artist.clone(),
             title: request.title.clone().or_else(|| non_empty(&request.query)),
-            duration_secs: None,
+            durations: Vec::new(),
             requested: request.query.clone(),
             catalogued: false,
         }
@@ -490,8 +492,14 @@ pub fn score(candidate: &Candidate, target: &Target) -> ScoreParts {
     let mut parts = ScoreParts::default();
     let title = candidate.title_lowercase();
 
-    if let (Some(wanted), Some(found)) = (target.duration_secs, candidate.duration) {
-        let delta = (wanted - found).abs();
+    if let (Some(found), true) = (candidate.duration, !target.durations.is_empty()) {
+        // The closest any provider came, so one that counts the outro does not
+        // drag the comparison away from the recording the others agree on.
+        let delta = target
+            .durations
+            .iter()
+            .map(|wanted| (wanted - found).abs())
+            .fold(f64::INFINITY, f64::min);
         parts.duration = if delta <= DURATION_TOLERANCE_SECS {
             DURATION_EXACT
         } else {
@@ -518,10 +526,10 @@ pub fn score(candidate: &Candidate, target: &Target) -> ScoreParts {
     }
 
     if let Some(wanted) = target.title.as_deref() {
-        let wanted = resolve::normalize(wanted);
-        let found = resolve::normalize(&title);
+        let wanted = matcher::normalize(wanted);
+        let found = matcher::normalize(&title);
         if !wanted.is_empty() && !found.is_empty() {
-            parts.relevance = resolve::similarity(&wanted, &found) as f64 * RELEVANCE_MAX;
+            parts.relevance = matcher::sim(&wanted, &found) as f64 * RELEVANCE_MAX;
         }
     }
 
@@ -532,7 +540,7 @@ pub fn score(candidate: &Candidate, target: &Target) -> ScoreParts {
         _ => 0.0,
     };
 
-    let requested = resolve::normalize(&target.requested);
+    let requested = matcher::normalize(&target.requested);
     for marker in PENALTY_MARKERS {
         if contains_marker(&title, marker)
             && !contains_marker(&requested, marker)
@@ -652,123 +660,191 @@ impl VideoSearch for YtDlpSearch {
     }
 }
 
-/// Resolves a request against the catalog and ranks YouTube results for it.
+/// What a request turned into.
 ///
-/// Split in two so each half can be reasoned about on its own: [`resolve_step`]
-/// answers "what song is this", which is where every provider failure has to
-/// degrade to "nothing", and [`rank_step`] answers "which upload of it", which
-/// is pure arithmetic over candidates already in hand.
-pub async fn resolve_step(
+/// The catalog answers this, not the video search. The principle is that a
+/// wrong confident answer is worse than asking: the listener hears a song
+/// nobody asked for and has no way to tell it from a right one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Resolved {
+    /// One song, confirmed by the catalog.
+    ///
+    /// Carries every running time the catalog reported, because the upload
+    /// search is ranked against the whole set: providers disagree, and an upload
+    /// is the right recording if it matches any of them.
+    Track {
+        track: CatalogTrack,
+        durations: Vec<f64>,
+    },
+    /// More than one song answers to what was said, and the request did not say
+    /// enough to choose between them. Ask, in songs rather than in videos.
+    Ask(Vec<CatalogTrack>),
+    /// Nothing believable. The caller plays a miss tone and says so.
+    Unknown {
+        /// What was heard, echoed back so the listener can say it better.
+        heard: String,
+    },
+}
+
+impl Resolved {
+    /// The one song, when there is one.
+    pub fn as_track(&self) -> Option<&CatalogTrack> {
+        match self {
+            Self::Track { track, .. } => Some(track),
+            _ => None,
+        }
+    }
+}
+
+/// What the bot is going to ask, when it is going to ask.
+///
+/// Default `ask`. With `popular`, a title two artists have recorded is settled
+/// by how much bigger one of them is, which is the behaviour the README
+/// described before the catalog could tell two recordings of one title apart.
+/// It is off by default because it is a guess: popularity is a fact about
+/// YouTube and not about which of them the listener meant.
+pub fn popular_beats_a_rival(winner: &CatalogTrack, rivals: &[CatalogTrack]) -> bool {
+    let Some(top) = winner.popularity else {
+        return false;
+    };
+    let Some(best_rival) = rivals
+        .iter()
+        .filter(|rival| matcher::normalize(&rival.artist) != matcher::normalize(&winner.artist))
+        .filter_map(|rival| rival.popularity)
+        .max()
+    else {
+        // No rival has a popularity, so there is nothing to compare against and
+        // nothing to be three times bigger than.
+        return false;
+    };
+    top >= best_rival.saturating_mul(3)
+}
+
+/// Turns a spoken request into a song, or into a question, or into nothing.
+///
+/// Never fails. Every provider failing is the same outcome as no provider
+/// finding anything: [`Resolved::Unknown`], which the caller reports rather
+/// than playing whatever YouTube ranked first.
+///
+/// `rewrite` is an optional second transcript from the transcript-rewriting
+/// stage. It is tried alongside the words that were heard and the better verdict
+/// wins, but the rewrite can only ever *propose* a transcript: it is scored
+/// against the same catalog hits by the same matcher, so it cannot bypass
+/// verification.
+pub async fn resolve_request(
     request: &PlayRequest,
     catalog: &resolve::Catalog,
-) -> (Target, Option<resolve::Resolution>) {
-    let requested = request.query.clone();
-    // `Catalog::resolve` never fails, so a dead provider reaches YouTube as an
-    // ordinary unresolved request rather than as an error the caller must
-    // handle.
-    match catalog
-        .resolve(&resolve::Target::from_request(request))
-        .await
+    rewrite: Option<&str>,
+) -> Resolved {
+    let heard = request.query.clone();
+    // The target carries every reading of the phrase, which is what the query
+    // plan is built from; the caller keeps the request for its own text.
+    let hits = catalog.hits(&resolve::Target::from_request(request)).await;
+
+    let verdict = matcher::decide(&heard, &hits, |hit: &resolve::Hit| {
+        (hit.artist.as_str(), hit.title.as_str())
+    });
+    if let Resolved::Track { .. } = decide(&verdict)
+        && let Some((rewritten, rewritten_hits)) = try_rewrite(catalog, rewrite).await
     {
-        Some(resolution) => {
-            tracing::debug!(
-                provider = catalog.provider_name(),
-                catalog = %resolution.track.label(),
-                duration = ?resolution.track.duration_secs,
-                confidence = resolution.confidence,
-                query = %resolution.query,
-                ambiguous = resolution.ambiguous,
-                "resolved against the catalog"
+        let alternative = matcher::decide(&rewritten, &rewritten_hits, |hit: &resolve::Hit| {
+            (hit.artist.as_str(), hit.title.as_str())
+        });
+        // Only a *confident* answer from the rewrite displaces the words as
+        // heard. If the heard transcript also resolved, that is evidence for
+        // it, and the rewrite is the speculative one.
+        if matches!(verdict, matcher::Verdict::NoMatch)
+            && matches!(alternative, matcher::Verdict::Confident(_))
+        {
+            tracing::info!(
+                heard = %heard,
+                rewritten = %rewritten,
+                "the transcript rewrite resolved the request and the words as heard did not"
             );
-            (Target::from_resolution(&resolution), Some(resolution))
-        }
-        None => {
-            tracing::debug!(
-                provider = catalog.provider_name(),
-                query = %requested,
-                "no catalog match; searching on the transcript alone"
-            );
-            (Target::from_request(request), None)
+            return decide(&alternative);
         }
     }
+    decide(&verdict)
 }
 
-/// Ranks candidates against an already-resolved target.
-pub fn rank_step(
-    candidates: &[Candidate],
-    target: &Target,
-    threshold: f64,
-    resolution: Option<&resolve::Resolution>,
-    requested: &str,
-) -> Choice {
-    rank_step_with(candidates, target, threshold, resolution, requested, false)
-}
-
-/// [`rank_step`], with the operator's answer to `ALLOW_UNVERIFIED_AUTOPLAY`.
-///
-/// Without a catalog match there is no verified running time, so the strongest
-/// signal in [`score`] is gone and what is left cannot identify a song: a
-/// completely unrelated upload title sharing one word with the transcript scored
-/// 19.7 against a bar of 20, and the real answer — *Taylor Swift — Anti-Hero*,
-/// a different song — scored 26.7. Autoplaying that is the "plays the wrong
-/// song with no feedback" complaint, so an unverified best result is offered as
-/// a choice instead. The setting exists for someone who prefers the wrong song
-/// to the extra click, and is logged loudly when it is on.
-fn rank_step_with(
-    candidates: &[Candidate],
-    target: &Target,
-    threshold: f64,
-    resolution: Option<&resolve::Resolution>,
-    requested: &str,
-    allow_unverified_autoplay: bool,
-) -> Choice {
-    let mut choice = pick(candidates, target, threshold);
-    choice.requested = requested.to_string();
-    choice.resolved = resolution.map(|r| r.track.clone());
-    // The catalog could not tell which artist was meant, so the winning video is
-    // a guess among equally good ones and must not be played on its own.
-    if resolution.is_some_and(|r| r.ambiguous) {
-        choice.confident = false;
-        tracing::debug!(
-            query = %target.search_query(),
-            ranked = choice.ranked.len(),
-            "the catalog named several artists for this title; asking instead of guessing"
-        );
-    }
-    if !target.catalogued && choice.confident {
-        if allow_unverified_autoplay {
-            tracing::warn!(
-                query = %target.search_query(),
-                picked = choice.best().map(|b| b.candidate.title()).unwrap_or(""),
-                "ALLOW_UNVERIFIED_AUTOPLAY is on: playing a video no catalog confirmed"
-            );
-        } else {
-            choice.confident = false;
-            tracing::debug!(
-                query = %target.search_query(),
-                ranked = choice.ranked.len(),
-                "no catalog match: offering the closest results rather than playing one"
-            );
-        }
-    }
-    choice
-}
-
-/// Resolves a spoken request, searches YouTube with the corrected names, and
-/// ranks the results.
-///
-/// This is the whole selection path: catalog first, then the video search, then
-/// scoring. Download and playback are untouched.
-pub async fn choose_match(
-    request: &PlayRequest,
+/// Runs the rewrite as a second request and returns its hits.
+async fn try_rewrite(
     catalog: &resolve::Catalog,
+    rewrite: Option<&str>,
+) -> Option<(String, Vec<resolve::Hit>)> {
+    let rewritten = rewrite
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())?;
+    let alternative = PlayRequest {
+        query: rewritten.to_lowercase(),
+        title: None,
+        artist: None,
+        splits: crate::parser::readings(rewritten)
+            .into_iter()
+            .filter_map(|(title, artist)| Some((title?, artist?)))
+            .collect(),
+    };
+    let hits = catalog
+        .hits(&resolve::Target::from_request(&alternative))
+        .await;
+    Some((rewritten.to_string(), hits))
+}
+
+/// Turns a matcher verdict into what the bot will do.
+fn decide(verdict: &matcher::Verdict<'_, resolve::Hit>) -> Resolved {
+    match verdict {
+        matcher::Verdict::NoMatch => Resolved::Unknown {
+            // The caller has the request in hand and echoes its own text back;
+            // carrying it here as well would be a second copy to keep in step.
+            heard: String::new(),
+        },
+        matcher::Verdict::Confident(hit) => Resolved::Track {
+            track: hit.to_track(),
+            durations: hit.durations.clone(),
+        },
+        matcher::Verdict::Ambiguous(options) => {
+            let tracks: Vec<CatalogTrack> = options.iter().map(|hit| hit.to_track()).collect();
+            match options.first() {
+                Some(top)
+                    if crate::config::ambiguous_policy()
+                        == crate::config::AmbiguousPolicy::Popular
+                        && popular_beats_a_rival(&top.to_track(), &tracks) =>
+                {
+                    tracing::info!(
+                        artist = %top.artist,
+                        title = %top.title,
+                        "AMBIGUOUS_POLICY=popular settled a shared title by popularity"
+                    );
+                    Resolved::Track {
+                        track: top.to_track(),
+                        durations: top.durations.clone(),
+                    }
+                }
+                _ => Resolved::Ask(tracks),
+            }
+        }
+    }
+}
+
+/// Finds the upload to play for a catalog track, and ranks the alternatives.
+///
+/// A confident catalog track makes the result confident only if the best upload
+/// clears [`crate::config::DEFAULT_MATCH_THRESHOLD`]. That is deliberately
+/// stricter than the catalog verdict: the catalog proved *which song*, and this
+/// still has to find *which recording of it*. If nothing clears the bar the
+/// caller offers the closest uploads of that song, so the user is choosing
+/// between recordings of the right thing rather than between different songs.
+pub async fn find_video(
+    resolved: &Resolved,
+    requested: &str,
     searcher: &dyn VideoSearch,
     candidate_count: usize,
     threshold: f64,
-    allow_unverified_autoplay: bool,
 ) -> anyhow::Result<Choice> {
-    let requested = request.query.clone();
-    let (target, resolution) = resolve_step(request, catalog).await;
+    let Resolved::Track { track, durations } = resolved else {
+        anyhow::bail!("find_video needs a resolved song, not a question or nothing");
+    };
+    let target = Target::from_track(track, durations.clone(), requested);
     let query = target.search_query();
     let candidates = searcher
         .candidates(&query, candidate_count)
@@ -779,33 +855,65 @@ pub async fn choose_match(
         "YouTube returned no results for '{query}'"
     );
 
-    let choice = rank_step_with(
-        &candidates,
-        &target,
-        threshold,
-        resolution.as_ref(),
-        &requested,
-        allow_unverified_autoplay,
-    );
-    if let Some(best) = choice.best() {
-        tracing::debug!(
-            heard = %request.query,
-            searched = %query,
-            catalogued = target.catalogued,
-            picked = best.candidate.title(),
-            channel = best.candidate.channel(),
-            chosen = %best.parts.explain(),
-            runner_up = choice.ranked.get(1).map(|scored| format!(
-                "{} ({:.1})",
-                scored.candidate.title(),
-                scored.score()
-            )),
-            threshold = choice.threshold,
-            confident = choice.confident,
-            "chose a video"
-        );
-    }
+    let mut choice = pick(&candidates, &target, threshold);
+    choice.requested = requested.to_string();
+    choice.resolved = Some(track.clone());
+    log_choice(&choice, &query);
     Ok(choice)
+}
+
+/// Finds the uploads for a request that no catalog track answers to.
+///
+/// Only ever called when the operator has asked for it. Nothing found this way
+/// is ever played on its own: without a catalog there is no verified running
+/// time, so the scorer has a title similarity and a view count and nothing
+/// else, which is how the wrong song gets played with no feedback.
+pub async fn find_unverified(
+    request: &PlayRequest,
+    searcher: &dyn VideoSearch,
+    candidate_count: usize,
+    threshold: f64,
+) -> anyhow::Result<Choice> {
+    let target = Target::from_request(request);
+    let query = target.search_query();
+    let candidates = searcher
+        .candidates(&query, candidate_count)
+        .await
+        .with_context(|| format!("could not search YouTube for '{query}'"))?;
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "YouTube returned no results for '{query}'"
+    );
+
+    let mut choice = pick(&candidates, &target, threshold);
+    choice.requested = request.query.clone();
+    // Said here rather than left to the caller, because the rule is absolute:
+    // these results were never verified against a catalog and are never
+    // autoplayed, whatever the caller forgets to do about it.
+    choice.confident = false;
+    log_choice(&choice, &query);
+    Ok(choice)
+}
+
+/// The one place a ranked choice is described, so every path logs the same way.
+fn log_choice(choice: &Choice, query: &str) {
+    let Some(best) = choice.best() else {
+        return;
+    };
+    tracing::debug!(
+        searched = %query,
+        picked = best.candidate.title(),
+        channel = best.candidate.channel(),
+        chosen = %best.parts.explain(),
+        runner_up = choice.ranked.get(1).map(|scored| format!(
+            "{} ({:.1})",
+            scored.candidate.title(),
+            scored.score()
+        )),
+        threshold = choice.threshold,
+        confident = choice.confident,
+        "chose a video"
+    );
 }
 
 /// Reads the video id out of a YouTube URL.
@@ -865,21 +973,9 @@ mod tests {
         Target {
             artist: Some("Tame Impala".to_string()),
             title: Some("Dracula".to_string()),
-            duration_secs: Some(205.0),
+            durations: vec![205.0],
             requested: requested.to_string(),
             catalogued: true,
-        }
-    }
-
-    /// A target the catalog could not resolve: no verified running time, and
-    /// so nothing that can identify the recording.
-    fn unresolved(title: &str, artist: &str) -> Target {
-        Target {
-            artist: Some(artist.to_string()),
-            title: Some(title.to_string()),
-            duration_secs: None,
-            requested: format!("{title} {artist}").to_lowercase(),
-            catalogued: false,
         }
     }
 
@@ -893,39 +989,22 @@ mod tests {
             .to_string()
     }
 
-    /// The reported bug: "play look at me" names no artist, and several artists
-    /// have recorded that title, so the catalog cannot say which was meant.
-    ///
-    /// It used to pick one and build the query from that name, which steered
-    /// YouTube straight at a song nobody asked for. The artist must not reach
-    /// the query at all when the catalog called the match ambiguous.
+    /// The catalog's names are what the YouTube query is built from. Getting
+    /// them right is the whole reason the catalog is called at all: a
+    /// misheard "hoolig" would otherwise be searched as those letters and come
+    /// back as whatever matched them.
     #[test]
-    fn an_ambiguous_catalog_match_keeps_the_artist_out_of_the_query() {
+    fn the_query_uses_the_catalog_names() {
         let track = resolve::CatalogTrack {
-            artist: "Tems".to_string(),
-            title: "Look at Me".to_string(),
-            duration_secs: Some(191.0),
+            artist: "BTS".to_string(),
+            title: "Hooligan".to_string(),
+            duration_secs: Some(182.0),
             id: "1".to_string(),
-            provider: "test",
+            provider: "catalog",
+            popularity: None,
         };
-        let resolution = Resolution {
-            track: track.clone(),
-            confidence: 0.7,
-            query: "look at me".to_string(),
-            ambiguous: true,
-        };
-        let target = Target::from_resolution(&resolution);
-        assert_eq!(target.artist, None, "a guessed artist must not be used");
-        assert_eq!(target.search_query(), "Look at Me");
-
-        // A confident match is the opposite case: the canonical name is the
-        // whole point of asking the catalog.
-        let confident = Resolution {
-            ambiguous: false,
-            ..resolution
-        };
-        let target = Target::from_resolution(&confident);
-        assert_eq!(target.search_query(), "Tems Look at Me");
+        let target = Target::from_track(&track, vec![182.0], "hoolig by bts");
+        assert_eq!(target.search_query(), "BTS Hooligan");
     }
 
     /// The bug the whole module exists for, as a live search saw it.
@@ -1218,7 +1297,7 @@ mod tests {
         let target = Target {
             artist: Some("BTS".to_string()),
             title: Some("Hooligan".to_string()),
-            duration_secs: None,
+            durations: Vec::new(),
             requested: "bts hoolig".to_string(),
             catalogued: false,
         };
@@ -1286,7 +1365,7 @@ mod tests {
         let target = Target {
             artist: None,
             title: None,
-            duration_secs: None,
+            durations: Vec::new(),
             requested: "the name of that one song".to_string(),
             catalogued: false,
         };
@@ -1319,7 +1398,7 @@ mod tests {
         let target = Target {
             artist: None,
             title: Some("hooligan".to_string()),
-            duration_secs: None,
+            durations: Vec::new(),
             requested: "hooligan".to_string(),
             catalogued: false,
         };
@@ -1369,32 +1448,26 @@ mod tests {
     /// `matcher::best_window`, which matches the title against a window of the
     /// spoken words and so ignores a leading artist.
     #[test]
-    fn a_misspelled_request_scores_nothing_against_a_title_that_leads_with_the_artist() {
+    fn a_misspelled_request_scores_badly_against_a_title_that_leads_with_the_artist() {
         let target = Target {
             artist: Some("BTS".to_string()),
             title: Some("Hooligan".to_string()),
-            duration_secs: None,
+            durations: Vec::new(),
             requested: "bts hoolig".to_string(),
             catalogued: false,
         };
-        let entries = [
-            candidate(
-                "BTS (방탄소년단) '2.0' Official MV",
-                Some(185_000_000),
-                Some(235.0),
-            ),
-            candidate("BTS 방탄소년단 'Hooligan'", Some(178_000), Some(182.0)),
-        ];
-        let wanted = candidate("BTS 방탄소년단 'Hooligan'", None, None);
-        assert_eq!(
-            score(&wanted, &target).relevance,
-            0.0,
-            "a whole-string comparison cannot see through the leading artist"
+        // Not zero, but far below what the title deserves. The old floor made
+        // any pair sharing one word worth 0.72 of the 25 available, which is
+        // what let a wrong song clear the bar on a single shared word.
+        let relevance =
+            score(&candidate("BTS 방탄소년단 'Hooligan'", None, None), &target).relevance;
+        assert!(
+            relevance < RELEVANCE_MAX * 0.6,
+            "a whole-string comparison cannot see through the leading artist: {relevance}"
         );
-        // Which is why the unresolved bar of 20 no longer buys a confident play
-        // here: it is offered as a choice instead (see
-        // `an_unresolved_request_is_judged_on_a_lower_bar_but_never_autoplayed`).
-        assert!(best_title(&entries, &target).contains("2.0"));
+        // Which is why an unverified result is offered as a choice rather than
+        // played: relevance is all the scorer has left without a catalog (see
+        // `unverified_results_are_never_confident`).
     }
 
     #[test]
@@ -1443,36 +1516,463 @@ mod tests {
         assert_eq!(entry.video_id(), Some("09839DpTctU"));
     }
 
+    // ---- the resolution contract ------------------------------------------
+
+    /// A catalog that hands back whatever the request asked for, without any
+    /// network. Keeps the catalog half of these tests out of the picture.
+    struct Stub {
+        hits: Vec<resolve::CatalogTrack>,
+    }
+
+    #[async_trait::async_trait]
+    impl resolve::CatalogProvider for Stub {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        fn rate(&self) -> resolve::Rate {
+            resolve::Rate::new(20.0, 20.0)
+        }
+        async fn search(
+            &self,
+            _q: &resolve::CatalogQuery,
+        ) -> Result<Vec<resolve::CatalogTrack>, resolve::ProviderError> {
+            Ok(self.hits.clone())
+        }
+    }
+
+    /// A catalog that finds nothing at all.
+    struct Empty;
+
+    #[async_trait::async_trait]
+    impl resolve::CatalogProvider for Empty {
+        fn name(&self) -> &'static str {
+            "empty"
+        }
+        async fn search(
+            &self,
+            _q: &resolve::CatalogQuery,
+        ) -> Result<Vec<resolve::CatalogTrack>, resolve::ProviderError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn catalog_track(artist: &str, title: &str, duration: Option<f64>) -> resolve::CatalogTrack {
+        resolve::CatalogTrack {
+            artist: artist.to_string(),
+            title: title.to_string(),
+            duration_secs: duration,
+            id: "1".to_string(),
+            provider: "stub",
+            popularity: None,
+        }
+    }
+
+    fn stub_catalog(hits: Vec<resolve::CatalogTrack>) -> resolve::Catalog {
+        resolve::Catalog::with_budget(vec![Box::new(Stub { hits })], 0.72, 2_500)
+    }
+
+    /// Records the queries it is asked for and answers with a fixed list.
+    struct FakeSearch {
+        candidates: Vec<Candidate>,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeSearch {
+        fn with(candidates: Vec<Candidate>) -> Self {
+            Self {
+                candidates,
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VideoSearch for FakeSearch {
+        async fn candidates(&self, query: &str, _count: usize) -> anyhow::Result<Vec<Candidate>> {
+            self.seen.lock().unwrap().push(query.to_string());
+            Ok(self.candidates.clone())
+        }
+    }
+
+    fn request(query: &str) -> PlayRequest {
+        PlayRequest {
+            query: query.to_string(),
+            title: None,
+            artist: None,
+            splits: crate::parser::readings(query)
+                .into_iter()
+                .filter_map(|(title, artist)| Some((title?, artist?)))
+                .collect(),
+        }
+    }
+
+    /// The ordinary case: a request that names a song and an artist resolves to
+    /// that song, and the running time comes with it for the upload search.
+    #[tokio::test]
+    async fn a_named_song_resolves_to_one_track() {
+        let catalog = stub_catalog(vec![catalog_track("Tame Impala", "Dracula", Some(205.0))]);
+        let resolved = resolve_request(&request("drakula by tame impala"), &catalog, None).await;
+        let track = resolved.as_track().expect("one song");
+        assert_eq!(track.artist, "Tame Impala");
+        assert_eq!(track.title, "Dracula");
+        assert_eq!(track.duration_secs, Some(205.0));
+    }
+
+    /// Two artists, one title, nothing said to tell them apart: the bot must
+    /// ask rather than pick. This is the README's "Look at Me" case.
+    #[tokio::test]
+    async fn a_title_two_artists_share_is_asked_about() {
+        let catalog = stub_catalog(vec![
+            catalog_track("Ben E. King", "Stand By Me", Some(191.0)),
+            catalog_track("Oasis", "Stand By Me", Some(254.0)),
+        ]);
+        match resolve_request(&request("stand by me"), &catalog, None).await {
+            Resolved::Ask(tracks) => {
+                assert_eq!(tracks.len(), 2);
+                assert!(tracks.iter().any(|t| t.artist == "Ben E. King"));
+                assert!(tracks.iter().any(|t| t.artist == "Oasis"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Everything failing is not an error. It is the same outcome as nothing
+    /// matching, and the caller reports it rather than playing something.
+    #[tokio::test]
+    async fn a_catalog_that_finds_nothing_is_unknown_not_an_error() {
+        let catalog = resolve::Catalog::with_budget(vec![Box::new(Empty)], 0.72, 2_500);
+        assert!(matches!(
+            resolve_request(&request("drakula tame impala"), &catalog, None).await,
+            Resolved::Unknown { .. }
+        ));
+    }
+
+    /// A provider that fails outright must not stop the request. Before the
+    /// fan-out, `?` on a provider error aborted everything: one Deezer quota
+    /// body in a HTTP 200 and the listener heard nothing at all.
+    #[tokio::test]
+    async fn a_failing_provider_leaves_the_request_alone() {
+        struct Broken;
+        #[async_trait::async_trait]
+        impl resolve::CatalogProvider for Broken {
+            fn name(&self) -> &'static str {
+                "broken"
+            }
+            async fn search(
+                &self,
+                _q: &resolve::CatalogQuery,
+            ) -> Result<Vec<resolve::CatalogTrack>, resolve::ProviderError> {
+                Err(resolve::ProviderError::Unavailable)
+            }
+        }
+        let catalog = resolve::Catalog::with_budget(vec![Box::new(Broken)], 0.72, 2_500);
+        let resolved = resolve_request(&request("drakula tame impala"), &catalog, None).await;
+        assert!(matches!(resolved, Resolved::Unknown { .. }));
+    }
+
+    /// The rewriting stage is a second *candidate*, not a replacement: it can
+    /// only ever propose a transcript, which then has to clear the same catalog
+    /// verification as the words that were heard.
+    #[tokio::test]
+    async fn a_rewrite_can_rescue_a_request_the_words_could_not() {
+        // The words as heard match nothing; the rewrite names the song.
+        let catalog = stub_catalog(vec![catalog_track("Tame Impala", "Dracula", Some(205.0))]);
+        let resolved = resolve_request(
+            &request("drakoola tame implala"),
+            &catalog,
+            Some("dracula tame impala"),
+        )
+        .await;
+        assert_eq!(
+            resolved.as_track().map(|t| t.title.as_str()),
+            Some("Dracula")
+        );
+    }
+
+    /// ...and it cannot override the words as heard when those already
+    /// resolved. The heard transcript is the evidence; the rewrite is the
+    /// speculation.
+    #[tokio::test]
+    async fn a_rewrite_does_not_override_words_that_already_resolved() {
+        let catalog = stub_catalog(vec![
+            catalog_track("Tame Impala", "Dracula", Some(205.0)),
+            catalog_track("Queen", "Bohemian Rhapsody", Some(354.0)),
+        ]);
+        let resolved = resolve_request(
+            &request("drakula tame impala"),
+            &catalog,
+            Some("bohemian rhapsody queen"),
+        )
+        .await;
+        assert_eq!(
+            resolved.as_track().map(|t| t.artist.as_str()),
+            Some("Tame Impala"),
+            "the words as heard win when they resolve"
+        );
+    }
+
+    /// A rewrite that is nonsense resolves to nothing and changes nothing.
+    #[tokio::test]
+    async fn a_useless_rewrite_changes_nothing() {
+        let catalog = stub_catalog(vec![catalog_track("Tame Impala", "Dracula", Some(205.0))]);
+        let resolved = resolve_request(
+            &request("drakula tame impala"),
+            &catalog,
+            Some("hello there"),
+        )
+        .await;
+        assert_eq!(
+            resolved.as_track().map(|t| t.title.as_str()),
+            Some("Dracula")
+        );
+    }
+
+    /// ---- the upload search ------------------------------------------------
+    ///
+    /// The catalog names the song; the upload search finds the recording. Both
+    /// have to agree before anything plays.
+    #[tokio::test]
+    async fn a_confident_song_is_searched_for_by_its_canonical_names() {
+        let resolved = Resolved::Track {
+            track: catalog_track("Tame Impala", "Dracula", Some(205.0)),
+            durations: vec![205.0],
+        };
+        let searcher = FakeSearch::with(vec![candidate(
+            "Tame Impala - Dracula",
+            Some(2_777_206),
+            Some(206.0),
+        )]);
+        let choice = find_video(
+            &resolved,
+            "drakula tame impala",
+            &searcher,
+            8,
+            DEFAULT_MATCH_THRESHOLD,
+        )
+        .await
+        .expect("a result");
+        assert_eq!(
+            searcher.seen.lock().unwrap().as_slice(),
+            ["Tame Impala Dracula"]
+        );
+        assert!(choice.confident);
+        assert_eq!(
+            choice.resolved.map(|t| t.label()),
+            Some("Tame Impala — Dracula".to_string())
+        );
+    }
+
+    /// Providers disagree about the length by a few seconds; an upload matching
+    /// any of them is the right recording, so the closest of the set decides.
+    #[tokio::test]
+    async fn an_upload_matching_any_reported_length_is_the_right_recording() {
+        let resolved = Resolved::Track {
+            track: catalog_track("Tame Impala", "Dracula", Some(205.0)),
+            durations: vec![205.0, 209.0, 241.0],
+        };
+        let entries = [
+            candidate(
+                "Tame Impala - Dracula (JENNIE Remix)",
+                Some(50_000_000),
+                Some(241.0),
+            ),
+            candidate("Tame Impala - Dracula", Some(2_777_206), Some(209.0)),
+        ];
+        let searcher = FakeSearch::with(entries.to_vec());
+        let choice = find_video(
+            &resolved,
+            "drakula tame impala",
+            &searcher,
+            8,
+            DEFAULT_MATCH_THRESHOLD,
+        )
+        .await
+        .expect("a result");
+        assert_eq!(
+            choice.best().unwrap().candidate.title(),
+            "Tame Impala - Dracula",
+            "the shorter recording wins; 241 s is the remix"
+        );
+    }
+
+    /// Nothing that clears the bar means the *song* is known but the *upload*
+    /// is not, which is a far narrower question to ask.
+    #[tokio::test]
+    async fn no_convincing_upload_means_offering_recordings_not_songs() {
+        let resolved = Resolved::Track {
+            track: catalog_track("Tame Impala", "Dracula", Some(205.0)),
+            durations: vec![205.0],
+        };
+        let entries = [
+            candidate("a completely unrelated upload", Some(1_000), Some(1200.0)),
+            candidate("another unrelated one", Some(9_000), Some(90.0)),
+        ];
+        let searcher = FakeSearch::with(entries.to_vec());
+        let choice = find_video(
+            &resolved,
+            "drakula tame impala",
+            &searcher,
+            8,
+            DEFAULT_MATCH_THRESHOLD,
+        )
+        .await
+        .expect("a result");
+        assert!(
+            !choice.confident,
+            "the song is known but this upload is not"
+        );
+        assert_eq!(
+            choice.resolved.map(|t| t.label()),
+            Some("Tame Impala — Dracula".to_string()),
+            "the caller still knows which song these uploads are meant to be"
+        );
+    }
+
+    /// Unverified results are never played on their own. There is no catalog
+    /// behind them, so the scorer has a title similarity and a view count and
+    /// nothing else, and `find_unverified` says so rather than trusting the
+    /// caller to remember.
+    #[tokio::test]
+    async fn unverified_results_are_never_confident() {
+        let entries = [on_channel(
+            candidate("BTS 방탄소년단 'Hooligan'", Some(178_000), Some(182.0)),
+            "BANGTANTV",
+        )];
+        let searcher = FakeSearch::with(entries.to_vec());
+        let choice = find_unverified(&request("hoolig bts"), &searcher, 8, 0.0)
+            .await
+            .expect("a result");
+        assert!(!choice.confident);
+        assert!(choice.best().is_some(), "but it is still offered");
+    }
+
+    /// An empty result list is a failure of the search itself, not a ranking
+    /// result, so it stays an error the caller reports.
+    #[tokio::test]
+    async fn no_results_from_the_search_is_an_error() {
+        let resolved = Resolved::Track {
+            track: catalog_track("Tame Impala", "Dracula", Some(205.0)),
+            durations: vec![205.0],
+        };
+        let searcher = FakeSearch::with(Vec::new());
+        let err = find_video(&resolved, "drakula", &searcher, 8, DEFAULT_MATCH_THRESHOLD)
+            .await
+            .expect_err("an empty search is a failure")
+            .to_string();
+        assert!(err.contains("no results"), "unhelpful: {err}");
+    }
+
+    /// A search that fails is reported with the query in the message, because
+    /// the query is what has to be logged when it happens.
+    #[tokio::test]
+    async fn a_failing_search_names_the_query() {
+        struct Broken;
+        #[async_trait::async_trait]
+        impl VideoSearch for Broken {
+            async fn candidates(&self, _query: &str, _n: usize) -> anyhow::Result<Vec<Candidate>> {
+                anyhow::bail!("yt-dlp is not installed")
+            }
+        }
+        let resolved = Resolved::Track {
+            track: catalog_track("BTS", "Hooligan", Some(182.0)),
+            durations: vec![182.0],
+        };
+        let err = find_video(&resolved, "hoolig bts", &Broken, 8, DEFAULT_MATCH_THRESHOLD)
+            .await
+            .expect_err("a failed search is a failure")
+            .to_string();
+        assert_eq!(err, "could not search YouTube for 'BTS Hooligan'");
+    }
+
+    /// `find_video` needs a song. Asking it to find an upload of a *question*
+    /// would silently pick one of the offered songs for the user.
+    #[tokio::test]
+    async fn a_question_cannot_be_turned_into_a_video() {
+        let asked = Resolved::Ask(vec![catalog_track("Oasis", "Stand By Me", Some(254.0))]);
+        let searcher = FakeSearch::with(vec![candidate("Stand By Me", Some(1), Some(254.0))]);
+        let err = find_video(&asked, "stand by me", &searcher, 8, DEFAULT_MATCH_THRESHOLD)
+            .await
+            .expect_err("a question is not a song")
+            .to_string();
+        assert!(err.contains("a resolved song"), "unhelpful: {err}");
+        assert!(
+            searcher.seen.lock().unwrap().is_empty(),
+            "and nothing was searched for"
+        );
+    }
+
+    // ---- the popularity policy -------------------------------------------
+    /// `AMBIGUOUS_POLICY=popular` is a documented escape hatch, and it is
+    /// deliberately timid: the popular one has to be *three times* the other.
+    #[test]
+    fn popularity_only_settles_a_tie_when_it_is_overwhelming() {
+        let big = resolve::CatalogTrack {
+            popularity: Some(900),
+            ..catalog_track("A", "Shared", Some(200.0))
+        };
+        let small = resolve::CatalogTrack {
+            popularity: Some(100),
+            ..catalog_track("B", "Shared", Some(200.0))
+        };
+        assert!(popular_beats_a_rival(&big, std::slice::from_ref(&small)));
+        assert!(!popular_beats_a_rival(&small, std::slice::from_ref(&big)));
+
+        // Barely more than twice as big is not enough.
+        let middling = resolve::CatalogTrack {
+            popularity: Some(400),
+            ..catalog_track("B", "Shared", Some(200.0))
+        };
+        assert!(!popular_beats_a_rival(&big, &[middling]));
+    }
+
+    /// Two recordings by the *same* artist are not a choice between artists,
+    /// and a rival with no popularity gives nothing to compare against.
+    #[test]
+    fn popularity_never_settles_a_question_within_one_artist() {
+        let big = resolve::CatalogTrack {
+            popularity: Some(900),
+            ..catalog_track("A", "Shared", Some(200.0))
+        };
+        let same_artist = resolve::CatalogTrack {
+            popularity: Some(10),
+            ..catalog_track("A", "Shared", Some(240.0))
+        };
+        assert!(!popular_beats_a_rival(&big, &[same_artist]));
+
+        let unknown = catalog_track("B", "Shared", Some(200.0));
+        assert!(!popular_beats_a_rival(&big, &[unknown]));
+        assert!(!popular_beats_a_rival(
+            &catalog_track("A", "Shared", None),
+            &[big]
+        ));
+    }
+
+    // ---- live --------------------------------------------------------------
+
     /// The whole path, against the real catalog and the real YouTube.
     ///
     /// Ignored by default because it needs network access, the yt-dlp binary
-    /// and the Deezer API:
-    /// `cargo test -- --ignored search`.
+    /// and the Deezer API: `cargo test -- --ignored search`.
     #[tokio::test]
     #[ignore = "needs network, yt-dlp and the Deezer API"]
     async fn the_whole_path_picks_the_requested_recording() {
         // Built directly rather than through `Config`, which would also want a
         // Discord token and a voice channel id that a test has no use for.
-        let catalog = resolve::Catalog::new(
-            Box::new(resolve::Deezer::new().expect("HTTP client")),
+        let catalog = resolve::Catalog::with_budget(
+            vec![Box::new(resolve::Deezer::new().expect("HTTP client"))],
             crate::config::DEFAULT_CATALOG_MATCH_THRESHOLD,
+            2_500,
         );
         for (heard, expected) in [
             // Misheard proper nouns, and a video that outranks the real track.
             ("drakula tame impala", "Dracula"),
             ("hoolig bts", "Hooligan"),
         ] {
-            let request = request(heard);
-            let choice = choose_match(
-                &request,
-                &catalog,
-                &YtDlpSearch,
-                8,
-                DEFAULT_MATCH_THRESHOLD,
-                true,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{heard}: {e:#}"));
+            let resolved = resolve_request(&request(heard), &catalog, None).await;
+            assert!(resolved.as_track().is_some(), "{heard}: {resolved:?}");
+            let choice = find_video(&resolved, heard, &YtDlpSearch, 8, DEFAULT_MATCH_THRESHOLD)
+                .await
+                .unwrap_or_else(|e| panic!("{heard}: {e:#}"));
             for scored in &choice.ranked {
                 println!(
                     "{:7.1} {:7.1}s {}",
@@ -1498,452 +1998,28 @@ mod tests {
         }
     }
 
-    /// A request the catalog cannot resolve still plays when a result's title
-    /// genuinely matches, rather than asking about every song.
-    ///
-    /// Passes `true` for `allow_unverified_autoplay` because that is the whole
-    /// point of the test: with the default off, an unresolved request is always
-    /// offered as a choice and never played, which
-    /// `an_unverified_best_result_is_never_played_by_default` covers without a
-    /// network.
-    #[tokio::test]
-    #[ignore = "needs network, yt-dlp and the Deezer API"]
-    async fn an_unresolvable_request_still_plays_a_real_match() {
-        let catalog = resolve::Catalog::new(Box::new(Empty), 0.62);
-        let request = request("hoolig bts");
-        let choice = choose_match(
-            &request,
-            &catalog,
-            &YtDlpSearch,
-            8,
-            DEFAULT_MATCH_THRESHOLD,
-            true,
-        )
-        .await
-        .expect("search should run");
-        assert!(
-            choice.resolved.is_none(),
-            "the catalog was supposed to find nothing"
-        );
-        for scored in &choice.ranked {
-            println!("{:7.1} {}", scored.score(), scored.candidate.title());
-        }
-        let best = choice.best().expect("a result");
-        assert!(choice.confident, "{:?}", best.parts);
-        assert!(
-            best.candidate.title().contains("Hooligan"),
-            "{}",
-            best.candidate.title()
-        );
-    }
-
-    /// The search deadline is pinned, because it is the longest a spoken command
-    /// waits on yt-dlp before the request fails, and the reason the guild's
-    /// request ordering has to be short.
-    #[test]
-    fn the_search_has_a_bounded_budget() {
-        assert_eq!(YOUTUBE_SEARCH_TIMEOUT, std::time::Duration::from_secs(10));
-    }
-
-    /// A provider that finds nothing, for the test above.
-    struct Empty;
-
-    #[async_trait::async_trait]
-    impl resolve::CatalogProvider for Empty {
-        fn name(&self) -> &'static str {
-            "empty"
-        }
-        async fn search(&self, _query: &str) -> anyhow::Result<Vec<resolve::CatalogTrack>> {
-            Ok(Vec::new())
-        }
-    }
-
-    /// A catalog that hands back whatever the request asked for, without any
-    /// network. Keeps the catalog half of the selection path out of these tests.
-    struct Stub {
-        hits: Vec<resolve::CatalogTrack>,
-    }
-
-    #[async_trait::async_trait]
-    impl resolve::CatalogProvider for Stub {
-        fn name(&self) -> &'static str {
-            "stub"
-        }
-        async fn search(&self, _query: &str) -> anyhow::Result<Vec<resolve::CatalogTrack>> {
-            Ok(self.hits.clone())
-        }
-    }
-
-    /// Records the queries it is asked for and answers with a fixed list.
-    struct FakeSearch {
-        candidates: Vec<Candidate>,
-        seen: std::sync::Mutex<Vec<String>>,
-    }
-
-    #[async_trait::async_trait]
-    impl VideoSearch for FakeSearch {
-        async fn candidates(&self, query: &str, _count: usize) -> anyhow::Result<Vec<Candidate>> {
-            self.seen.lock().unwrap().push(query.to_string());
-            Ok(self.candidates.clone())
-        }
-    }
-
-    /// A request with nothing split out of it, as speech-to-text usually
-    /// delivers it.
-    fn request(query: &str) -> PlayRequest {
-        PlayRequest {
-            query: query.to_string(),
-            title: None,
-            artist: None,
-            splits: crate::parser::readings(query)
-                .into_iter()
-                .filter_map(|(title, artist)| Some((title?, artist?)))
-                .collect(),
-        }
-    }
-
-    /// The bug this split exists to prove fixed: a catalog that errors aborts
-    /// nothing. `choose_match` used to propagate the error with `?`, so one
-    /// Deezer quota body arriving in a HTTP 200 meant the listener heard
-    /// nothing at all. The search has to still run.
-    #[tokio::test]
-    async fn a_broken_catalog_still_reaches_the_video_search() {
-        struct Broken;
-        #[async_trait::async_trait]
-        impl resolve::CatalogProvider for Broken {
-            fn name(&self) -> &'static str {
-                "broken"
-            }
-            async fn search(&self, _query: &str) -> anyhow::Result<Vec<resolve::CatalogTrack>> {
-                anyhow::bail!("Deezer could not search: quota spent")
-            }
-        }
-
-        let searcher = FakeSearch {
-            candidates: vec![candidate(
-                "Tame Impala - Dracula",
-                Some(2_777_206),
-                Some(206.0),
-            )],
-            seen: std::sync::Mutex::new(Vec::new()),
-        };
-        let catalog = resolve::Catalog::new(Box::new(Broken), 0.62);
-        let choice = choose_match(
-            &request("drakula tame impala"),
-            &catalog,
-            &searcher,
-            8,
-            DEFAULT_MATCH_THRESHOLD,
-            false,
-        )
-        .await
-        .expect("a dead catalog must not fail the request");
-
-        assert!(
-            choice.resolved.is_none(),
-            "the catalog is supposed to have found nothing"
-        );
-        assert_eq!(
-            searcher.seen.lock().unwrap().as_slice(),
-            ["drakula tame impala"],
-            "the search falls back to the words that were heard"
-        );
-        assert!(choice.best().is_some(), "there is still a result to rank");
-    }
-
-    /// The same path with the recorded Deezer quota body rather than a
-    /// hand-written error, since that is the shape that actually arrives: HTTP
-    /// 200, no status line hint, an `error` object in the payload.
-    #[tokio::test]
-    async fn a_deezer_quota_body_is_not_a_failed_request() {
-        let body: resolve::DeezerSearch =
-            serde_json::from_str(include_str!("../tests/fixtures/deezer_quota.json"))
-                .expect("the recorded quota body decodes");
-        struct Quota {
-            body: std::sync::Mutex<Option<resolve::DeezerSearch>>,
-        }
-        #[async_trait::async_trait]
-        impl resolve::CatalogProvider for Quota {
-            fn name(&self) -> &'static str {
-                "deezer"
-            }
-            async fn search(&self, query: &str) -> anyhow::Result<Vec<resolve::CatalogTrack>> {
-                let body = self
-                    .body
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("each query gets one recorded body");
-                resolve::parse_search(body, query)
-            }
-        }
-
-        let searcher = FakeSearch {
-            candidates: vec![candidate(
-                "Tame Impala - Dracula",
-                Some(2_777_206),
-                Some(206.0),
-            )],
-            seen: std::sync::Mutex::new(Vec::new()),
-        };
-        let catalog = resolve::Catalog::new(
-            Box::new(Quota {
-                body: std::sync::Mutex::new(Some(body)),
-            }),
-            0.62,
-        );
-        choose_match(
-            &request("drakula tame impala"),
-            &catalog,
-            &searcher,
-            8,
-            DEFAULT_MATCH_THRESHOLD,
-            false,
-        )
-        .await
-        .expect("a quota reply is not a failed request");
-        assert_eq!(searcher.seen.lock().unwrap().len(), 1);
-    }
-
-    /// A catalog hit must reach the search as the corrected name, which is the
-    /// whole reason the catalog is called at all.
-    #[tokio::test]
-    async fn a_catalog_hit_aims_the_search_at_the_corrected_names() {
-        let searcher = FakeSearch {
-            candidates: vec![candidate(
-                "BTS 방탄소년단 'Hooligan'",
-                Some(178_000),
-                Some(182.0),
-            )],
-            seen: std::sync::Mutex::new(Vec::new()),
-        };
-        let catalog = resolve::Catalog::new(
-            Box::new(Stub {
-                hits: vec![resolve::CatalogTrack {
-                    artist: "BTS".into(),
-                    title: "Hooligan".into(),
-                    duration_secs: Some(182.0),
-                    id: "1".into(),
-                    provider: "stub",
-                }],
-            }),
-            0.62,
-        );
-        let choice = choose_match(
-            &PlayRequest {
-                splits: vec![("hoolig".to_string(), "bts".to_string())],
-                ..request("hoolig by bts")
-            },
-            &catalog,
-            &searcher,
-            8,
-            DEFAULT_MATCH_THRESHOLD,
-            false,
-        )
-        .await
-        .expect("a catalog hit should reach the search");
-        assert_eq!(searcher.seen.lock().unwrap().as_slice(), ["BTS Hooligan"]);
-        assert_eq!(
-            choice.resolved.map(|t| t.label()),
-            Some("BTS — Hooligan".to_string())
-        );
-    }
-
-    /// The ranking half on its own: the same arithmetic, without a catalog or a
-    /// searcher in the way.
-    #[test]
-    fn ranking_is_the_same_step_whether_or_not_the_catalog_answered() {
-        let entries = [
-            candidate(
-                "Tame Impala - Dracula (Official Video)",
-                Some(75_000_000),
-                Some(234.0),
-            ),
-            candidate("Tame Impala - Dracula", Some(2_777_206), Some(206.0)),
-        ];
-        let target = catalogued("drakula tame impala");
-        let choice = rank_step(
-            &entries,
-            &target,
-            DEFAULT_MATCH_THRESHOLD,
-            None,
-            "drakula tame impala",
-        );
-        assert_eq!(
-            choice.best().unwrap().candidate.title(),
-            "Tame Impala - Dracula"
-        );
-        assert_eq!(choice.requested, "drakula tame impala");
-    }
-
-    /// An ambiguous catalog match still has to reach the ranking step and come
-    /// back unconfident, so the caller asks instead of guessing an artist.
-    #[test]
-    fn an_ambiguous_match_is_never_confident() {
-        let entries = [candidate("Look at Me", Some(1_000), Some(191.0))];
-        let resolution = resolve::Resolution {
-            track: resolve::CatalogTrack {
-                artist: "Tems".into(),
-                title: "Look at Me".into(),
-                duration_secs: Some(191.0),
-                id: "1".into(),
-                provider: "stub",
-            },
-            confidence: 0.7,
-            query: "look at me".into(),
-            ambiguous: true,
-        };
-        let target = Target::from_resolution(&resolution);
-        let choice = rank_step(
-            &entries,
-            &target,
-            DEFAULT_MATCH_THRESHOLD,
-            Some(&resolution),
-            "look at me",
-        );
-        assert!(!choice.confident, "the artist is a guess, so ask");
-        assert_eq!(target.search_query(), "Look at Me");
-    }
-
-    /// An empty result list is a failure of the search itself, not a ranking
-    /// result, so it stays an error the caller reports.
-    #[tokio::test]
-    async fn no_results_from_the_search_is_an_error() {
-        let searcher = FakeSearch {
-            candidates: Vec::new(),
-            seen: std::sync::Mutex::new(Vec::new()),
-        };
-        let catalog = resolve::Catalog::new(Box::new(Empty), 0.62);
-        let err = choose_match(
-            &request("hoolig bts"),
-            &catalog,
-            &searcher,
-            8,
-            DEFAULT_MATCH_THRESHOLD,
-            false,
-        )
-        .await
-        .expect_err("an empty search is a failure")
-        .to_string();
-        assert!(err.contains("no results"), "unhelpful: {err}");
-    }
-
-    /// A search that fails is reported as such, with the query in the message,
-    /// because the query is what has to be logged when it happens.
-    #[tokio::test]
-    async fn a_failing_search_names_the_query() {
-        struct Broken;
-        #[async_trait::async_trait]
-        impl VideoSearch for Broken {
-            async fn candidates(&self, _query: &str, _n: usize) -> anyhow::Result<Vec<Candidate>> {
-                anyhow::bail!("yt-dlp is not installed")
-            }
-        }
-        let catalog = resolve::Catalog::new(Box::new(Empty), 0.62);
-        let err = choose_match(
-            &request("hoolig bts"),
-            &catalog,
-            &Broken,
-            8,
-            DEFAULT_MATCH_THRESHOLD,
-            false,
-        )
-        .await
-        .expect_err("a failed search is a failure")
-        .to_string();
-        assert_eq!(err, "could not search YouTube for 'hoolig bts'");
-    }
-
-    /// An unverified result is never played on its own.
-    ///
-    /// This is the "no catalog, plays almost anything" bug. For the transcript
-    /// "love story taylor swift" with no catalog match, *Taylor Swift — Anti-Hero*
-    /// — a different song — scored 26.7 against the unresolved bar of 20, and a
-    /// completely unrelated title scored 19.7. `relevance` alone is 18.0 for
-    /// any upload title sharing one word, and views add up to 12 more.
-    #[test]
-    fn an_unverified_best_result_is_never_played_by_default() {
-        let target = unresolved("love story", "Taylor Swift");
-        let entries = [on_channel(
-            candidate(
-                "Love Story (Taylor's Version) - Taylor Swift",
-                Some(24_000_000),
-                Some(220.0),
-            ),
-            "TaylorSwiftVEVO",
-        )];
-        let raw = pick(&entries, &target, DEFAULT_MATCH_THRESHOLD);
-        assert!(
-            raw.confident,
-            "the unresolved bar is not what protects the listener: {}",
-            raw.best().map(|b| b.parts.explain()).unwrap_or_default()
-        );
-        let choice = rank_step(
-            &entries,
-            &target,
-            DEFAULT_MATCH_THRESHOLD,
-            None,
-            &target.requested,
-        );
-        assert!(!choice.confident, "but it is offered, not played");
-        assert_eq!(
-            choice.top(1)[0].candidate.title(),
-            "Love Story (Taylor's Version) - Taylor Swift",
-            "it is still the best thing to offer"
-        );
-    }
-
-    /// The escape hatch exists for someone who would rather have the wrong song
-    /// than the extra click, and it restores exactly the old behaviour.
-    #[test]
-    fn allowing_unverified_autoplay_restores_the_old_behaviour() {
-        let target = unresolved("love story", "Taylor Swift");
-        let entries = [on_channel(
-            candidate(
-                "Love Story (Taylor's Version) - Taylor Swift",
-                Some(24_000_000),
-                Some(220.0),
-            ),
-            "TaylorSwiftVEVO",
-        )];
-        let choice = rank_step_with(
-            &entries,
-            &target,
-            DEFAULT_MATCH_THRESHOLD,
-            None,
-            &target.requested,
-            true,
-        );
-        assert!(choice.confident);
-    }
-
-    /// A catalog-backed result is unaffected: the whole point of the catalog is
-    /// that its running time makes the answer verifiable.
-    #[test]
-    fn a_catalogued_result_still_plays_without_asking() {
-        let entries = [candidate(
-            "Tame Impala - Dracula",
-            Some(2_777_206),
-            Some(206.0),
-        )];
-        let choice = rank_step(
-            &entries,
-            &catalogued("drakula tame impala"),
-            DEFAULT_MATCH_THRESHOLD,
-            None,
-            "drakula tame impala",
-        );
-        assert!(choice.confident);
-    }
-
     /// Hits the real YouTube via yt-dlp. Ignored by default because it needs
-    /// network access and the yt-dlp binary:
-    /// `cargo test -- --ignored search`.
+    /// network access and the yt-dlp binary.
     #[tokio::test]
     #[ignore = "needs network and yt-dlp"]
     async fn ranks_a_live_search_against_the_catalog() {
         // The search that motivated all of this, and its results as observed.
-        let target = catalogued("dracula tame impala");
+        let resolved = Resolved::Track {
+            track: resolve::CatalogTrack {
+                artist: "Tame Impala".to_string(),
+                title: "Dracula".to_string(),
+                duration_secs: Some(205.0),
+                id: "1".to_string(),
+                provider: "catalog",
+                popularity: None,
+            },
+            durations: vec![205.0],
+        };
+        let target = Target::from_track(
+            resolved.as_track().expect("a song"),
+            vec![205.0],
+            "dracula tame impala",
+        );
         let entries = youtube_candidates(&target.search_query(), 8).await.unwrap();
         println!("searched: {}", target.search_query());
         let choice = pick(&entries, &target, DEFAULT_MATCH_THRESHOLD);
