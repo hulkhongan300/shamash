@@ -9,11 +9,16 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.104"
+# Object-safe async for the swappable catalog provider trait. Already in the
+# dependency graph via serenity, so this adds no new transitive downloads.
+async-trait = "0.1.92"
 dotenvy = "0.15.7"
-# `reqwest` is not a direct dependency: serenity brings it in for the gateway,
-# and music lookups shell out to yt-dlp rather than making HTTP requests.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# Jaro-Winkler for fuzzy-matching misheard song and artist names. Also already
+# in the graph via darling; direct use costs nothing extra.
+strsim = "0.9.3"
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "cache", "builder"] }
 songbird = { version = "0.6.0", features = ["receive"] }
 # Songbird depends on symphonia with `default-features = false` and exposes no
@@ -47,8 +52,17 @@ tokio = { version = "1.53.1", features = ["full"] }
 transcribe-cpp = "0.2.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+rphonetic = "3"
 # transcribe.cpp is the speech engine. It replaced whisper-rs, which cannot
 # coexist with it: both vendor their own copy of ggml and export the same C
 # symbols, so a binary linking both dies with duplicate-symbol errors. Whisper
 # models still work, as GGUFs, through this engine.
+
+[dev-dependencies]
+# `test-util` gives `#[tokio::test(start_paused = true)]`, which auto-advances
+# the clock when the runtime is idle. The catalog timeout test needs to wait out
+# a two-second budget, and this makes that instant rather than a two-second tax
+# on every `cargo test`. A feature on a dependency already in the graph, not a
+# new one.
+tokio = { version = "1.53.1", features = ["full", "test-util"] }
 

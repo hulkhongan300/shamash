@@ -1,21 +1,23 @@
 //! The now-playing dashboard posted to the text channel.
 //!
-//! An embed with the song title, its thumbnail, and a row of buttons that
-//! pause, skip and stop playback. Discord requires a unique `custom_id` per
-//! button and echoes it back on every press, which is how [`action_from_id`]
-//! recovers the intent.
+//! An embed plus buttons. Discord echoes a button's `custom_id` back on every
+//! press, which is how the press is matched to [`action_from_id`].
 
 use crate::queue::Queued;
 use serenity::builder::{
-    CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, CreateMessage, EditMessage,
+    CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter,
+    CreateMessage, EditMessage,
 };
 use serenity::model::application::ButtonStyle;
 
 /// Custom id prefix for every dashboard button.
 ///
-/// The guild is not encoded, because a press arrives with the guild already
-/// attached and the dashboard is only ever shown for the guild it is in.
+/// The guild is not encoded: a press already arrives with the guild attached.
 const PREFIX: &str = "shamash";
+
+/// Marks a custom id as a "which song did you mean" button, which names a
+/// video rather than an action.
+const PICK_PREFIX: &str = "pick";
 
 /// Buttons, in the order they are shown.
 pub const ACTION_PAUSE: &str = "pause";
@@ -23,32 +25,57 @@ pub const ACTION_RESUME: &str = "resume";
 pub const ACTION_SKIP: &str = "skip";
 pub const ACTION_STOP: &str = "stop";
 
+/// The button on a chooser that means "none of these".
+///
+/// A question with no way to say no is a question that has to be answered. The
+/// listener who asked for something the bot did not offer gets a way to say so
+/// rather than leaving a question on offer forever.
+pub const ACTION_NONE: &str = "none";
+
 /// The longest a title may be before it is trimmed.
 ///
-/// Discord truncates an embed title at 256 characters anyway, and an over-long
-/// one is rejected rather than trimmed, which would lose the whole dashboard.
+/// Discord rejects an over-long embed rather than truncating it, which would
+/// lose the whole dashboard.
 const MAX_TITLE: usize = 256;
 /// The same limit applies to the description and field values.
 const MAX_DESCRIPTION: usize = 4096;
 /// Longest field name Discord accepts.
 const MAX_FIELD_NAME: usize = 256;
+/// Longest footer Discord accepts, which is lower than the description's.
+const MAX_FOOTER: usize = 2048;
 
 /// Builds the custom id for a dashboard button.
 fn button_id(action: &str) -> String {
     format!("{PREFIX}:{action}")
 }
 
-/// Recovers the intent from a pressed button's custom id.
-///
-/// Returns `None` for anything that is not a dashboard button, so an
-/// interaction from some other part of the bot is ignored rather than
-/// misread.
+/// Recovers the intent from a pressed button's custom id, or `None` for
+/// anything that is not a dashboard button.
 pub fn action_from_id(custom_id: &str) -> Option<&str> {
     let action = custom_id.strip_prefix(&format!("{PREFIX}:"))?;
     match action {
-        ACTION_PAUSE | ACTION_RESUME | ACTION_SKIP | ACTION_STOP => Some(action),
+        ACTION_PAUSE | ACTION_RESUME | ACTION_SKIP | ACTION_STOP | ACTION_NONE => Some(action),
         _ => None,
     }
+}
+
+/// Builds the custom id for a "which one did you mean" button.
+///
+/// The key rides in the custom id rather than being looked up, so a press needs
+/// no state. It is opaque: a video's id, or the index of a song in the guild's
+/// current question. Either way what it means is decided by the choice store and
+/// by nothing that arrived from the client.
+pub fn pick_id(key: &str) -> String {
+    format!("{PREFIX}:{PICK_PREFIX}:{key}")
+}
+
+/// Recovers the key from a choice button's custom id. Separate from
+/// [`action_from_id`], which only reports the playback actions.
+pub fn picked_key(custom_id: &str) -> Option<&str> {
+    let action = custom_id.strip_prefix(&format!("{PREFIX}:"))?;
+    let key = action.strip_prefix(&format!("{PICK_PREFIX}:"))?;
+    // An empty key would match nothing and then do nothing.
+    (!key.is_empty()).then_some(key)
 }
 
 /// Shortens `text` to at most `max` characters on a word boundary.
@@ -90,7 +117,7 @@ impl View {
 /// Builds the dashboard for the song playing now.
 ///
 /// `paused` picks between a pause and a resume button, because a paused song
-/// and a playing one need opposite actions.
+/// needs the opposite action.
 pub fn dashboard(song: &Queued, paused: bool, pending: usize) -> View {
     let mut embed = CreateEmbed::new()
         .title(trim(&song.title, MAX_TITLE))
@@ -114,9 +141,8 @@ pub fn dashboard(song: &Queued, paused: bool, pending: usize) -> View {
         embed = embed.description(trim("Paused", MAX_DESCRIPTION));
     }
 
-    // Labels rather than emoji: serenity only builds a reaction type from a
-    // single `char`, which cannot carry the variation selector a button emoji
-    // needs, and a word reads as clearly as a glyph in a row of three.
+    // Labels rather than emoji: serenity builds a reaction type from a single
+    // `char`, which cannot carry the variation selector a button emoji needs.
     let (toggle_label, toggle_action) = if paused {
         ("Resume", ACTION_RESUME)
     } else {
@@ -146,6 +172,144 @@ pub fn idle_dashboard() -> View {
     }
 }
 
+/// The message posted when the bot could not tell which song was meant.
+///
+/// One numbered button per candidate, since a row of titles would overflow the
+/// 80-character label limit. The titles are in the embed above them.
+pub fn choice(
+    requested: &str,
+    resolved: Option<&str>,
+    options: &[ChoiceOption<'_>],
+) -> CreateMessage {
+    let mut embed = CreateEmbed::new()
+        .title("Which one did you mean?")
+        .description(format!(
+            "I heard {}but these look closest.",
+            trim(&markdown_escape(requested), MAX_DESCRIPTION)
+        ))
+        .color(0xfa_a4_1d);
+    if let Some(resolved) = resolved {
+        embed = embed.footer(CreateEmbedFooter::new(format!(
+            "Closest match: {}",
+            trim(resolved, MAX_FOOTER)
+        )));
+    }
+    embed = embed.fields(
+        options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| {
+                (
+                    format!("{}. {}", index + 1, trim(option.title, MAX_FIELD_NAME)),
+                    option.detail(),
+                    false,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let mut buttons: Vec<CreateButton> = options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            CreateButton::new(pick_id(option.key)).label((index + 1).to_string())
+        })
+        .collect();
+    buttons.push(
+        CreateButton::new(action_id(ACTION_NONE))
+            .label("None of these")
+            .style(ButtonStyle::Secondary),
+    );
+
+    CreateMessage::new()
+        .embed(embed)
+        .components(vec![CreateActionRow::Buttons(buttons)])
+}
+
+/// The custom id for a dashboard action button.
+pub fn action_id(action: &str) -> String {
+    format!("{PREFIX}:{action}")
+}
+
+/// The edit that removes the buttons from a question nobody answered.
+///
+/// Used after the chooser expires: the question stays readable, but a press on
+/// a button from ten minutes ago must not start a download.
+pub fn expired(question: &str) -> EditMessage {
+    EditMessage::new()
+        .embed(
+            CreateEmbed::new()
+                .title("Which one did you mean?")
+                .description(trim(question, MAX_DESCRIPTION))
+                .footer(CreateEmbedFooter::new("This question timed out."))
+                .color(0x60_6a_76),
+        )
+        .components(Vec::new())
+}
+
+/// A one-line notice for something that did not work.
+///
+/// Not an embed and not a button row: it is a sentence to read, it has to say
+/// what was heard, and nothing about it is actionable from Discord.
+pub fn notice(text: &str) -> View {
+    View {
+        embed: CreateEmbed::new()
+            .description(trim(&markdown_escape(text), MAX_DESCRIPTION))
+            .color(0xcd_2f_31),
+        buttons: Vec::new(),
+    }
+}
+
+/// One option in the chooser.
+#[derive(Clone, Copy)]
+pub struct ChoiceOption<'a> {
+    pub title: &'a str,
+    /// Who recorded or uploaded it, shown as the second line.
+    pub channel: &'a str,
+    pub duration_secs: Option<f64>,
+    /// The opaque key this button stands for, in the guild's choice store.
+    ///
+    /// Opaque on purpose: a press carries a key, and the store decides what it
+    /// means. Nothing a client sends is treated as a video id to play.
+    pub key: &'a str,
+}
+
+impl ChoiceOption<'_> {
+    /// The line shown under the title: who uploaded it, and how long it runs.
+    fn detail(&self) -> String {
+        let mut detail = String::new();
+        if !self.channel.is_empty() {
+            detail.push_str(&trim(self.channel, MAX_FIELD_NAME));
+        }
+        if let Some(duration) = self.duration_secs {
+            if !detail.is_empty() {
+                detail.push_str(" \u{2022} ");
+            }
+            let total = duration.max(0.0) as u64;
+            detail.push_str(&format!("{}:{:02}", total / 60, total % 60));
+        }
+        if detail.is_empty() {
+            detail.push_str("unknown length");
+        }
+        detail
+    }
+}
+
+/// Escapes the Discord markdown that would otherwise be read out of a title.
+///
+/// `requested` is speech-to-text output echoed back, so it can contain anything
+/// the person said, and unescaped `*` or `_` would reformat the message.
+fn markdown_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '*' | '_' | '~' | '`' | '|' | '>' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +324,145 @@ mod tests {
             url: "https://youtu.be/abc".to_string(),
             video_id: "abc".to_string(),
         }
+    }
+
+    /// The description a view will actually send.
+    ///
+    /// `CreateEmbed` keeps its fields private and offers only setters, so the
+    /// message is read back the way Discord would see it.
+    fn description_of(view: View) -> String {
+        serde_json::to_value(&view.embed)
+            .expect("an embed serialises")
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A notice echoes back what the bot thought it heard, which is
+    /// speech-to-text output, so it can contain anything the person said --
+    /// including markdown that would reformat the message or a stray backtick
+    /// pair that swallows the rest of it.
+    #[test]
+    fn a_notice_escapes_what_it_echoes_back() {
+        let description =
+            description_of(notice("I heard “*stand* by _me_”, but couldn’t match it."));
+        assert!(
+            description.contains("\\*stand\\*") && description.contains("\\_me\\_"),
+            "not escaped: {description}"
+        );
+    }
+
+    /// A notice is not a question, so it must not leave buttons behind that
+    /// would answer a question nobody asked.
+    #[test]
+    fn a_notice_has_no_buttons() {
+        assert!(notice("something went wrong").buttons.is_empty());
+    }
+
+    /// A very long transcript must not be able to push the notice over
+    /// Discord's field limit, which would make the send fail -- and a failed
+    /// send is exactly the silence this is here to remove.
+    #[test]
+    fn a_notice_is_trimmed_to_something_discord_will_send() {
+        let said = "a".repeat(MAX_DESCRIPTION * 2);
+        let description = description_of(notice(&said));
+        assert!(
+            description.chars().count() <= MAX_DESCRIPTION,
+            "{} chars",
+            description.chars().count()
+        );
+    }
+
+    /// A chooser button has to survive the round trip, or a press cannot be
+    /// matched back to the video it stands for.
+    #[test]
+    fn a_choice_button_round_trips_through_its_custom_id() {
+        let id = pick_id("dQw4w9WgXcQ");
+        assert_eq!(picked_key(&id), Some("dQw4w9WgXcQ"));
+    }
+
+    /// A choice button is not a playback action, and `action_from_id` is what
+    /// the button dispatcher trusts, so it must not claim these.
+    #[test]
+    fn a_choice_button_is_not_a_playback_action() {
+        let id = pick_id("dQw4w9WgXcQ");
+        assert_eq!(action_from_id(&id), None);
+        assert_eq!(picked_key("shamash:pause"), None);
+        assert_eq!(picked_key("other:pick:abc"), None);
+        assert_eq!(picked_key("shamash:pick:"), None);
+        // A catalog question's key is an index, and the store is what says what
+        // index 0 means.
+        assert_eq!(picked_key(&pick_id("song:0")), Some("song:0"));
+    }
+
+    /// The custom id has a 100-character limit in Discord, and the video id is
+    /// the only variable part.
+    #[test]
+    fn a_choice_custom_id_fits_discords_limit() {
+        let id = pick_id(&"x".repeat(64));
+        assert!(id.len() <= 100, "too long: {}", id.len());
+    }
+
+    fn option(title: &str, channel: &str, duration: Option<f64>) -> ChoiceOption<'static> {
+        ChoiceOption {
+            title: Box::leak(title.to_string().into_boxed_str()),
+            channel: Box::leak(channel.to_string().into_boxed_str()),
+            duration_secs: duration,
+            key: "vid",
+        }
+    }
+
+    /// The question has to say what was heard and what is being offered,
+    /// numbered to match the buttons.
+    #[test]
+    fn the_chooser_shows_the_request_and_the_options() {
+        let options = [
+            option("Dracula", "Tame Impala", Some(206.0)),
+            option("Dracula (Live)", "Someone", Some(240.0)),
+        ];
+        let message = choice("dracula tame impala", None, &options);
+        let json = serde_json::to_string(&message).expect("choice serialises");
+        assert!(json.contains("dracula tame impala"), "{json}");
+        assert!(json.contains("Dracula"), "{json}");
+        assert!(json.contains("Tame Impala"), "{json}");
+        // Lengths, so two recordings of one title can be told apart.
+        assert!(json.contains("3:26"), "{json}");
+        assert!(json.contains("1"), "{json}");
+    }
+
+    /// The catalog match is the reason the bot is asking: it knows roughly
+    /// what was meant, and showing it makes a wrong guess obvious.
+    #[test]
+    fn the_chooser_names_the_closest_catalog_match() {
+        let message = choice(
+            "dracula",
+            Some("Dracula by Tame Impala"),
+            &[option("Dracula", "Tame Impala", Some(206.0))],
+        );
+        let json = serde_json::to_string(&message).expect("choice serialises");
+        assert!(json.contains("Dracula by Tame Impala"), "{json}");
+    }
+
+    /// The request is speech-to-text output, so it can contain markdown that
+    /// would otherwise reformat the message.
+    #[test]
+    fn a_request_containing_markdown_is_escaped() {
+        // Checked on the escaped text, because the JSON encoding adds a second
+        // layer of backslashes that has nothing to do with Discord's.
+        assert_eq!(
+            markdown_escape("play *everything* _now_"),
+            r"play \*everything\* \_now\_"
+        );
+        let message = choice("play *everything* _now_", None, &[]);
+        let json = serde_json::to_string(&message).expect("choice serialises");
+        assert!(!json.contains("play *everything*"), "unescaped: {json}");
+    }
+
+    /// A candidate with no reported length still has to render as a field.
+    #[test]
+    fn an_option_without_metadata_still_renders() {
+        assert_eq!(option("Dracula", "", None).detail(), "unknown length");
     }
 
     #[test]

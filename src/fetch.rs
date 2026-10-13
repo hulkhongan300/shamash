@@ -23,6 +23,7 @@
 use anyhow::{Context, bail};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::process::Command;
 
 /// Audio formats to try, best first.
@@ -38,11 +39,17 @@ pub const DECODABLE_FORMAT: &str = "bestaudio[acodec^=mp4a][vcodec=none]/\
 /// The selector for the fallback download, which is then transcoded.
 const BEST_FORMAT: &str = "bestaudio";
 
-/// How many downloaded files to keep per guild.
+/// How many downloaded files to keep per guild, beyond the ones still in use.
 ///
 /// Each song is kept while it is playing or queued, and the newest few survive
-/// so a repeated request does not download the same audio twice. Old ones are
-/// pruned, because the songs the listener asks for are never the same twice.
+/// afterwards so a repeated request does not download the same audio twice.
+/// Old ones are pruned, because the songs the listener asks for are never the
+/// same twice.
+///
+/// This is deliberately a *retention* rule, not a cache bound: it used to keep
+/// the newest eight files outright, which is fewer than [`crate::queue::MAX_QUEUE`],
+/// so with nine songs queued a ninth download deleted the audio of songs that
+/// were about to play.
 const KEEP_FILES: usize = 8;
 
 /// Directory holding one guild's downloaded audio.
@@ -68,7 +75,15 @@ async fn remove_file(path: &Path, what: &str) {
 /// `video_id` names the file, so a song already downloaded is reused. The file
 /// is either the stream YouTube publishes in a decodable format, or a WAV
 /// transcoded from the best stream it offers.
-pub async fn fetch(video_id: &str, url: &str, dir: &Path) -> anyhow::Result<PathBuf> {
+///
+/// `in_use` names the songs that are playing or queued. Their audio is never
+/// deleted, whatever the retention rule says.
+pub async fn fetch(
+    video_id: &str,
+    url: &str,
+    dir: &Path,
+    in_use: &[PathBuf],
+) -> anyhow::Result<PathBuf> {
     let stem = file_stem(video_id);
     tokio::fs::create_dir_all(dir)
         .await
@@ -92,7 +107,7 @@ pub async fn fetch(video_id: &str, url: &str, dir: &Path) -> anyhow::Result<Path
         }
     };
 
-    prune(dir, &stem).await;
+    prune(dir, in_use).await;
     Ok(path)
 }
 
@@ -176,13 +191,53 @@ fn download_args(url: &str, dir: &Path, stem: &str, format: &str) -> Vec<OsStrin
     .collect()
 }
 
+/// How long one yt-dlp download may take before it is treated as failed.
+///
+/// A few minutes for a slow connection on a long track, and bounded regardless:
+/// the download runs while a request is in flight, and an unbounded yt-dlp would
+/// leave the request unresolved rather than reporting a failure the listener
+/// could hear about.
+pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long one ffmpeg transcode may take.
+///
+/// Shorter than the download because it is only a CPU-bound local rewrite of a
+/// file that has already arrived, so ninety seconds of that means something is
+/// wrong rather than slow.
+pub const TRANSCODE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Runs `command` to completion under a deadline, killing it if it overruns.
+///
+/// Every subprocess this crate spawns goes through here. Two properties matter
+/// and neither comes from the timeout alone: `kill_on_drop` so a cancelled or
+/// timed-out call does not leave the child running with the guild's ordering
+/// still held, and a named command in the error so a stalled yt-dlp can be told
+/// from a stalled ffmpeg in the log.
+async fn run(
+    mut command: Command,
+    what: &str,
+    budget: Duration,
+) -> anyhow::Result<std::process::Output> {
+    let output = tokio::time::timeout(budget, command.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("{what} took longer than {budget:?}"))??;
+    Ok(output)
+}
+
 /// Downloads one format into `dir` and returns the path yt-dlp wrote.
 async fn download(url: &str, dir: &Path, stem: &str, format: &str) -> anyhow::Result<PathBuf> {
-    let output = Command::new("yt-dlp")
-        .args(download_args(url, dir, stem, format))
-        .output()
-        .await
-        .with_context(|| format!("could not run yt-dlp to fetch {url}"))?;
+    let mut command = Command::new("yt-dlp");
+    command
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .args(download_args(url, dir, stem, format));
+    let output = run(
+        command,
+        &format!("yt-dlp download of {url}"),
+        DOWNLOAD_TIMEOUT,
+    )
+    .await
+    .with_context(|| format!("could not run yt-dlp to fetch {url}"))?;
 
     anyhow::ensure!(
         output.status.success(),
@@ -217,15 +272,22 @@ async fn download(url: &str, dir: &Path, stem: &str, format: &str) -> anyhow::Re
 /// Songbird resamples to its own 48 kHz stereo output, so the sample rate and
 /// channel count are left as they are and only the codec is replaced.
 async fn transcode(source: &Path, dest: &Path) -> anyhow::Result<()> {
-    let output = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    command
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
         .args(["-nostdin", "-loglevel", "error", "-y"])
         .arg("-i")
         .arg(source)
         .args(["-c:a", "pcm_s16le"])
-        .arg(dest)
-        .output()
-        .await
-        .context("could not run ffmpeg; is it installed and on PATH?")?;
+        .arg(dest);
+    let output = run(
+        command,
+        &format!("ffmpeg transcode of {}", source.display()),
+        TRANSCODE_TIMEOUT,
+    )
+    .await
+    .context("could not run ffmpeg; is it installed and on PATH?")?;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -242,11 +304,14 @@ async fn transcode(source: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Deletes all but the newest [`KEEP_FILES`] downloads, keeping `keep`.
+/// Deletes downloads that are neither in use nor among the newest
+/// [`KEEP_FILES`].
 ///
-/// A song being played or waiting in the queue is among the newest, so pruning
-/// by age cannot pull the audio out from under a track that is about to start.
-async fn prune(dir: &Path, keep: &str) {
+/// `in_use` is the audio of every song playing or waiting in the queue. Those
+/// are never deleted, whatever their age: keeping "the newest eight files"
+/// outright is fewer than a full queue, so with nine songs queued a ninth
+/// download used to delete the audio of a song about to play.
+async fn prune(dir: &Path, in_use: &[PathBuf]) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return;
     };
@@ -256,6 +321,12 @@ async fn prune(dir: &Path, keep: &str) {
         if path.extension().is_some_and(|ext| ext == "part") {
             continue;
         }
+        if in_use
+            .iter()
+            .any(|kept| kept.file_name() == path.file_name())
+        {
+            continue;
+        }
         let Ok(modified) = entry.metadata().await.and_then(|meta| meta.modified()) else {
             continue;
         };
@@ -263,9 +334,7 @@ async fn prune(dir: &Path, keep: &str) {
     }
     files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     for (_, path) in files.into_iter().skip(KEEP_FILES) {
-        if path.file_stem().and_then(|s| s.to_str()) != Some(keep) {
-            remove_file(&path, "an old cached download").await;
-        }
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }
 
@@ -412,7 +481,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pruning_keeps_the_newest_downloads_and_the_current_song() {
+    async fn a_subprocess_that_never_finishes_is_killed_at_the_deadline() {
+        // The point of the deadlines: `Player::play` holds the guild's request
+        // ordering while a fetch runs, so a subprocess that hangs forever must
+        // become an error the listener can be told about rather than a request
+        // that never completes.
+        let budget = Duration::from_millis(200);
+        let mut command = Command::new("sh");
+        command.kill_on_drop(true).arg("-c").arg("sleep 30");
+        let started = std::time::Instant::now();
+        let err = run(command, "a sleeping test process", budget)
+            .await
+            .expect_err("the sleep outlives the budget");
+        assert!(
+            err.to_string().contains("longer than"),
+            "the error must say it timed out: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline did not apply"
+        );
+    }
+
+    /// A command that finishes inside the budget is not disturbed by the
+    /// wrapper, or every normal fetch would report a timeout.
+    #[tokio::test]
+    async fn a_subprocess_that_finishes_in_time_is_not_disturbed() {
+        let mut command = Command::new("sh");
+        command.kill_on_drop(true).arg("-c").arg("exit 0");
+        let output = run(command, "a test process", Duration::from_secs(30))
+            .await
+            .expect("a quick process must be allowed through");
+        assert!(output.status.success());
+    }
+
+    /// The durations are the documented contract for how long a spoken command
+    /// can wait on a subprocess, so they are pinned here rather than only in
+    /// the README.
+    #[test]
+    fn every_subprocess_has_a_bounded_budget() {
+        assert_eq!(DOWNLOAD_TIMEOUT, Duration::from_secs(90));
+        assert_eq!(TRANSCODE_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn pruning_keeps_the_newest_downloads() {
         let dir = std::env::temp_dir().join("shamash-prune-test");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.expect("create dir");
@@ -424,33 +537,86 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        prune(&dir, "song0").await;
+        prune(&dir, &[]).await;
 
-        let mut left: Vec<String> = Vec::new();
-        let mut entries = tokio::fs::read_dir(&dir).await.expect("read dir");
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            left.push(entry.file_name().to_string_lossy().into_owned());
-        }
-        assert!(
-            left.contains(&"song0.m4a".to_string()),
-            "the song being played must survive: {left:?}"
-        );
+        let left = names_in(&dir).await;
         assert!(
             left.contains(&"song11.m4a".to_string()),
-            "the newest download must survive: {left:?}"
+            "newest kept: {left:?}"
         );
         // The 12 files written are song0..song11, and the newest 8 are kept, so
-        // the three oldest after song0 are what goes.
-        for pruned in ["song1.m4a", "song2.m4a", "song3.m4a"] {
+        // the four oldest are what goes.
+        for pruned in ["song0.m4a", "song1.m4a", "song2.m4a", "song3.m4a"] {
             assert!(
                 !left.contains(&pruned.to_string()),
                 "{pruned} should have been pruned: {left:?}"
             );
         }
-        assert!(
-            left.len() <= KEEP_FILES + 1,
-            "the cache must stay bounded: {left:?}"
-        );
+        assert_eq!(left.len(), KEEP_FILES, "the cache must stay bounded");
+    }
+
+    /// The bug this exists for: `prune` kept the newest eight files outright,
+    /// which is fewer than `MAX_QUEUE`, so with a dozen songs queued a
+    /// thirteenth download deleted the audio of songs that were about to play.
+    /// Nothing in use is ever deleted, however old it is.
+    #[tokio::test]
+    async fn pruning_never_deletes_a_queued_songs_audio() {
+        let dir = std::env::temp_dir().join("shamash-prune-queued-test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.expect("create dir");
+
+        let queued: Vec<PathBuf> = (0..12)
+            .map(|i| dir.join(format!("queued{i}.m4a")))
+            .collect();
+        for path in &queued {
+            tokio::fs::write(path, b"audio").await.expect("write");
+            // Deliberately old: pruning is by age, and these must survive it.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Then the thirteenth, which is what triggers the prune.
+        tokio::fs::write(dir.join("thirteenth.m4a"), b"audio")
+            .await
+            .expect("write");
+
+        prune(&dir, &queued).await;
+
+        let left = names_in(&dir).await;
+        for path in &queued {
+            assert!(
+                left.contains(&path.file_name().unwrap().to_string_lossy().into_owned()),
+                "{} was queued and must survive: {left:?}",
+                path.display()
+            );
+        }
+        assert_eq!(left.len(), 13, "nothing was in use to prune: {left:?}");
+    }
+
+    /// Once the songs are gone the cache shrinks again, so a queue that was
+    /// full of one-off songs does not keep their audio forever.
+    #[tokio::test]
+    async fn pruning_resumes_once_the_songs_are_no_longer_queued() {
+        let dir = std::env::temp_dir().join("shamash-prune-after-test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.expect("create dir");
+        for i in 0..(KEEP_FILES + 4) {
+            tokio::fs::write(dir.join(format!("song{i}.m4a")), b"audio")
+                .await
+                .expect("write");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        prune(&dir, &[]).await;
+        assert_eq!(names_in(&dir).await.len(), KEEP_FILES);
+    }
+
+    /// The file names left in a directory, for readable assertions.
+    async fn names_in(dir: &Path) -> Vec<String> {
+        let mut left: Vec<String> = Vec::new();
+        let mut entries = tokio::fs::read_dir(dir).await.expect("read dir");
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            left.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        left.sort();
+        left
     }
 
     /// Checks the fallback used when YouTube offers nothing but Opus: the
@@ -492,12 +658,17 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.expect("create dir");
 
-        let first = fetch("wJGcwEv7838", "https://youtu.be/wJGcwEv7838", &dir)
+        let first = fetch("wJGcwEv7838", "https://youtu.be/wJGcwEv7838", &dir, &[])
             .await
             .expect("fetch the first");
-        let second = fetch("aqz-KE-bpKQ", "https://youtu.be/aqz-KE-bpKQ", &dir)
-            .await
-            .expect("fetch the second");
+        let second = fetch(
+            "aqz-KE-bpKQ",
+            "https://youtu.be/aqz-KE-bpKQ",
+            &dir,
+            std::slice::from_ref(&first),
+        )
+        .await
+        .expect("fetch the second");
 
         assert_ne!(first, second, "each song needs its own file");
         assert_ne!(
@@ -520,7 +691,7 @@ mod tests {
         use symphonia::default::{get_codecs, get_probe};
 
         let dir = std::env::temp_dir().join("shamash-fetch-test");
-        let path = fetch("wJGcwEv7838", "https://youtu.be/wJGcwEv7838", &dir)
+        let path = fetch("wJGcwEv7838", "https://youtu.be/wJGcwEv7838", &dir, &[])
             .await
             .expect("fetch must succeed");
         let bytes = std::fs::read(&path).expect("read");

@@ -9,6 +9,13 @@ pub struct PlayRequest {
     pub title: Option<String>,
     /// The detected artist, when the transcript had "play <title> by <artist>".
     pub artist: Option<String>,
+    /// Every plausible reading of the request as "<title> by <artist>".
+    ///
+    /// `title`/`artist` are the last-" by "-split guess, which is wrong whenever
+    /// "by" belongs to the title. This is the full set, so the resolver can try
+    /// all of them instead of committing to the guess. Empty when the phrase
+    /// has no " by " in it.
+    pub splits: Vec<(String, String)>,
 }
 
 /// Wake words shorter than this must match exactly, so short words like "bot"
@@ -100,7 +107,7 @@ impl std::fmt::Display for ParseMiss {
 }
 
 /// Turns transcripts into [`PlayRequest`]s using a wake word + "play" grammar.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CommandParser {
     wake_words: HashSet<String>,
 }
@@ -147,6 +154,16 @@ impl CommandParser {
     /// Like [`Self::parse`], but reports why the transcript was rejected.
     pub fn parse_with_reason(&self, transcript: &str) -> Result<PlayRequest, ParseMiss> {
         let text = normalize(transcript);
+        let tail = self.command_tail(&text)?;
+        build_request(&tail).ok_or(ParseMiss::EmptyRequest)
+    }
+
+    /// The words after the wake word and "play", if the grammar matched.
+    ///
+    /// Split out because two callers need the same index arithmetic: the parser
+    /// itself, and [`Self::strip_command`], which the transcript-rewriting stage
+    /// uses when a model returns a whole sentence instead of just the request.
+    fn command_tail(&self, text: &str) -> Result<String, ParseMiss> {
         let words: Vec<&str> = text.split(' ').collect();
 
         let wake_idx = words
@@ -163,8 +180,36 @@ impl CommandParser {
                 .ok_or(ParseMiss::NoPlayVerb)?
         };
 
-        let rest = words[play_at + 1..].join(" ");
-        build_request(&rest).ok_or(ParseMiss::EmptyRequest)
+        Ok(words[play_at + 1..].join(" "))
+    }
+
+    /// The request alone, with any wake word and "play" removed.
+    ///
+    /// A rewriting model asked to tidy a transcript tends to keep the wake word,
+    /// and the search would then be aimed at "bot dracula" rather than
+    /// "Dracula". Two passes, because what comes back from a model may be any of
+    /// three shapes: the command as it was spoken with the wake word somewhere in
+    /// it, the request on its own, or the wake word with no "play". The grammar
+    /// handles the first and the tolerant pass the other two, so all three come
+    /// back as the same request. `None` only when there is nothing to search for.
+    pub fn strip_command(&self, transcript: &str) -> Option<String> {
+        let text = normalize(transcript);
+
+        if let Ok(Some(request)) = self.command_tail(&text).map(|tail| build_request(&tail)) {
+            return Some(request.query);
+        }
+
+        let mut words: Vec<&str> = text.split(' ').collect();
+        if words.len() == 1 && words[0].is_empty() {
+            return None;
+        }
+        if self.is_wake_word(words[0]) {
+            words.remove(0);
+        }
+        if words.first() == Some(&PLAY_VERB) {
+            words.remove(0);
+        }
+        build_request(&words.join(" ")).map(|request| request.query)
     }
 
     /// Builds a request from text spoken after a "play" that was already heard.
@@ -185,7 +230,17 @@ fn build_request(rest: &str) -> Option<PlayRequest> {
         return None;
     }
 
-    let (title, artist) = split_artist(rest);
+    let splits = splits(rest);
+    // The last " by " is the best guess and drives the query, because it is
+    // right whenever the speaker meant "<title> by <artist>" and a multi-word
+    // artist cannot be split any other way. It is only a guess: "stand by me"
+    // splits into title "stand" and artist "me", and the resolver is given
+    // every plausible split so it does not have to commit to that one.
+    let best = splits.first().cloned();
+    let (title, artist) = match best {
+        Some((title, artist)) => (Some(title.to_string()), Some(artist.to_string())),
+        None => (None, None),
+    };
     let query = match (&title, &artist) {
         (Some(title), Some(artist)) => format!("{title} by {artist}"),
         _ => rest.to_string(),
@@ -195,7 +250,63 @@ fn build_request(rest: &str) -> Option<PlayRequest> {
         query,
         title,
         artist,
+        splits,
     })
+}
+
+/// Every plausible reading of a phrase as "<title> by <artist>", best first.
+///
+/// "by" is part of far more song titles than it is a separator: *Stand By Me*,
+/// *Take Me By The Hand*, *By The Way*, *Hey Jude By The Beatles*. Committing
+/// to the last " by " turns "play stand by me" into a search for "stand" by an
+/// artist called "me", which matches nothing and then plays whatever scores
+/// best. So every position of " by " is offered, plus the reading where the
+/// whole phrase is the title and no artist was named at all.
+///
+/// Ordered so the last " by " comes first, because that is the reading the
+/// query and the backwards-compatible `title`/`artist` fields use.
+///
+/// Returns an empty vec when the phrase has no " by " in it: the whole phrase
+/// is then the only reading, and there is nothing to choose between.
+fn splits(phrase: &str) -> Vec<(String, String)> {
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+
+    let at_by: Vec<usize> = words
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| **w == "by")
+        .map(|(i, _)| i)
+        .collect();
+    for i in at_by.into_iter().rev() {
+        let title = words[..i].join(" ");
+        let artist = words[i + 1..].join(" ");
+        if title.is_empty() || artist.is_empty() {
+            continue;
+        }
+        out.push((title, artist));
+    }
+    out
+}
+
+/// The readings of a phrase, including the whole phrase as its own title.
+///
+/// [`splits`] only answers "<title> by <artist>"; most requests name no artist
+/// at all, and the whole phrase is then the title. Returned as a single
+/// candidate rather than an `Option` so the resolver can treat every reading
+/// the same way.
+pub fn readings(phrase: &str) -> Vec<(Option<String>, Option<String>)> {
+    let mut out: Vec<(Option<String>, Option<String>)> = Vec::new();
+    for reading in splits(phrase)
+        .into_iter()
+        .map(|(title, artist)| (Some(title), Some(artist)))
+        .chain([(None, Some(phrase.to_string()))])
+    {
+        if !out.contains(&reading) {
+            out.push(reading);
+        }
+    }
+    out
 }
 
 /// Lowercases and strips punctuation, collapsing whitespace.
@@ -206,19 +317,6 @@ fn normalize(text: &str) -> String {
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
         .collect();
     filtered.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn split_artist(rest: &str) -> (Option<String>, Option<String>) {
-    let Some(idx) = rest.rfind(" by ") else {
-        return (None, None);
-    };
-    let (title, artist) = rest.split_at(idx);
-    let title = title.trim();
-    let artist = artist.trim_start_matches(" by ").trim();
-    if title.is_empty() || artist.is_empty() {
-        return (None, None);
-    }
-    (Some(title.to_string()), Some(artist.to_string()))
 }
 
 #[cfg(test)]
@@ -339,6 +437,120 @@ mod tests {
             .unwrap();
         assert_eq!(req.title.as_deref(), Some("us and them"));
         assert_eq!(req.artist.as_deref(), Some("pink floyd"));
+    }
+
+    /// "by" belongs to more song titles than it separates artists, so the last
+    /// " by " is only ever a guess. Every position is kept, best first, so the
+    /// resolver can try them all.
+    #[test]
+    fn every_position_of_by_is_kept_as_a_reading() {
+        for (heard, expected) in [
+            ("stand by me", vec![("stand".to_string(), "me".to_string())]),
+            (
+                "take me by the hand",
+                vec![("take me".to_string(), "the hand".to_string())],
+            ),
+            (
+                "stand by me by ben e king",
+                vec![
+                    ("stand by me".to_string(), "ben e king".to_string()),
+                    ("stand".to_string(), "me by ben e king".to_string()),
+                ],
+            ),
+        ] {
+            let req = parser()
+                .parse(&format!("shamash play {heard}"))
+                .unwrap_or_else(|| panic!("{heard} should parse"));
+            assert_eq!(req.splits, expected, "for {heard:?}");
+        }
+    }
+
+    /// The order is what the backwards-compatible `title`/`artist` fields use,
+    /// and it has to stay last-" by "-first: "us and them by pink floyd" can
+    /// only mean a two-word artist.
+    #[test]
+    fn the_last_by_stays_the_primary_guess() {
+        let req = parser()
+            .parse("shamash play stand by me by ben e king")
+            .unwrap();
+        assert_eq!(req.title.as_deref(), Some("stand by me"));
+        assert_eq!(req.artist.as_deref(), Some("ben e king"));
+        assert_eq!(req.query, "stand by me by ben e king");
+    }
+
+    /// A phrase with no " by " at all has exactly one reading, so the guess is
+    /// no guess: nothing is split, and the whole phrase is the title.
+    #[test]
+    fn a_request_with_no_by_has_no_splits() {
+        let req = parser().parse("shamash play despacito").unwrap();
+        assert!(req.splits.is_empty());
+        assert_eq!(req.title, None);
+        assert_eq!(req.artist, None);
+        assert_eq!(req.query, "despacito");
+
+        let readings = readings("despacito");
+        assert_eq!(readings, vec![(None, Some("despacito".to_string()))]);
+    }
+
+    /// "by" at either end is not a separator at all: there is nothing on one
+    /// side of it.
+    #[test]
+    fn a_by_with_nothing_on_one_side_is_not_a_split() {
+        for heard in ["by the way by daft punk", "hey jude by"] {
+            let req = parser()
+                .parse(&format!("shamash play {heard}"))
+                .unwrap_or_else(|| panic!("{heard} should parse"));
+            assert!(
+                req.splits
+                    .iter()
+                    .all(|(t, a)| !t.is_empty() && !a.is_empty()),
+                "{heard}: {:?}",
+                req.splits
+            );
+        }
+        // "by the way by daft punk" has a leading "by" that produces no split,
+        // so only the one reading survives.
+        let req = parser()
+            .parse("shamash play by the way by daft punk")
+            .unwrap();
+        assert_eq!(
+            req.splits,
+            vec![("by the way".to_string(), "daft punk".to_string())]
+        );
+        // A trailing "by" produces no split either.
+        let req = parser().parse("shamash play hey jude by").unwrap();
+        assert!(req.splits.is_empty());
+    }
+
+    /// "By the Way" is a title that begins with "by" and nothing else, so the
+    /// reading where the whole phrase is the title has to be available even
+    /// when a " by " split exists.
+    #[test]
+    fn the_whole_phrase_is_always_one_of_the_readings() {
+        let readings = readings("by the way by daft punk");
+        assert_eq!(
+            readings.last(),
+            Some(&(None, Some("by the way by daft punk".into())))
+        );
+        assert!(
+            readings.contains(&(Some("by the way".into()), Some("daft punk".into()))),
+            "{readings:?}"
+        );
+    }
+
+    /// The readings are deduplicated in order, so a phrase like "stand by me"
+    /// -- where splitting at either "by" gives the same pair -- does not send
+    /// the resolver the same query twice.
+    #[test]
+    fn duplicate_readings_are_collapsed() {
+        let readings = readings("stand by me");
+        assert_eq!(readings.len(), 2, "{readings:?}");
+        assert_eq!(
+            readings[0],
+            (Some("stand".into()), Some("me".into())),
+            "{readings:?}"
+        );
+        assert_eq!(readings[1], (None, Some("stand by me".into())));
     }
 
     #[test]
@@ -561,6 +773,62 @@ mod tests {
             parser.parse_with_reason("chameleon play despacito").err(),
             Some(ParseMiss::NoWakeWord)
         );
+    }
+
+    #[test]
+    fn a_paused_request_without_a_wake_word_is_still_a_request() {
+        assert_eq!(
+            parser().strip_command("dracula by tame impala").as_deref(),
+            Some("dracula by tame impala")
+        );
+    }
+
+    /// The rewriting stage is handed whole sentences, wake word included, so the
+    /// grammar has to be reusable on what comes back from a model.
+    #[test]
+    fn stripping_the_command_leaves_the_request() {
+        let parser = parser();
+        assert_eq!(
+            parser
+                .strip_command("Shamash, play Dracula by Tame Impala!")
+                .as_deref(),
+            Some("dracula by tame impala")
+        );
+        assert_eq!(
+            parser.strip_command("play lofi hip hop").as_deref(),
+            Some("lofi hip hop")
+        );
+        // A model may drop "play", or keep the wake word without it.
+        assert_eq!(
+            parser
+                .strip_command("bot dracula by tame impala")
+                .as_deref(),
+            Some("dracula by tame impala")
+        );
+        assert_eq!(
+            parser.strip_command("shamash play").as_deref(),
+            None,
+            "nothing left to search for"
+        );
+        assert_eq!(parser.strip_command("   "), None);
+    }
+
+    /// Whatever the grammar accepts, stripping and parsing must agree on.
+    #[test]
+    fn stripping_agrees_with_parsing() {
+        let parser = parser_with_play_wake_word();
+        for transcript in [
+            "bot play dracula by tame impala",
+            "play despacito",
+            "shamash play us and them by pink floyd",
+            "play",
+        ] {
+            assert_eq!(
+                parser.strip_command(transcript),
+                parser.parse(transcript).map(|r| r.query),
+                "for {transcript:?}"
+            );
+        }
     }
 
     #[test]

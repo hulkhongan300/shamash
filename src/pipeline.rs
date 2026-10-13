@@ -1,10 +1,13 @@
 use crate::config::Config;
+use crate::llm;
 use crate::parser::{CommandParser, ParseMiss, PlayRequest};
-use crate::player::Player;
-use crate::transcriber::Transcriber;
+use crate::player::{Player, Tone};
+use crate::state::HttpClientKey;
+use crate::wake::{BigModels, Heard, WakeHit};
 use serenity::model::id::GuildId;
 use serenity::prelude::Context as SerenityContext;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// How long a "bot play" with no title keeps waiting for one.
@@ -47,20 +50,11 @@ impl PendingQuery {
     }
 }
 
-/// Transcribes an utterance and turns it into a play request, if the grammar
-/// matched. `None` means the transcript contained no play command.
-pub fn transcribe_and_parse(
-    transcriber: &dyn Transcriber,
-    parser: &CommandParser,
-    samples: &[f32],
-) -> anyhow::Result<Option<PlayRequest>> {
-    let transcript = transcriber.transcribe(samples)?;
-    Ok(parser.parse(&transcript))
-}
-
-/// The full speech-to-music pipeline: transcribe, parse, and play.
+/// Acts on what [`crate::wake`] hears: acknowledge the wake word, bring the
+/// larger model up, then turn the captured request into a song.
 pub struct ListenerPipeline {
-    pub transcriber: Arc<dyn Transcriber>,
+    /// The larger model, loaded on the first wake word rather than at startup.
+    pub models: Arc<BigModels>,
     pub parser: CommandParser,
     pub player: Arc<Player>,
     /// Utterances that produced no words, reported once there is something
@@ -72,13 +66,9 @@ pub struct ListenerPipeline {
 }
 
 impl ListenerPipeline {
-    pub fn new(
-        transcriber: Arc<dyn Transcriber>,
-        parser: CommandParser,
-        player: Arc<Player>,
-    ) -> Self {
+    pub fn new(models: Arc<BigModels>, parser: CommandParser, player: Arc<Player>) -> Self {
         Self {
-            transcriber,
+            models,
             parser,
             player,
             muted_utterances: std::sync::atomic::AtomicUsize::new(0),
@@ -86,70 +76,227 @@ impl ListenerPipeline {
         }
     }
 
-    /// Transcribes `utterance` off the blocking pool, then plays any request
-    /// that matches the grammar. Failures are logged, never fatal.
-    pub async fn handle_utterance(
+    /// Dispatches one event from the gate.
+    ///
+    /// Awaited rather than spawned by the caller, so the request can never be
+    /// acted on before the model for its wake word is up.
+    pub async fn handle(
         &self,
         ctx: &SerenityContext,
         config: &Config,
         guild_id: GuildId,
-        utterance: Vec<f32>,
+        heard: Heard,
     ) {
-        let transcriber = self.transcriber.clone();
-        let transcript =
-            match tokio::task::spawn_blocking(move || transcriber.transcribe(&utterance)).await {
-                Ok(Ok(transcript)) => transcript,
-                Ok(Err(e)) => {
-                    println!("transcription failed: {e:#}");
-                    return;
-                }
-                Err(e) => {
-                    println!("transcription task failed: {e}");
-                    return;
-                }
-            };
+        match heard {
+            Heard::Wake(hit) => self.handle_wake(guild_id, hit).await,
+            Heard::Command(audio) => self.handle_request(ctx, config, guild_id, audio).await,
+        }
+    }
+
+    /// The first tone: the wake word was heard.
+    ///
+    /// This is the only acknowledgement a speaker gets for being heard, and it
+    /// comes before any waiting, so it cannot be mistaken for the answer.
+    async fn handle_wake(&self, guild_id: GuildId, hit: WakeHit) {
+        if let Err(e) = self.player.acknowledge(guild_id, Tone::Wake).await {
+            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "wake tone failed");
+        }
+
+        let models = Arc::clone(&self.models);
+        // The load reads the whole model off disk, so it cannot run on the
+        // reactor thread the rest of the bot is on.
+        let loaded = tokio::task::spawn_blocking(move || models.get_or_load()).await;
+        let transcriber = match loaded {
+            Ok(Ok(transcriber)) => transcriber,
+            Ok(Err(e)) => {
+                // Nothing can be answered now, so the gate is not told the model
+                // is ready: it closes the capture on its length bound instead of
+                // transcribing with a model that is not there.
+                tracing::error!(guild_id = %guild_id, error = %format!("{e:#}"), "could not load the larger model");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(guild_id = %guild_id, error = %format!("{e:#}"), "model load task failed");
+                return;
+            }
+        };
+        tracing::info!(
+            guild_id = %guild_id,
+            sample_rate = transcriber.sample_rate(),
+            "the larger model is ready; listening for a request"
+        );
+
+        if let Err(e) = self.player.acknowledge(guild_id, Tone::Ready).await {
+            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "ready tone failed");
+        }
+        // Set only now, so the silence before the speaker starts talking cannot
+        // close the capture before anything has been said.
+        hit.ready.store(true, Ordering::Relaxed);
+    }
+
+    /// The second tone has played and a request was captured: transcribe it,
+    /// clean it up, and play whatever that resolves to.
+    async fn handle_request(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        audio: Vec<f32>,
+    ) {
+        if audio.is_empty() {
+            tracing::debug!(guild_id = %guild_id, "ready for a request, but nothing was said");
+            return;
+        }
+
+        let models = Arc::clone(&self.models);
+        // Already loaded by the wake word, so this is a lookup in all but the
+        // case where the first load failed.
+        let loaded = tokio::task::spawn_blocking(move || models.get_or_load()).await;
+        let transcriber = match loaded {
+            Ok(Ok(transcriber)) => transcriber,
+            Ok(Err(e)) => {
+                tracing::error!(guild_id = %guild_id, error = %format!("{e:#}"), "no larger model available");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(guild_id = %guild_id, error = %format!("{e:#}"), "model lookup task failed");
+                return;
+            }
+        };
+
+        let inferred = tokio::task::spawn_blocking(move || transcriber.transcribe(&audio)).await;
+        let transcript = match inferred {
+            Ok(Ok(transcript)) => transcript,
+            Ok(Err(e)) => {
+                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "transcription failed");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(guild_id = %guild_id, error = %format!("{e:#}"), "transcription task failed");
+                return;
+            }
+        };
 
         if transcript.trim().is_empty() {
             self.muted_utterances
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            println!(
-                "[{guild_id}] voice detected but no words recognised (too quiet, or too short?)"
-            );
+            tracing::debug!(guild_id = %guild_id, "heard a request but no words in it (too quiet, or too short?)");
             return;
         }
         let skipped = self
             .muted_utterances
             .swap(0, std::sync::atomic::Ordering::Relaxed);
         if skipped > 0 {
-            println!("[{guild_id}] heard: {transcript:?} (skipped {skipped} unintelligible)");
+            tracing::info!(
+                guild_id = %guild_id,
+                transcript = %transcript,
+                skipped = skipped,
+                "request heard"
+            );
         } else {
-            println!("[{guild_id}] heard: {transcript:?}");
+            tracing::info!(guild_id = %guild_id, transcript = %transcript, "request heard");
         }
 
-        let request = match self.parser.parse_with_reason(&transcript) {
+        let (Some(request), rewritten) = self.request_for(ctx, config, guild_id, &transcript).await
+        else {
+            return;
+        };
+        tracing::info!(guild_id = %guild_id, request = %request.query, "playing a request");
+        if let Err(e) = self
+            .player
+            .play(ctx, config, guild_id, &request, rewritten.as_deref())
+            .await
+        {
+            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "playback failed");
+        }
+    }
+
+    /// Turns a transcript into a request, cleaned by the rewriting stage when
+    /// one is configured.
+    ///
+    /// Every failure of that stage falls back to the words that were actually
+    /// heard, which is the whole pre-rewriting behaviour: a model that is down,
+    /// slow or unsure must not be the reason a request goes unplayed.
+    async fn request_for(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        transcript: &str,
+    ) -> (Option<PlayRequest>, Option<String>) {
+        // The rewrite is a *second candidate transcript*, not a replacement.
+        // Both are resolved and the better verdict wins, so a rewriting model
+        // can rescue a request the catalog cannot read, while still never being
+        // able to talk the bot into a song the catalog did not find.
+        let rewritten = self
+            .rewrite(ctx, config, guild_id, transcript)
+            .await
+            // The reply may still carry a wake word, which is why the grammar is
+            // applied to it rather than trusting it to have stripped one.
+            .and_then(|text| self.parser.strip_command(&text));
+        if let Some(rewritten) = &rewritten {
+            tracing::info!(
+                guild_id = %guild_id,
+                rewrite = %rewritten,
+                "the transcript rewrite is a second candidate for this request"
+            );
+        }
+        (self.parse_heard(guild_id, transcript), rewritten)
+    }
+
+    /// The rewriting stage, or `None` when it is off or produced nothing better.
+    async fn rewrite(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        transcript: &str,
+    ) -> Option<String> {
+        let endpoint = config.llm_endpoint.as_deref()?;
+        let http = {
+            let data = ctx.data.read().await;
+            data.get::<HttpClientKey>().cloned()
+        }?;
+        match llm::rewrite(&http, endpoint, &config.llm_model, transcript).await {
+            Ok(Some(rewritten)) => Some(rewritten),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "the transcript rewrite failed");
+                None
+            }
+        }
+    }
+
+    /// The grammar, as applied to what was heard.
+    ///
+    /// Also keeps the split-command case: a "bot play" with a pause before the
+    /// title is two captures, and the second is only recognisable because of
+    /// the first.
+    fn parse_heard(&self, guild_id: GuildId, transcript: &str) -> Option<PlayRequest> {
+        match self.parser.parse_with_reason(transcript) {
             Ok(request) => {
                 self.awaiting_query.clear();
-                request
+                Some(request)
             }
             Err(ParseMiss::EmptyRequest) => {
                 self.awaiting_query.expect();
-                println!("[{guild_id}] heard the wake word and \"play\", waiting for a title");
-                return;
+                tracing::info!(guild_id = %guild_id, "heard the wake word and \"play\"; waiting for a title");
+                None
             }
             Err(miss) => {
-                // A pause inside the command splits it in two, so the title can
-                // arrive without any wake word of its own.
                 let completed = self
                     .awaiting_query
                     .take()
-                    .then(|| self.parser.request_from_query(&transcript))
+                    .then(|| self.parser.request_from_query(transcript))
                     .flatten();
                 match completed {
                     Some(request) => {
-                        println!(
-                            "[{guild_id}] taking {transcript:?} as the title for that command"
+                        tracing::info!(
+                            guild_id = %guild_id,
+                            transcript = %transcript,
+                            "taking this as the title for the waiting command"
                         );
-                        request
+                        Some(request)
                     }
                     None => {
                         let wake_words = self
@@ -159,24 +306,16 @@ impl ListenerPipeline {
                             .cloned()
                             .collect::<Vec<_>>()
                             .join(", ");
-                        println!(
-                            "[{guild_id}] not a play command: {miss} (wake words: {wake_words})"
+                        tracing::debug!(
+                            guild_id = %guild_id,
+                            reason = %miss,
+                            wake_words = %wake_words,
+                            "not a play command"
                         );
-                        return;
+                        None
                     }
                 }
             }
-        };
-
-        println!(
-            "[{guild_id}] wake command activated: {transcript:?} -> play {}",
-            request.query
-        );
-        if let Err(e) = self.player.acknowledge(guild_id).await {
-            println!("[{guild_id}] acknowledgement tone failed: {e:#}");
-        }
-        if let Err(e) = self.player.play(ctx, config, guild_id, &request).await {
-            println!("[{guild_id}] playback failed: {e:#}");
         }
     }
 }
@@ -184,53 +323,6 @@ impl ListenerPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct TestTranscriber;
-
-    impl Transcriber for TestTranscriber {
-        fn sample_rate(&self) -> u32 {
-            16_000
-        }
-
-        fn transcribe(&self, _samples: &[f32]) -> anyhow::Result<String> {
-            Ok("shamash play dracula by tame impala".to_string())
-        }
-    }
-
-    struct QuietTranscriber;
-
-    impl Transcriber for QuietTranscriber {
-        fn sample_rate(&self) -> u32 {
-            16_000
-        }
-
-        fn transcribe(&self, _samples: &[f32]) -> anyhow::Result<String> {
-            Ok("just chatting about lunch".to_string())
-        }
-    }
-
-    #[test]
-    fn wired_pipeline_yields_play_request() {
-        let req = transcribe_and_parse(
-            &TestTranscriber,
-            &crate::parser::CommandParser::new(["shamash".to_string()]),
-            &[0.0; 320],
-        )
-        .unwrap()
-        .expect("should match");
-        assert_eq!(req.query, "dracula by tame impala");
-    }
-
-    #[test]
-    fn wired_pipeline_ignores_ordinary_speech() {
-        let result = transcribe_and_parse(
-            &QuietTranscriber,
-            &crate::parser::CommandParser::new(["shamash".to_string()]),
-            &[0.0; 320],
-        )
-        .unwrap();
-        assert!(result.is_none());
-    }
 
     #[test]
     fn a_title_can_only_be_claimed_once() {

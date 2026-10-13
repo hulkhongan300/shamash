@@ -12,12 +12,25 @@ use std::path::{Path, PathBuf};
 
 /// The model both engines default to.
 ///
-/// Chosen by measurement on real short utterances, not by a leaderboard. It is
-/// a 129 MB Parakeet TDT+CTC English model: it loads fast, needs no language
-/// hint, and produced text on noisy real speech where the larger and
-/// "recommended" alternatives returned nothing at all. See the note on
-/// `crate::direct` for the numbers.
+/// Parakeet TDT 0.6B v2, the strong English model, held resident by the direct
+/// engine. It was picked by running both over real recordings from the Handy's
+/// cache: on the two that crossed the VAD gate the 110M model returned *empty
+/// text* and this one returned what was said, which is the whole difference
+/// between hearing a command and dropping it.
+///
+/// The earlier note here said the larger models "returned nothing at all" and
+/// sent the default back to 110M. That measurement was taken through the Handy
+/// subprocess, which reloads the model per utterance and cannot pass a language
+/// hint; it does not describe `ASR_ENGINE=direct`, where the model loads once at
+/// startup and `RunOptions::language` is available. Size costs nothing there.
+///
+/// `ASR_ENGINE=handy` still prefers [`SMALL_MODEL_ID`], where a 600 ms load per
+/// command really is the dominant cost.
 pub const DEFAULT_MODEL_ID: &str =
+    "handy-computer/parakeet-tdt-0.6b-v2-gguf/parakeet-tdt-0.6b-v2-Q8_0.gguf";
+
+/// The fast-loading model, for the engine that pays to load one per utterance.
+pub const SMALL_MODEL_ID: &str =
     "handy-computer/parakeet-tdt_ctc-110m-gguf/parakeet-tdt_ctc-110m-Q8_0.gguf";
 
 /// Turns a model spec into a path this process can open.

@@ -1,59 +1,69 @@
-//! Local test harness for the wake-word → play-request pipeline.
-//!
-//! Transcribes a WAV file (16-bit PCM, mono or stereo, any sample rate) using
-//! the same path as live voice: resample to 16 kHz, VAD-split into
-//! utterances, transcribe, then parse. Prints transcripts and any resulting
-//! play request so you can test the bot's ears without Discord.
+//! Offline rehearsal of the two-stage listening pipeline.
 //!
 //!     cargo run --release --example transcribe -- path/to/recording.wav
 //!
-//! Uses the same engine as the bot: the in-process transcribe.cpp one, with the
-//! default Parakeet model. Point it elsewhere with `PARAKEET_MODEL`, and set
-//! `ASR_LANGUAGE=en` for models that need a language hint.
+//! Feeds a WAV (16-bit PCM, mono or stereo, any sample rate) through the real
+//! [`WakeGate`] rather than a copy of it: resample to 16 kHz, offer each window
+//! to the small wake model, report what it heard, and when it hears the wake
+//! word mark the model "ready" exactly as the bot does and capture the rest.
+//! The captured request is then transcribed by the larger model and parsed.
+//!
+//! That makes the two things worth measuring on a real recording directly
+//! visible: whether the small model can hear the wake word at all, and whether
+//! the larger model turns the words after it into a playable request.
+//!
+//! Models come from the same settings as the bot: `WAKE_MODEL` for the small
+//! one, `PARAKEET_MODEL` for the large, `WAKE_WORDS` for what counts as a wake
+//! word, and `ASR_LANGUAGE=en` for models that need a language hint.
+//!
+//! Record a wake word and a request with a clear pause between them — the pause
+//! is what the bot's two tones sit in, and a recording with no gap cannot show
+//! the second stage working.
 
 use anyhow::Context;
-use shamash::audio::{Resampler, VadBuffer, rms};
-use shamash::config::{AsrEngine, Config, DEFAULT_WAKE_WORDS};
-use shamash::direct::DirectTranscriber;
-use shamash::listener::{VAD_GAP_FRAMES, VAD_MAX_FRAMES, VAD_RMS_THRESHOLD};
+use shamash::audio::{Resampler, rms};
+use shamash::config::{Config, DEFAULT_WAKE_WORDS};
+use shamash::listener::{FRAME_SAMPLES, VAD_RMS_THRESHOLD};
 use shamash::parser::CommandParser;
 use shamash::transcriber::Transcriber;
+use shamash::wake::{COMMAND_GAP_FRAMES, Heard, Step, WakeGate};
 use std::path::Path;
+use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
     let wav_path = std::env::args()
         .nth(1)
         .context("usage: transcribe <recording.wav>")?;
-    let parakeet_model = std::env::var("PARAKEET_MODEL")
-        .unwrap_or_else(|_| shamash::model::DEFAULT_MODEL_ID.to_string());
-    let asr_language = std::env::var("ASR_LANGUAGE")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
 
-    let transcriber: Box<dyn Transcriber> = Box::new(DirectTranscriber::new(
-        &parakeet_model,
-        asr_language.as_deref(),
-    )?);
-
-    let config = Config {
-        wake_words: std::env::var("WAKE_WORDS")
-            .map(|s| {
-                s.split(',')
-                    .map(|w| w.trim().to_ascii_lowercase())
-                    .collect()
-            })
-            .unwrap_or_else(|_| DEFAULT_WAKE_WORDS.iter().map(|w| w.to_string()).collect()),
-        // The rest of the config is unused by this harness.
-        discord_token: String::new(),
-        voice_channel_id: 0,
-        // The harness drives the engine directly; the bot picks its own from
-        // the environment instead.
-        asr_engine: AsrEngine::Direct,
-        parakeet_model,
-        asr_language,
-        alert_channel_id: None,
+    // Config::from_env insists on the Discord settings so a typo in one is still
+    // reported here. The harness never connects, so placeholders are enough.
+    // SAFETY: single-threaded at this point; nothing else reads the environment.
+    unsafe {
+        std::env::set_var(
+            "DISCORD_TOKEN",
+            std::env::var("DISCORD_TOKEN").unwrap_or_else(|_| "harness".into()),
+        );
+        std::env::set_var(
+            "VOICE_CHANNEL_ID",
+            std::env::var("VOICE_CHANNEL_ID").unwrap_or_else(|_| "0".into()),
+        );
+    }
+    let config = Config::from_env()?;
+    let wake_words = if config.wake_words.is_empty() {
+        DEFAULT_WAKE_WORDS.iter().map(|w| w.to_string()).collect()
+    } else {
+        config.wake_words.clone()
     };
+
+    println!("wake model:   {}", config.wake_model);
+    println!("request model: {}", config.parakeet_model);
+    let mut sorted: Vec<&str> = wake_words.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    println!("wake words:   {}", sorted.join(", "));
+
+    let wake_model = build(&config.wake_model, config.asr_language.as_deref())?;
+    let parser = CommandParser::new(wake_words);
+    let mut gate = WakeGate::new(wake_model, parser.clone());
 
     let (samples, sample_rate) = load_wav(Path::new(&wav_path))?;
     let resampled = Resampler::new(sample_rate, 16_000).resample(&samples);
@@ -62,31 +72,73 @@ fn main() -> anyhow::Result<()> {
         "wav: {sample_rate} Hz -> {} samples at 16 kHz ({duration} s)",
         resampled.len()
     );
-    let parser = CommandParser::new(config.wake_words.clone());
 
-    let mut vad = VadBuffer::new(320, VAD_RMS_THRESHOLD, VAD_GAP_FRAMES, VAD_MAX_FRAMES);
     let mut peak = 0.0f32;
     let mut frames_heard = 0usize;
     let mut frames_total = 0usize;
-    let mut spoke = false;
-    for frame in resampled.as_chunks::<320>().0 {
+    let mut checks = 0usize;
+    let mut command: Option<Vec<f32>> = None;
+    // Loaded when the wake word is heard, exactly as the bot does, so the time
+    // it takes is the time the speaker would really have waited.
+    let mut request_model: Option<std::sync::Arc<dyn Transcriber>> = None;
+
+    // A synthetic tail of silence stands in for the speaker having stopped, so a
+    // recording that ends mid-request still closes the capture.
+    let frames = resampled
+        .as_chunks::<FRAME_SAMPLES>()
+        .0
+        .iter()
+        .map(|f| f.to_vec())
+        .chain(std::iter::repeat_with(|| vec![0.0f32; FRAME_SAMPLES]).take(COMMAND_GAP_FRAMES * 3));
+
+    for frame in frames {
         frames_total += 1;
-        let level = rms(frame);
+        let level = rms(&frame);
         peak = peak.max(level);
         if level >= VAD_RMS_THRESHOLD {
             frames_heard += 1;
         }
-        spoke |= report(&vad.push(frame), transcriber.as_ref(), &parser)?;
-    }
-    // The buffer flushes on a long silence or at the frame cap, so a recording
-    // that stops mid-sentence would never be transcribed. A synthetic tail of
-    // silence stands in for the speaker having finished.
-    for _ in 0..VAD_GAP_FRAMES {
-        spoke |= report(&vad.push(&[0.0; 320]), transcriber.as_ref(), &parser)?;
+        match gate.push(&frame) {
+            Step::Idle => {}
+            Step::Check(window) => {
+                checks += 1;
+                let transcript = gate.transcriber().transcribe(&window)?;
+                println!("wake model heard: {transcript:?}");
+                if let Some(heard) = gate.transcribed(&transcript) {
+                    let Heard::Wake(hit) = heard else {
+                        unreachable!("a check only ever reports a wake word");
+                    };
+                    println!(
+                        ">>> wake word heard after {checks} check(s), in {:.2} s of audio",
+                        hit.audio.len() as f32 / 16_000.0
+                    );
+                    // What the bot does between its two tones: the larger model
+                    // loads, then the gate is told it is ready.
+                    let started = Instant::now();
+                    request_model = Some(build(
+                        &config.parakeet_model,
+                        config.asr_language.as_deref(),
+                    )?);
+                    println!("larger model ready in {:?}", started.elapsed());
+                    hit.ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Step::Heard(heard) => {
+                let Heard::Command(audio) = heard else {
+                    unreachable!("only a check reports a wake word");
+                };
+                println!(
+                    ">>> captured {:.2} s of request",
+                    audio.len() as f32 / 16_000.0
+                );
+                command = Some(audio);
+            }
+        }
+        if command.is_some() {
+            break;
+        }
     }
 
-    // Level report, so a threshold that is wrong for this voice is visible
-    // rather than just silent.
     println!(
         "level: peak frame rms {:.4} ({:.1} dBFS), gate {:.4} ({:.1} dBFS)",
         peak,
@@ -103,34 +155,35 @@ fn main() -> anyhow::Result<()> {
             "nothing crossed the gate; speak louder or closer, or lower VAD_RMS_THRESHOLD in src/listener.rs"
         );
     }
-    if !spoke {
-        println!("no speech detected; try a louder or longer recording");
+
+    let Some(audio) = command else {
+        println!("no wake word was heard, so there was no request to transcribe.");
+        println!(
+            "the small model made {checks} check(s); if that is zero it never saw enough \
+             speech, and if it is non-zero the wake word is in there but not being recognised"
+        );
+        println!("done.");
+        return Ok(());
+    };
+
+    let transcript = request_model
+        .as_deref()
+        .context("a captured request without a loaded model")?
+        .transcribe(&audio)?;
+    println!("request heard: {transcript:?}");
+    match parser.parse_with_reason(&transcript) {
+        Ok(request) => println!("play: {}", request.query),
+        Err(miss) => println!("not a play command: {miss}"),
     }
     println!("done.");
     Ok(())
 }
 
-/// Transcribes one completed utterance and reports what the parser made of it.
-///
-/// Returns whether there was any speech, so the caller can tell an empty
-/// recording from one that merely failed to parse.
-fn report(
-    utterance: &[f32],
-    transcriber: &dyn Transcriber,
-    parser: &CommandParser,
-) -> anyhow::Result<bool> {
-    if utterance.is_empty() {
-        return Ok(false);
-    }
-    let transcript = transcriber
-        .transcribe(utterance)
-        .context("transcription failed")?;
-    println!("heard: {transcript:?}");
-    match parser.parse_with_reason(&transcript) {
-        Ok(request) => println!("play: {}", request.query),
-        Err(miss) => println!("not a play command: {miss}"),
-    }
-    Ok(true)
+/// Builds one speech-to-text engine.
+fn build(model: &str, language: Option<&str>) -> anyhow::Result<std::sync::Arc<dyn Transcriber>> {
+    Ok(std::sync::Arc::new(
+        shamash::direct::DirectTranscriber::new(model, language)?,
+    ))
 }
 
 /// Full-scale decibel level of a linear amplitude.
