@@ -30,25 +30,35 @@ const BEEP_CHANNELS: u16 = 2;
 
 /// Which acknowledgement tone to play back.
 ///
-/// The two stages answer different questions -- "did it hear me?" and "is it
-/// ready for what I am about to say?" -- and a speaker who says the next word
-/// before the second tone finishes needs to tell them apart by ear. They are a
-/// tone apart rather than a melody, so the pair stays recognisable as the same
-/// acknowledgement instead of becoming something to wait for.
+/// The stages answer different questions -- "did it hear me?", "is it ready for
+/// what I am about to say?", and "sorry, that did not become a song" -- and a
+/// speaker who says the next word before the second tone finishes needs to tell
+/// them apart by ear. They are a tone apart rather than a melody, so the set
+/// stays recognisable as the same acknowledgement instead of becoming something
+/// to wait for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
     /// The wake word was heard. The first model is done listening.
     Wake,
     /// The larger model is loaded and ready for the request.
     Ready,
+    /// Nothing became of the request: no match, no search result, or a fetch
+    /// that failed.
+    Miss,
 }
 
 impl Tone {
-    /// The tone's frequency in Hz: A5, then the next one up.
+    /// The tone's frequency in Hz: A5, the next one up, and A4.
+    ///
+    /// The miss tone is *below* the other two rather than between or above
+    /// them: a failure answer should not sound like the start of an
+    /// acknowledgement, and dropping an octave from A5 to A4 is a larger,
+    /// easier-to-hear gap than the semitone the ready tone sits above.
     pub fn frequency(self) -> f32 {
         match self {
             Self::Wake => 880.0,
             Self::Ready => 987.77,
+            Self::Miss => 440.0,
         }
     }
 }
@@ -67,6 +77,65 @@ pub enum Outcome {
     Offered(search::Choice),
     /// Playback was stopped while this was still downloading.
     Cancelled,
+}
+
+/// Why a request could not be turned into a song.
+///
+/// The speaker gets a tone and a message for each of these. Previously every
+/// failure was a `println!` nobody in the voice channel can see, so the
+/// complaint was silence: the person who said "play X" heard nothing back and
+/// no idea whether the bot had not heard them or could not find the song.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Problem {
+    /// Nothing in the catalog or on YouTube was convincing enough.
+    NoMatch,
+    /// The song was found but its audio could not be downloaded.
+    FetchFailed,
+    /// The queue had no room.
+    QueueFull,
+}
+
+/// A failure, and what to tell the listener about it.
+///
+/// Carried as its own type rather than inferred from the message so the wording
+/// of an error can change without changing which message the listener reads.
+#[derive(Debug)]
+pub struct Failure {
+    pub problem: Problem,
+    pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl Failure {
+    fn new(problem: Problem, error: anyhow::Error) -> Self {
+        Self { problem, error }
+    }
+
+    /// What the listener is told, in one place so every failure reads the same.
+    ///
+    /// Echoes back what was heard, because the two things a person needs in
+    /// order to fix this are what the bot thought it heard and what to say
+    /// instead.
+    fn message(&self, heard: &str) -> String {
+        match self.problem {
+            Problem::NoMatch => format!(
+                "I heard “{heard}”, but couldn’t match it to a song. \
+                 Try “play <title> by <artist>”."
+            ),
+            Problem::FetchFailed => {
+                format!("I found “{heard}” but couldn’t download it. Try again in a moment.")
+            }
+            Problem::QueueFull => format!(
+                "The queue is full, so “{heard}” wasn’t added. \
+                 Skip or stop something first, then ask again."
+            ),
+        }
+    }
 }
 
 /// Plays queued music and keeps the text channel dashboard in step.
@@ -451,16 +520,71 @@ impl Player {
             .get(guild_id)
             .context("bot is not in a voice channel")?;
 
-        match self.resolve_and_queue(config, guild_id, request).await? {
-            Outcome::Offered(choice) => self.offer_choice(ctx, config, guild_id, &choice).await,
-            // Either way the dashboard is redrawn: a played song needs naming,
-            // and a cancelled one may have moved the queue along underneath it.
-            Outcome::Played { starting: true } => {
+        let heard = request.query.clone();
+        match self.resolve_and_queue(config, guild_id, request).await {
+            Ok(Outcome::Offered(choice)) => {
+                let asked = choice.requested.clone();
+                self.offer_choice(ctx, config, guild_id, &asked, &choice)
+                    .await
+            }
+            Ok(Outcome::Played { starting: true }) => {
                 self.start_next(ctx, config, guild_id).await;
             }
-            _ => self.draw_dashboard(ctx, config, guild_id).await,
+            // Either way the dashboard is redrawn: a played song needs naming,
+            // and a cancelled one may have moved the queue along underneath it.
+            Ok(_) => self.draw_dashboard(ctx, config, guild_id).await,
+            Err(failure) => {
+                self.report(ctx, config, guild_id, &heard, &failure).await;
+                return Err(failure.error);
+            }
         }
         Ok(())
+    }
+
+    /// Tells the listener their request did not become a song.
+    ///
+    /// A tone first, because the person who spoke is standing in a voice
+    /// channel and may not be reading the text channel at all; then a message
+    /// saying what was heard, which is the part they can act on.
+    async fn report(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        heard: &str,
+        failure: &Failure,
+    ) {
+        tracing::warn!(
+            guild_id = %guild_id,
+            heard = %heard,
+            problem = ?failure.problem,
+            error = %format!("{failure:#}"),
+            "the request did not become a song"
+        );
+        if let Err(e) = self.acknowledge(guild_id, Tone::Miss).await {
+            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "the miss tone failed");
+        }
+
+        let Some(channel_id) = resolve_alert_channel(ctx, config, guild_id) else {
+            tracing::debug!(
+                guild_id = %guild_id,
+                "no alert channel, so there was nowhere to report the failure"
+            );
+            return;
+        };
+        let sent = channel_id
+            .send_message(
+                &ctx.http,
+                dashboard::notice(&failure.message(heard)).into_message(),
+            )
+            .await;
+        if let Err(e) = sent {
+            tracing::warn!(
+                guild_id = %guild_id,
+                error = %format!("{e:#}"),
+                "could not report the failed request"
+            );
+        }
     }
 
     /// Turns a spoken request into a queued song, without touching Discord.
@@ -475,14 +599,16 @@ impl Player {
         config: &Config,
         guild_id: GuildId,
         request: &PlayRequest,
-    ) -> anyhow::Result<Outcome> {
+    ) -> Result<Outcome, Failure> {
         let queue = self.queues.get(guild_id);
         // Checked before searching, so a full queue fails without a download.
         // `commit` checks again, since another request may have filled it.
-        anyhow::ensure!(
-            !queue.is_full(),
-            "the queue is full, try again once a song finishes"
-        );
+        if queue.is_full() {
+            return Err(Failure::new(
+                Problem::QueueFull,
+                anyhow::anyhow!("the queue is full, try again once a song finishes"),
+            ));
+        }
 
         // Claims the request ordering lock and reads the cancellation number to
         // hand back to `commit`. Read after the lock is taken, so a Stop that
@@ -498,10 +624,18 @@ impl Player {
             config.allow_unverified_autoplay,
         )
         .await
-        .with_context(|| format!("no match for '{}'", request.query))?;
+        .map_err(|e| {
+            Failure::new(
+                Problem::NoMatch,
+                e.context(format!("no match for '{}'", request.query)),
+            )
+        })?;
 
         let Some(best) = choice.best() else {
-            anyhow::bail!("no playable song found for the request");
+            return Err(Failure::new(
+                Problem::NoMatch,
+                anyhow::anyhow!("no playable song found for the request"),
+            ));
         };
         if !choice.confident {
             return Ok(Outcome::Offered(choice));
@@ -510,7 +644,8 @@ impl Player {
         let song = self
             .fetch
             .fetch(guild_id, &best.candidate, &queue.in_use())
-            .await?;
+            .await
+            .map_err(|e| Failure::new(Problem::FetchFailed, e))?;
         Ok(self.outcome(guild_id, &queue, song, started_at).await)
     }
 
@@ -540,11 +675,16 @@ impl Player {
     }
 
     /// Posts the "which one did you mean" question in the alert channel.
+    ///
+    /// A question that cannot be asked is itself reported: a listener who gets
+    /// neither music nor buttons would otherwise have no way to tell a bad
+    /// match from a bot that never saw their request.
     async fn offer_choice(
         &self,
         ctx: &SerenityContext,
         config: &Config,
         guild_id: GuildId,
+        heard: &str,
         choice: &search::Choice,
     ) {
         let options: Vec<dashboard::ChoiceOption<'_>> = choice
@@ -561,7 +701,11 @@ impl Player {
             })
             .collect();
         if options.is_empty() {
-            println!("[{guild_id}] no candidate had a video id, so there was nothing to offer");
+            let failure = Failure::new(
+                Problem::NoMatch,
+                anyhow::anyhow!("no candidate had a video id, so there was nothing to offer"),
+            );
+            self.report(ctx, config, guild_id, heard, &failure).await;
             return;
         }
 
@@ -573,14 +717,22 @@ impl Player {
         self.choices.set(guild_id, candidates);
 
         let Some(channel_id) = resolve_alert_channel(ctx, config, guild_id) else {
-            println!("[{guild_id}] no alert channel, so there was nowhere to ask");
+            let failure = Failure::new(
+                Problem::NoMatch,
+                anyhow::anyhow!("no alert channel, so there was nowhere to ask"),
+            );
+            self.report(ctx, config, guild_id, heard, &failure).await;
             return;
         };
         // Built before the send so the borrowed label outlives the call.
         let resolved = choice.resolved.as_ref().map(|track| track.label());
         let message = dashboard::choice(&choice.requested, resolved.as_deref(), &options);
         if let Err(e) = channel_id.send_message(&ctx.http, message).await {
-            println!("[{guild_id}] could not ask which song was meant: {e:#}");
+            tracing::warn!(
+                guild_id = %guild_id,
+                error = %format!("{e:#}"),
+                "could not ask which song was meant"
+            );
         }
     }
 
@@ -1405,6 +1557,99 @@ mod tests {
             ready - wake > 60.0,
             "{wake} Hz and {ready} Hz are too close to tell apart"
         );
+    }
+
+    /// The miss tone has to be tellable from both acknowledgements, in either
+    /// order. This is the whole point of adding it: a person who spoke and heard
+    /// nothing has no way to tell the bot apart from one that did not hear them,
+    /// so "I could not find that song" has to arrive as a sound and not only as
+    /// a message in a text channel they may not be reading.
+    #[test]
+    fn the_miss_tone_is_tellable_from_both_acknowledgements() {
+        let miss = frequency_of(&beep_wav(Tone::Miss.frequency()));
+        assert!(
+            (miss - Tone::Miss.frequency()).abs() < 20.0,
+            "miss tone measured {miss} Hz"
+        );
+        for other in [Tone::Wake, Tone::Ready] {
+            let their_frequency = other.frequency();
+            let gap = (miss - their_frequency).abs();
+            assert!(
+                gap > 60.0,
+                "{miss} Hz and {their_frequency} Hz are too close to tell apart"
+            );
+        }
+        // And it is the odd one out, so it reads as "not an acknowledgement"
+        // rather than as a third step in the same sequence.
+        assert!(miss < Tone::Wake.frequency());
+    }
+
+    /// Every tone has to survive the same probe songbird runs on it, or a
+    /// message that never arrives is worse than no message at all.
+    #[test]
+    fn every_tone_decodes() {
+        use symphonia::core::formats::FormatOptions;
+        use symphonia::core::io::MediaSourceStream;
+        use symphonia::core::meta::MetadataOptions;
+        use symphonia::core::probe::Hint;
+        use symphonia::default::{get_codecs, get_probe};
+
+        for tone in [Tone::Wake, Tone::Ready, Tone::Miss] {
+            let wav = beep_wav(tone.frequency());
+            let source =
+                MediaSourceStream::new(Box::new(std::io::Cursor::new(wav)), Default::default());
+            let mut probed = get_probe()
+                .format(
+                    &Hint::new(),
+                    source,
+                    &FormatOptions::default(),
+                    &MetadataOptions::default(),
+                )
+                .expect("the probe must recognise the tone");
+            let track = probed.format.default_track().expect("a track");
+            let _decoder = get_codecs()
+                .make(&track.codec_params, &Default::default())
+                .expect("the pcm decoder must be registered");
+            assert!(probed.format.next_packet().is_ok(), "{tone:?} must decode");
+        }
+    }
+
+    /// The listener has to be told what was heard: the bot's transcription is
+    /// frequently wrong, and echoing it back is what lets them say the right
+    /// thing next time.
+    #[test]
+    fn every_failure_says_what_was_heard_and_what_to_do() {
+        for (problem, expected) in [
+            (
+                Problem::NoMatch,
+                "I heard “dracula by tame impala”, but couldn’t match it to a song. \
+                 Try “play <title> by <artist>”.",
+            ),
+            (
+                Problem::FetchFailed,
+                "I found “dracula by tame impala” but couldn’t download it. \
+                 Try again in a moment.",
+            ),
+            (
+                Problem::QueueFull,
+                "The queue is full, so “dracula by tame impala” wasn’t added. \
+                 Skip or stop something first, then ask again.",
+            ),
+        ] {
+            let failure = Failure::new(problem, anyhow::anyhow!("because"));
+            assert_eq!(failure.message("dracula by tame impala"), expected);
+        }
+    }
+
+    /// The three have to stay distinguishable as prose too, since a person
+    /// reading them should not have to guess which went wrong.
+    #[test]
+    fn the_three_failures_read_differently() {
+        let heard = "dracula by tame impala";
+        let said = |problem| Failure::new(problem, anyhow::anyhow!("because")).message(heard);
+        assert_ne!(said(Problem::NoMatch), said(Problem::FetchFailed));
+        assert_ne!(said(Problem::NoMatch), said(Problem::QueueFull));
+        assert_ne!(said(Problem::FetchFailed), said(Problem::QueueFull));
     }
 
     /// The tone the second stage plays has to decode like the first, or a model

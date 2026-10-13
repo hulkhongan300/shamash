@@ -294,6 +294,19 @@ chose a video heard=drakula tame impala picked=Dracula channel=Tame Impala
   threshold=90.0 confident=true
 ```
 
+### When it cannot find the song
+
+A request that turns into nothing used to be a `println!` and silence: the
+person who spoke heard no music and no explanation, and could not tell a bad
+match from a bot that had not heard them. Now every failure is a **lower tone**
+(440 Hz, an octave below the wake acknowledgement) followed by a message in the
+alert channel that says what was heard:
+
+> I heard “dracula by tame impala”, but couldn’t match it to a song. Try “play
+> \<title\> by \<artist\>”.
+
+There are three: no match, a download that failed, and a queue with no room.
+
 ### Controlling playback
 
 The dashboard in the alert channel is the only control surface:

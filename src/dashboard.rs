@@ -213,6 +213,19 @@ pub fn choice(
         .components(vec![CreateActionRow::Buttons(buttons)])
 }
 
+/// A one-line notice for something that did not work.
+///
+/// Not an embed and not a button row: it is a sentence to read, it has to say
+/// what was heard, and nothing about it is actionable from Discord.
+pub fn notice(text: &str) -> View {
+    View {
+        embed: CreateEmbed::new()
+            .description(trim(&markdown_escape(text), MAX_DESCRIPTION))
+            .color(0xcd_2f_31),
+        buttons: Vec::new(),
+    }
+}
+
 /// One option in the chooser.
 #[derive(Clone, Copy)]
 pub struct ChoiceOption<'a> {
@@ -273,6 +286,54 @@ mod tests {
             url: "https://youtu.be/abc".to_string(),
             video_id: "abc".to_string(),
         }
+    }
+
+    /// The description a view will actually send.
+    ///
+    /// `CreateEmbed` keeps its fields private and offers only setters, so the
+    /// message is read back the way Discord would see it.
+    fn description_of(view: View) -> String {
+        serde_json::to_value(&view.embed)
+            .expect("an embed serialises")
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A notice echoes back what the bot thought it heard, which is
+    /// speech-to-text output, so it can contain anything the person said --
+    /// including markdown that would reformat the message or a stray backtick
+    /// pair that swallows the rest of it.
+    #[test]
+    fn a_notice_escapes_what_it_echoes_back() {
+        let description =
+            description_of(notice("I heard “*stand* by _me_”, but couldn’t match it."));
+        assert!(
+            description.contains("\\*stand\\*") && description.contains("\\_me\\_"),
+            "not escaped: {description}"
+        );
+    }
+
+    /// A notice is not a question, so it must not leave buttons behind that
+    /// would answer a question nobody asked.
+    #[test]
+    fn a_notice_has_no_buttons() {
+        assert!(notice("something went wrong").buttons.is_empty());
+    }
+
+    /// A very long transcript must not be able to push the notice over
+    /// Discord's field limit, which would make the send fail -- and a failed
+    /// send is exactly the silence this is here to remove.
+    #[test]
+    fn a_notice_is_trimmed_to_something_discord_will_send() {
+        let said = "a".repeat(MAX_DESCRIPTION * 2);
+        let description = description_of(notice(&said));
+        assert!(
+            description.chars().count() <= MAX_DESCRIPTION,
+            "{} chars",
+            description.chars().count()
+        );
     }
 
     /// A chooser button has to survive the round trip, or a press cannot be
