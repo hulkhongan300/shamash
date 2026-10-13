@@ -231,8 +231,12 @@ below `CATALOG_MATCH_THRESHOLD` is discarded in favour of the words that were
 actually heard.
 
 The lookup is bounded at two seconds. It is an improvement on the raw transcript
-and must never be the reason a command goes unanswered, so a slow or failed
-catalog call falls back to searching the transcript rather than blocking.
+and must never be the reason a command goes unanswered, so a slow, failing or
+quota-exhausted catalog call falls back to searching the transcript rather than
+blocking. That covers every way a provider can fail, including the awkward one:
+Deezer reports a spent quota as **HTTP 200** with an `error` object in the body,
+so there is no status line to catch. The request continues on the words that
+were heard.
 
 A YouTube search returns whatever matched the words, and for a popular song that
 routinely includes other people's takes of it. Ranking those by view count picks

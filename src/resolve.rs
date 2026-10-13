@@ -138,32 +138,41 @@ impl CatalogProvider for Deezer {
             .json()
             .await
             .context("failed to decode the Deezer search response")?;
-        if let Some(error) = body.error {
-            anyhow::bail!("Deezer could not search for '{query}': {error}");
-        }
-
-        Ok(body
-            .data
-            .unwrap_or_default()
-            .into_iter()
-            .map(|hit| CatalogTrack {
-                artist: hit.artist.name,
-                // `title` carries the decorations ("Remastered 2011"); the short
-                // form is the bare song name, which is what gets matched.
-                title: match hit.title_short {
-                    Some(short) if !short.trim().is_empty() => short,
-                    _ => hit.title,
-                },
-                duration_secs: hit.duration,
-                id: hit.id.to_string(),
-                provider: "deezer",
-            })
-            .collect())
+        parse_search(body, query)
     }
 }
 
+/// Turns a decoded Deezer body into tracks, or fails the way Deezer asks.
+///
+/// Split out from the request so the quota-in-a-200 shape can be tested without
+/// a network call: it is a body Deezer returns with HTTP 200, so nothing about
+/// the response line says anything is wrong.
+pub(crate) fn parse_search(body: DeezerSearch, query: &str) -> anyhow::Result<Vec<CatalogTrack>> {
+    if let Some(error) = body.error {
+        anyhow::bail!("Deezer could not search for '{query}': {error}");
+    }
+
+    Ok(body
+        .data
+        .unwrap_or_default()
+        .into_iter()
+        .map(|hit| CatalogTrack {
+            artist: hit.artist.name,
+            // `title` carries the decorations ("Remastered 2011"); the short
+            // form is the bare song name, which is what gets matched.
+            title: match hit.title_short {
+                Some(short) if !short.trim().is_empty() => short,
+                _ => hit.title,
+            },
+            duration_secs: hit.duration,
+            id: hit.id.to_string(),
+            provider: "deezer",
+        })
+        .collect())
+}
+
 #[derive(Deserialize)]
-struct DeezerSearch {
+pub(crate) struct DeezerSearch {
     #[serde(default)]
     data: Option<Vec<DeezerHit>>,
     #[serde(default)]
@@ -458,19 +467,30 @@ impl Catalog {
     /// confident answer is worse than a fuzzy one, because it plays the wrong
     /// song without complaint.
     ///
-    /// Bounded by [`LOOKUP_TIMEOUT`] however the provider behaves. A lookup
-    /// that hangs is reported as no match rather than as an error, because the
-    /// catalog is an improvement on the raw transcript and must never be the
-    /// reason a command goes unanswered: the caller searches on the words it
-    /// heard instead.
-    pub async fn resolve(&self, target: &Target) -> anyhow::Result<Option<Resolution>> {
+    /// This never fails. Bounded by [`LOOKUP_TIMEOUT`] however the provider
+    /// behaves, and a provider that errors, stalls or answers with a quota
+    /// notice is reported as "that provider had nothing" rather than as an
+    /// error. The catalog is an improvement on the raw transcript, so it must
+    /// never be the reason a command goes unanswered -- an HTTP 500 or a
+    /// Deezer quota body arriving with HTTP 200 used to abort the whole
+    /// request, and the listener heard nothing at all.
+    pub async fn resolve(&self, target: &Target) -> Option<Resolution> {
         let query = target.query();
         if query.trim().is_empty() {
-            return Ok(None);
+            return None;
         }
 
         let hits = match timeout(LOOKUP_TIMEOUT, self.provider.search(&query)).await {
-            Ok(hits) => hits?,
+            Ok(Ok(hits)) => hits,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    provider = self.provider.name(),
+                    query = %query,
+                    error = %format!("{e:#}"),
+                    "the catalog could not answer; continuing on the transcript alone"
+                );
+                return None;
+            }
             Err(_) => {
                 tracing::debug!(
                     provider = self.provider.name(),
@@ -478,12 +498,10 @@ impl Catalog {
                     budget = ?LOOKUP_TIMEOUT,
                     "catalog lookup timed out; searching on the transcript alone"
                 );
-                return Ok(None);
+                return None;
             }
         };
-        let Some(tied) = tied_hits(target, &hits) else {
-            return Ok(None);
-        };
+        let tied = tied_hits(target, &hits)?;
         let (confidence, track) = tied.best[0].clone();
         tracing::debug!(
             provider = self.provider.name(),
@@ -498,14 +516,14 @@ impl Catalog {
         );
 
         if confidence < self.threshold {
-            return Ok(None);
+            return None;
         }
-        Ok(Some(Resolution {
+        Some(Resolution {
             track,
             confidence,
             query,
             ambiguous: tied.ambiguous,
-        }))
+        })
     }
 }
 
@@ -957,13 +975,13 @@ mod tests {
             catalog.resolve(&target(Some("dracula"), Some("tame impala"))),
         )
         .await
-        .expect("resolve must return rather than hang")
-        .expect("a timeout is a fallback, not an error");
+        .expect("resolve must return rather than hang");
         assert!(resolved.is_none(), "a stalled lookup yields no match");
     }
 
-    /// A provider that fails outright, and one that is merely slow, must both
-    /// leave the caller able to search on the transcript.
+    /// A provider that fails outright must leave the caller able to search on
+    /// the transcript. The old contract reported this as an error and the
+    /// caller propagated it, so one catalog outage played nothing at all.
     #[tokio::test]
     async fn a_failing_provider_leaves_the_caller_with_no_match() {
         struct Broken;
@@ -983,9 +1001,37 @@ mod tests {
             catalog
                 .resolve(&target(Some("dracula"), Some("tame impala")))
                 .await
-                .is_err(),
-            "an outright failure is still reported; the caller handles it"
+                .is_none(),
+            "an outright failure is reported as no match, never as an error"
         );
+    }
+
+    /// Deezer reports a spent quota as HTTP 200 with an `error` body, so
+    /// nothing about the status line says anything is wrong and the decode step
+    /// is the only place that can notice.
+    #[test]
+    fn a_quota_reply_arriving_in_a_200_is_an_error_not_a_track() {
+        let body: DeezerSearch =
+            serde_json::from_str(include_str!("../tests/fixtures/deezer_quota.json"))
+                .expect("the recorded quota body decodes");
+        let err = parse_search(body, "dracula tame impala")
+            .expect_err("a quota body has no tracks in it")
+            .to_string();
+        assert!(err.contains("Deezer could not search"), "unhelpful: {err}");
+    }
+
+    /// The recorded shape of a real search, so a change to Deezer's fields is
+    /// caught here rather than at request time.
+    #[test]
+    fn a_recorded_deezer_response_becomes_tracks() {
+        let body: DeezerSearch =
+            serde_json::from_str(include_str!("../tests/fixtures/deezer_dracula.json"))
+                .expect("the recorded response decodes");
+        let tracks = parse_search(body, "dracula tame impala").expect("hits");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].artist, "Tame Impala");
+        assert_eq!(tracks[0].title, "Dracula", "the decorations are dropped");
+        assert_eq!(tracks[0].duration_secs, Some(205.0));
     }
 
     /// iTunes reports the running time in milliseconds. Reading it as seconds
@@ -1039,7 +1085,6 @@ mod tests {
         let resolved = catalog
             .resolve(&target(Some("hoolig"), Some("bts")))
             .await
-            .unwrap()
             .expect("BTS Hooligan is a real song");
         assert_eq!(resolved.track.artist, "BTS");
         assert!(resolved.track.duration_secs.unwrap_or(0.0) > 100.0);
@@ -1061,8 +1106,7 @@ mod tests {
         let catalog = Catalog::new(Box::new(Silent), 0.62);
         let resolved = catalog
             .resolve(&target(Some("dracula"), Some("tame impala")))
-            .await
-            .unwrap();
+            .await;
         assert!(resolved.is_none());
     }
 
@@ -1081,8 +1125,7 @@ mod tests {
         let catalog = Catalog::new(Box::new(Wrong), 0.62);
         let resolved = catalog
             .resolve(&target(Some("dracula"), Some("tame impala")))
-            .await
-            .unwrap();
+            .await;
         assert!(resolved.is_none(), "a wrong song must not be trusted");
     }
 
@@ -1093,7 +1136,6 @@ mod tests {
         let resolved = catalog
             .resolve(&target(Some("hoolig"), Some("bts")))
             .await
-            .unwrap()
             .expect("BTS Hooligan is a real song");
         assert_eq!(resolved.track.artist, "BTS");
         assert!(resolved.track.duration_secs.unwrap_or(0.0) > 100.0);

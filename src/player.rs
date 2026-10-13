@@ -265,6 +265,7 @@ impl Player {
         let choice = search::choose_match(
             request,
             &self.catalog,
+            &search::YtDlpSearch,
             config.search_candidates,
             config.match_threshold,
         )
