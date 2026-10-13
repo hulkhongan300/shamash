@@ -29,9 +29,44 @@ pub const SUPPORTED_CATALOG_PROVIDERS: &[&str] = &["deezer", "itunes"];
 /// transcript.
 ///
 /// 0.62 is where a fuzzy-but-right title clears the bar and a merely related
-/// song does not. A title that shares a word with the request scores at least
-/// 0.72, so this admits a misheard name and still rejects a different song.
+/// song does not.
 pub const DEFAULT_CATALOG_MATCH_THRESHOLD: f32 = 0.62;
+
+/// Whether a video found *without* a catalog match may be played on its own.
+///
+/// Default `false`, and it should stay that way. Without a catalog there is no
+/// verified running time, which removes the only signal that tells the studio
+/// recording from a remix of it; the scorer then has nothing but a title
+/// similarity and a view count, and `UNRESOLVED_MATCH_THRESHOLD` was low enough
+/// that an unrelated title sharing one word cleared it. Offering the results as
+/// a choice costs the listener one button press and never plays a wrong song
+/// unannounced; this setting only exists for someone who would rather have the
+/// wrong song than the extra click.
+pub const DEFAULT_ALLOW_UNVERIFIED_AUTOPLAY: bool = false;
+
+/// Reads a boolean from the environment, falling back to `default`.
+///
+/// A malformed value is an error rather than a silent default, for the same
+/// reason [`env_f32`] refuses one: a typo in `ALLOW_UNVERIFIED_AUTOPLAY` that
+/// quietly became `false` would be invisible, and one that quietly became
+/// `true` would turn the bot back into playing whatever YouTube ranked first.
+pub fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(raw) => parse_bool(name, &raw),
+    }
+}
+
+/// One setting's value, without the environment, so the accepted spellings can
+/// be tested without `std::env::set_var` (unsafe in edition 2024, and the test
+/// threads run in parallel so a shared variable would be a race).
+fn parse_bool(name: &str, raw: &str) -> anyhow::Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => anyhow::bail!("{name} must be true or false, got {other:?}"),
+    }
+}
 
 /// How many YouTube results a request is scored against.
 ///
@@ -150,6 +185,8 @@ pub struct Config {
     pub search_candidates: usize,
     /// The lowest score a candidate may reach and still be played unasked.
     pub match_threshold: f64,
+    /// Whether a video found without a catalog match may be played unasked.
+    pub allow_unverified_autoplay: bool,
     /// The small model that listens for the wake word at all times.
     pub wake_model: String,
     /// An Ollama-compatible endpoint that cleans up a transcript, or `None`.
@@ -206,6 +243,10 @@ impl Config {
                 DEFAULT_MATCH_THRESHOLD as f32,
                 0.0..=1000.0,
             )? as f64,
+            allow_unverified_autoplay: env_bool(
+                "ALLOW_UNVERIFIED_AUTOPLAY",
+                DEFAULT_ALLOW_UNVERIFIED_AUTOPLAY,
+            )?,
             wake_model: std::env::var("WAKE_MODEL")
                 .ok()
                 .map(|m| m.trim().to_string())
@@ -317,6 +358,40 @@ mod tests {
         assert_eq!(catalog_provider_name(None).unwrap(), "deezer");
         assert_eq!(catalog_provider_name(Some("  ")).unwrap(), "deezer");
         assert_eq!(catalog_provider_name(Some(" Deezer ")).unwrap(), "deezer");
+    }
+
+    /// Unverified autoplay is off unless the operator says otherwise, because the
+    /// whole point is not to play a song no catalog confirmed. Pinned at compile
+    /// time so it cannot be flipped by accident.
+    const _: () = assert!(!DEFAULT_ALLOW_UNVERIFIED_AUTOPLAY);
+
+    /// A typo must not become a silent `false` here: this flag decides whether
+    /// the bot plays something it could not verify.
+    #[test]
+    fn a_malformed_boolean_is_an_error_rather_than_a_default() {
+        for (raw, expected) in [
+            ("1", true),
+            ("true", true),
+            (" YES ", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("No", false),
+            ("off", false),
+        ] {
+            assert_eq!(
+                parse_bool("ALLOW_UNVERIFIED_AUTOPLAY", raw).unwrap(),
+                expected
+            );
+        }
+        let err = parse_bool("ALLOW_UNVERIFIED_AUTOPLAY", "ture")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ALLOW_UNVERIFIED_AUTOPLAY"),
+            "unhelpful: {err}"
+        );
+        assert!(err.contains("true or false"), "unhelpful: {err}");
     }
 
     #[test]

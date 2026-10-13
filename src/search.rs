@@ -378,6 +378,14 @@ impl Target {
 /// and without one the most it can earn is the 125 that do not depend on
 /// running time. A fraction would move this bar every time the weights in
 /// [`score`] were retuned, silently.
+///
+/// It decides the *order* the chooser offers its options in, and nothing else.
+/// With no catalog match there is no verified running time, so the strongest
+/// signal is gone and the score cannot be trusted to identify a song at all:
+/// `relevance` alone is 18.0 for any upload title sharing one word with the
+/// transcript, which is why this bar used to admit almost anything. An
+/// unverified best result is therefore never played on its own unless
+/// [`crate::config::Config::allow_unverified_autoplay`] says otherwise.
 const UNRESOLVED_MATCH_THRESHOLD: f64 = 20.0;
 
 /// A candidate's score, broken down so it can be logged and tuned.
@@ -672,6 +680,27 @@ pub fn rank_step(
     resolution: Option<&resolve::Resolution>,
     requested: &str,
 ) -> Choice {
+    rank_step_with(candidates, target, threshold, resolution, requested, false)
+}
+
+/// [`rank_step`], with the operator's answer to `ALLOW_UNVERIFIED_AUTOPLAY`.
+///
+/// Without a catalog match there is no verified running time, so the strongest
+/// signal in [`score`] is gone and what is left cannot identify a song: a
+/// completely unrelated upload title sharing one word with the transcript scored
+/// 19.7 against a bar of 20, and the real answer — *Taylor Swift — Anti-Hero*,
+/// a different song — scored 26.7. Autoplaying that is the "plays the wrong
+/// song with no feedback" complaint, so an unverified best result is offered as
+/// a choice instead. The setting exists for someone who prefers the wrong song
+/// to the extra click, and is logged loudly when it is on.
+fn rank_step_with(
+    candidates: &[Candidate],
+    target: &Target,
+    threshold: f64,
+    resolution: Option<&resolve::Resolution>,
+    requested: &str,
+    allow_unverified_autoplay: bool,
+) -> Choice {
     let mut choice = pick(candidates, target, threshold);
     choice.requested = requested.to_string();
     choice.resolved = resolution.map(|r| r.track.clone());
@@ -684,6 +713,22 @@ pub fn rank_step(
             ranked = choice.ranked.len(),
             "the catalog named several artists for this title; asking instead of guessing"
         );
+    }
+    if !target.catalogued && choice.confident {
+        if allow_unverified_autoplay {
+            tracing::warn!(
+                query = %target.search_query(),
+                picked = choice.best().map(|b| b.candidate.title()).unwrap_or(""),
+                "ALLOW_UNVERIFIED_AUTOPLAY is on: playing a video no catalog confirmed"
+            );
+        } else {
+            choice.confident = false;
+            tracing::debug!(
+                query = %target.search_query(),
+                ranked = choice.ranked.len(),
+                "no catalog match: offering the closest results rather than playing one"
+            );
+        }
     }
     choice
 }
@@ -699,6 +744,7 @@ pub async fn choose_match(
     searcher: &dyn VideoSearch,
     candidate_count: usize,
     threshold: f64,
+    allow_unverified_autoplay: bool,
 ) -> anyhow::Result<Choice> {
     let requested = request.query.clone();
     let (target, resolution) = resolve_step(request, catalog).await;
@@ -712,12 +758,13 @@ pub async fn choose_match(
         "YouTube returned no results for '{query}'"
     );
 
-    let choice = rank_step(
+    let choice = rank_step_with(
         &candidates,
         &target,
         threshold,
         resolution.as_ref(),
         &requested,
+        allow_unverified_autoplay,
     );
     if let Some(best) = choice.best() {
         tracing::debug!(
@@ -800,6 +847,18 @@ mod tests {
             duration_secs: Some(205.0),
             requested: requested.to_string(),
             catalogued: true,
+        }
+    }
+
+    /// A target the catalog could not resolve: no verified running time, and
+    /// so nothing that can identify the recording.
+    fn unresolved(title: &str, artist: &str) -> Target {
+        Target {
+            artist: Some(artist.to_string()),
+            title: Some(title.to_string()),
+            duration_secs: None,
+            requested: format!("{title} {artist}").to_lowercase(),
+            catalogued: false,
         }
     }
 
@@ -1387,9 +1446,16 @@ mod tests {
                 title: None,
                 artist: None,
             };
-            let choice = choose_match(&request, &catalog, &YtDlpSearch, 8, DEFAULT_MATCH_THRESHOLD)
-                .await
-                .unwrap_or_else(|e| panic!("{heard}: {e:#}"));
+            let choice = choose_match(
+                &request,
+                &catalog,
+                &YtDlpSearch,
+                8,
+                DEFAULT_MATCH_THRESHOLD,
+                true,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{heard}: {e:#}"));
             for scored in &choice.ranked {
                 println!(
                     "{:7.1} {:7.1}s {}",
@@ -1417,6 +1483,12 @@ mod tests {
 
     /// A request the catalog cannot resolve still plays when a result's title
     /// genuinely matches, rather than asking about every song.
+    ///
+    /// Passes `true` for `allow_unverified_autoplay` because that is the whole
+    /// point of the test: with the default off, an unresolved request is always
+    /// offered as a choice and never played, which
+    /// `an_unverified_best_result_is_never_played_by_default` covers without a
+    /// network.
     #[tokio::test]
     #[ignore = "needs network, yt-dlp and the Deezer API"]
     async fn an_unresolvable_request_still_plays_a_real_match() {
@@ -1426,9 +1498,16 @@ mod tests {
             title: None,
             artist: None,
         };
-        let choice = choose_match(&request, &catalog, &YtDlpSearch, 8, DEFAULT_MATCH_THRESHOLD)
-            .await
-            .expect("search should run");
+        let choice = choose_match(
+            &request,
+            &catalog,
+            &YtDlpSearch,
+            8,
+            DEFAULT_MATCH_THRESHOLD,
+            true,
+        )
+        .await
+        .expect("search should run");
         assert!(
             choice.resolved.is_none(),
             "the catalog was supposed to find nothing"
@@ -1528,6 +1607,7 @@ mod tests {
             &searcher,
             8,
             DEFAULT_MATCH_THRESHOLD,
+            false,
         )
         .await
         .expect("a dead catalog must not fail the request");
@@ -1591,6 +1671,7 @@ mod tests {
             &searcher,
             8,
             DEFAULT_MATCH_THRESHOLD,
+            false,
         )
         .await
         .expect("a quota reply is not a failed request");
@@ -1631,6 +1712,7 @@ mod tests {
             &searcher,
             8,
             DEFAULT_MATCH_THRESHOLD,
+            false,
         )
         .await
         .expect("a catalog hit should reach the search");
@@ -1712,6 +1794,7 @@ mod tests {
             &searcher,
             8,
             DEFAULT_MATCH_THRESHOLD,
+            false,
         )
         .await
         .expect_err("an empty search is a failure")
@@ -1737,11 +1820,94 @@ mod tests {
             &Broken,
             8,
             DEFAULT_MATCH_THRESHOLD,
+            false,
         )
         .await
         .expect_err("a failed search is a failure")
         .to_string();
         assert_eq!(err, "could not search YouTube for 'hoolig bts'");
+    }
+
+    /// An unverified result is never played on its own.
+    ///
+    /// This is the "no catalog, plays almost anything" bug. For the transcript
+    /// "love story taylor swift" with no catalog match, *Taylor Swift — Anti-Hero*
+    /// — a different song — scored 26.7 against the unresolved bar of 20, and a
+    /// completely unrelated title scored 19.7. `relevance` alone is 18.0 for
+    /// any upload title sharing one word, and views add up to 12 more.
+    #[test]
+    fn an_unverified_best_result_is_never_played_by_default() {
+        let target = unresolved("love story", "Taylor Swift");
+        let entries = [on_channel(
+            candidate(
+                "Love Story (Taylor's Version) - Taylor Swift",
+                Some(24_000_000),
+                Some(220.0),
+            ),
+            "TaylorSwiftVEVO",
+        )];
+        let raw = pick(&entries, &target, DEFAULT_MATCH_THRESHOLD);
+        assert!(
+            raw.confident,
+            "the unresolved bar is not what protects the listener: {}",
+            raw.best().map(|b| b.parts.explain()).unwrap_or_default()
+        );
+        let choice = rank_step(
+            &entries,
+            &target,
+            DEFAULT_MATCH_THRESHOLD,
+            None,
+            &target.requested,
+        );
+        assert!(!choice.confident, "but it is offered, not played");
+        assert_eq!(
+            choice.top(1)[0].candidate.title(),
+            "Love Story (Taylor's Version) - Taylor Swift",
+            "it is still the best thing to offer"
+        );
+    }
+
+    /// The escape hatch exists for someone who would rather have the wrong song
+    /// than the extra click, and it restores exactly the old behaviour.
+    #[test]
+    fn allowing_unverified_autoplay_restores_the_old_behaviour() {
+        let target = unresolved("love story", "Taylor Swift");
+        let entries = [on_channel(
+            candidate(
+                "Love Story (Taylor's Version) - Taylor Swift",
+                Some(24_000_000),
+                Some(220.0),
+            ),
+            "TaylorSwiftVEVO",
+        )];
+        let choice = rank_step_with(
+            &entries,
+            &target,
+            DEFAULT_MATCH_THRESHOLD,
+            None,
+            &target.requested,
+            true,
+        );
+        assert!(choice.confident);
+    }
+
+    /// A catalog-backed result is unaffected: the whole point of the catalog is
+    /// that its running time makes the answer verifiable.
+    #[test]
+    fn a_catalogued_result_still_plays_without_asking() {
+        let entries = [candidate(
+            "Tame Impala - Dracula",
+            Some(2_777_206),
+            Some(206.0),
+        )];
+        let choice = rank_step(
+            &entries,
+            &catalogued("drakula tame impala"),
+            DEFAULT_MATCH_THRESHOLD,
+            None,
+            "drakula tame impala",
+        );
+        assert!(choice.confident);
     }
 
     /// Hits the real YouTube via yt-dlp. Ignored by default because it needs

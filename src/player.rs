@@ -268,6 +268,7 @@ impl Player {
             &search::YtDlpSearch,
             config.search_candidates,
             config.match_threshold,
+            config.allow_unverified_autoplay,
         )
         .await
         .with_context(|| format!("no match for '{}'", request.query))?;

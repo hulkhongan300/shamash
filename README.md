@@ -153,6 +153,7 @@ a language hint to produce text at all; set `ASR_LANGUAGE=en` for those.
 | `CATALOG_PROVIDER`| no       | Which music catalog resolves requests: `deezer` (default) or `itunes`. Both are keyless |
 | `CATALOG_MATCH_THRESHOLD` | no | How confident a catalog match must be to correct the transcript, 0–1 (default `0.62`) |
 | `MATCH_THRESHOLD` | no       | Lowest score a candidate may reach and still be played without asking, in points (default `90`) |
+| `ALLOW_UNVERIFIED_AUTOPLAY` | no | Play a video found *without* a catalog match instead of offering a choice (default `false`) |
 | `SEARCH_CANDIDATES` | no     | How many YouTube results a request is scored against, 1–50 (default `8`) |
 
 A malformed value is a startup error rather than a silent default, so a typo in
@@ -259,6 +260,12 @@ between equally good uploads.
 
 Below `MATCH_THRESHOLD` the bot does not guess. It posts the three closest
 results in the alert channel as numbered buttons and waits.
+
+When the catalog resolved nothing at all, *nothing* is played unasked — the
+threshold only decides the order the options are offered in. Without a verified
+running time the scorer has a title similarity and a view count and nothing else,
+and that is not enough to tell the studio recording from a remix of it, so
+`ALLOW_UNVERIFIED_AUTOPLAY=true` is the only way to get the old behaviour back.
 
 Some titles are simply not distinctive. "Look at Me" has been recorded by
 Naughty Boy, Tems, The Neighbourhood and others, and a request that named no
