@@ -52,6 +52,7 @@ tokio = { version = "1.53.1", features = ["full"] }
 transcribe-cpp = "0.2.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+rphonetic = "3"
 # transcribe.cpp is the speech engine. It replaced whisper-rs, which cannot
 # coexist with it: both vendor their own copy of ggml and export the same C
 # symbols, so a binary linking both dies with duplicate-symbol errors. Whisper

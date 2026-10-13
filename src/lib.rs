@@ -6,6 +6,7 @@ pub mod direct;
 pub mod fetch;
 pub mod listener;
 pub mod llm;
+pub mod matcher;
 pub mod model;
 pub mod parakeet;
 pub mod parser;
