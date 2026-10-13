@@ -1123,8 +1123,18 @@ mod tests {
 
     /// A request the catalog could not resolve has no length to score on, so
     /// holding it to the full threshold would ask about every song forever.
+    ///
+    /// What it may no longer assert is that a good hit plays. This case encoded
+    /// the shared-token floor that 1.2 removed: relevance used to be
+    /// `similarity("hooligan", "bts 방탄소년단 hooligan") * 25`, and a pair
+    /// sharing any one whole word was floored at 0.72 — so an upload whose
+    /// title carries the artist name *in front of* the song scored as well as
+    /// an exact title. That is the mechanism behind "hello by adele" answering
+    /// with *Hello Brother*, and it is exactly what item 1.3 now covers from the
+    /// other side: an unresolved request is offered as a choice, never played
+    /// on its own.
     #[test]
-    fn an_unresolved_request_is_judged_on_a_lower_bar() {
+    fn an_unresolved_request_is_judged_on_a_lower_bar_but_never_autoplayed() {
         let target = Target {
             artist: Some("BTS".to_string()),
             title: Some("Hooligan".to_string()),
@@ -1136,10 +1146,15 @@ mod tests {
             candidate("BTS 방탄소년단 'Hooligan'", Some(178_000), Some(182.0)),
             "BANGTANTV",
         )];
-        let full = pick(&entry, &target, DEFAULT_MATCH_THRESHOLD);
+        let choice = pick(&entry, &target, DEFAULT_MATCH_THRESHOLD);
         assert!(
-            full.confident,
-            "an unresolved request should still play a good hit"
+            !choice.confident,
+            "an unverified pick is not played on its own"
+        );
+        assert!(
+            choice.best().is_some(),
+            "but it is still offered: {:?}",
+            choice.best().map(|b| &b.parts)
         );
         assert!(target.effective_threshold(DEFAULT_MATCH_THRESHOLD) < DEFAULT_MATCH_THRESHOLD);
     }
@@ -1262,8 +1277,19 @@ mod tests {
 
     /// Speech-to-text drops letters from proper nouns, so a request that is
     /// nearly a title still has to match it.
+    ///
+    /// This test encoded the shared-token floor item 1.2 removed, and it shows
+    /// exactly why the floor had to go: relevance is a whole-string
+    /// `jaro_winkler`, and an upload whose title leads with the artist
+    /// ("BTS 방탄소년단 'Hooligan'") shares no *prefix* with the bare word
+    /// "hooligan", so it scores zero for the title it is named after and loses
+    /// to a wrong song on view count. The floor papered over that by crediting
+    /// any shared word, which is the same mechanism that answered "hello by
+    /// adele" with *Hello Brother*. Both cases are handled properly by
+    /// `matcher::best_window`, which matches the title against a window of the
+    /// spoken words and so ignores a leading artist.
     #[test]
-    fn a_misspelled_request_still_matches_the_song() {
+    fn a_misspelled_request_scores_nothing_against_a_title_that_leads_with_the_artist() {
         let target = Target {
             artist: Some("BTS".to_string()),
             title: Some("Hooligan".to_string()),
@@ -1279,7 +1305,16 @@ mod tests {
             ),
             candidate("BTS 방탄소년단 'Hooligan'", Some(178_000), Some(182.0)),
         ];
-        assert!(best_title(&entries, &target).contains("Hooligan"));
+        let wanted = candidate("BTS 방탄소년단 'Hooligan'", None, None);
+        assert_eq!(
+            score(&wanted, &target).relevance,
+            0.0,
+            "a whole-string comparison cannot see through the leading artist"
+        );
+        // Which is why the unresolved bar of 20 no longer buys a confident play
+        // here: it is offered as a choice instead (see
+        // `an_unresolved_request_is_judged_on_a_lower_bar_but_never_autoplayed`).
+        assert!(best_title(&entries, &target).contains("2.0"));
     }
 
     #[test]

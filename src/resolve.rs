@@ -395,10 +395,17 @@ fn is_noise_word(word: &str) -> bool {
 
 /// How similar two normalized strings are, 0.0 to 1.0.
 ///
-/// Jaro-Winkler over the whole string, then a floor for a token that appears in
-/// both. The floor matters because speech-to-text drops or adds whole words
-/// ("the dark side of the moon" → "dark side moon") and that is a match, while
-/// Winkler alone scores the pair well below any usable threshold.
+/// Jaro-Winkler over the whole string.
+///
+/// There used to be a floor here: any pair sharing one whole word scored at
+/// least 0.72, on the theory that speech-to-text drops or adds whole words
+/// ("the dark side of the moon" → "dark side moon"). It was the single largest
+/// cause of a wrong song being played confidently — the floor is reached by
+/// "hello" ~ "hello brother" and "love story" ~ "love yourself" just as easily
+/// as by a genuine reordered title, and `CATALOG_MATCH_THRESHOLD` sat below it,
+/// so the floor *was* the threshold for anything sharing a word. Word-order
+/// insensitivity now comes from [`crate::matcher`], which scores a window of
+/// words instead of flattening the string.
 pub fn similarity(left: &str, right: &str) -> f32 {
     if left.is_empty() || right.is_empty() {
         return 0.0;
@@ -406,11 +413,7 @@ pub fn similarity(left: &str, right: &str) -> f32 {
     if left == right {
         return 1.0;
     }
-    let base = jaro_winkler(left, right) as f32;
-    let shared = left
-        .split_whitespace()
-        .any(|l| right.split_whitespace().any(|r| l == r));
-    if shared { base.max(0.72) } else { base }
+    jaro_winkler(left, right) as f32
 }
 
 /// Resolves requests to canonical tracks, with a confidence for each.
