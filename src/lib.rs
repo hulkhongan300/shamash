@@ -4,6 +4,7 @@ pub mod config;
 pub mod dashboard;
 pub mod direct;
 pub mod fetch;
+pub mod library;
 pub mod listener;
 pub mod llm;
 pub mod matcher;

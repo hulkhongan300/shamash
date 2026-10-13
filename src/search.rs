@@ -23,11 +23,14 @@
 //! Ranking by views picks the 75 M video. Ranking by length alone picks the
 //! right one, and it does so from a number no uploader can misreport.
 
+use crate::library;
 use crate::matcher;
 use crate::parser::PlayRequest;
 use crate::resolve::{self, CatalogTrack};
 use anyhow::Context;
 use serde::Deserialize;
+#[cfg(test)]
+use serenity::model::id::GuildId;
 use tokio::process::Command;
 
 /// Shorter than this and it is a clip or sound effect, not a song.
@@ -686,6 +689,38 @@ pub enum Resolved {
     },
 }
 
+impl std::fmt::Display for Resolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Track { track, .. } => write!(f, "{}", track.label()),
+            Self::Ask(tracks) => write!(f, "{} songs to choose from", tracks.len()),
+            Self::Unknown { .. } => f.write_str("nothing"),
+        }
+    }
+}
+
+impl Resolved {}
+
+impl From<matcher::Verdict<'_, resolve::Hit>> for Resolved {
+    /// A verdict with no popularity policy applied. Used for the library's own
+    /// history, where the songs are the guild's own and there is no ambiguity to
+    /// settle by popularity.
+    fn from(verdict: matcher::Verdict<'_, resolve::Hit>) -> Self {
+        match verdict {
+            matcher::Verdict::NoMatch => Self::Unknown {
+                heard: String::new(),
+            },
+            matcher::Verdict::Confident(hit) => Self::Track {
+                track: hit.to_track(),
+                durations: hit.durations.clone(),
+            },
+            matcher::Verdict::Ambiguous(options) => {
+                Self::Ask(options.iter().map(|hit| hit.to_track()).collect())
+            }
+        }
+    }
+}
+
 impl Resolved {
     /// The one song, when there is one.
     pub fn as_track(&self) -> Option<&CatalogTrack> {
@@ -735,11 +770,46 @@ pub async fn resolve_request(
     request: &PlayRequest,
     catalog: &resolve::Catalog,
     rewrite: Option<&str>,
+    library: Option<&library::Library>,
+    guild_id: serenity::model::id::GuildId,
 ) -> Resolved {
     let heard = request.query.clone();
+
+    // An exact alias hit skips the catalog entirely: the same misheard phrase
+    // cost the same lookup every time it was heard, and this is what stops it.
+    if let Some(track) = library.and_then(|library| library.recall(&heard)) {
+        tracing::info!(said = %heard, track = %track.label(), "recalled from the song library");
+        return Resolved::Track {
+            track: track.to_catalog_track(),
+            durations: track.duration_secs.into_iter().collect(),
+        };
+    }
+
     // The target carries every reading of the phrase, which is what the query
     // plan is built from; the caller keeps the request for its own text.
-    let hits = catalog.hits(&resolve::Target::from_request(request)).await;
+    let mut hits = catalog.hits(&resolve::Target::from_request(request)).await;
+
+    // Songs this guild has played before are candidates too, judged by the same
+    // matcher as the catalog's own. They are added *after* the catalog so a
+    // remembered song can win, but it cannot make one up: it still has to
+    // explain the request.
+    if let Some(library) = library {
+        let remembered = library.history_hits(guild_id.get());
+        let confident = matches!(
+            matcher::decide(&heard, &remembered, |hit: &resolve::Hit| {
+                (hit.artist.as_str(), hit.title.as_str())
+            }),
+            matcher::Verdict::Confident(_)
+        );
+        if confident {
+            tracing::info!(said = %heard, "the play history alone resolved this request");
+            return matcher::decide(&heard, &remembered, |hit: &resolve::Hit| {
+                (hit.artist.as_str(), hit.title.as_str())
+            })
+            .into();
+        }
+        hits.extend(remembered);
+    }
 
     let verdict = matcher::decide(&heard, &hits, |hit: &resolve::Hit| {
         (hit.artist.as_str(), hit.title.as_str())
@@ -1611,7 +1681,14 @@ mod tests {
     #[tokio::test]
     async fn a_named_song_resolves_to_one_track() {
         let catalog = stub_catalog(vec![catalog_track("Tame Impala", "Dracula", Some(205.0))]);
-        let resolved = resolve_request(&request("drakula by tame impala"), &catalog, None).await;
+        let resolved = resolve_request(
+            &request("drakula by tame impala"),
+            &catalog,
+            None,
+            None,
+            GuildId::new(1),
+        )
+        .await;
         let track = resolved.as_track().expect("one song");
         assert_eq!(track.artist, "Tame Impala");
         assert_eq!(track.title, "Dracula");
@@ -1626,7 +1703,15 @@ mod tests {
             catalog_track("Ben E. King", "Stand By Me", Some(191.0)),
             catalog_track("Oasis", "Stand By Me", Some(254.0)),
         ]);
-        match resolve_request(&request("stand by me"), &catalog, None).await {
+        match resolve_request(
+            &request("stand by me"),
+            &catalog,
+            None,
+            None,
+            GuildId::new(1),
+        )
+        .await
+        {
             Resolved::Ask(tracks) => {
                 assert_eq!(tracks.len(), 2);
                 assert!(tracks.iter().any(|t| t.artist == "Ben E. King"));
@@ -1642,7 +1727,14 @@ mod tests {
     async fn a_catalog_that_finds_nothing_is_unknown_not_an_error() {
         let catalog = resolve::Catalog::with_budget(vec![Box::new(Empty)], 0.72, 2_500);
         assert!(matches!(
-            resolve_request(&request("drakula tame impala"), &catalog, None).await,
+            resolve_request(
+                &request("drakula tame impala"),
+                &catalog,
+                None,
+                None,
+                GuildId::new(1)
+            )
+            .await,
             Resolved::Unknown { .. }
         ));
     }
@@ -1666,7 +1758,14 @@ mod tests {
             }
         }
         let catalog = resolve::Catalog::with_budget(vec![Box::new(Broken)], 0.72, 2_500);
-        let resolved = resolve_request(&request("drakula tame impala"), &catalog, None).await;
+        let resolved = resolve_request(
+            &request("drakula tame impala"),
+            &catalog,
+            None,
+            None,
+            GuildId::new(1),
+        )
+        .await;
         assert!(matches!(resolved, Resolved::Unknown { .. }));
     }
 
@@ -1681,6 +1780,8 @@ mod tests {
             &request("drakoola tame implala"),
             &catalog,
             Some("dracula tame impala"),
+            None,
+            GuildId::new(1),
         )
         .await;
         assert_eq!(
@@ -1702,6 +1803,8 @@ mod tests {
             &request("drakula tame impala"),
             &catalog,
             Some("bohemian rhapsody queen"),
+            None,
+            GuildId::new(1),
         )
         .await;
         assert_eq!(
@@ -1719,6 +1822,8 @@ mod tests {
             &request("drakula tame impala"),
             &catalog,
             Some("hello there"),
+            None,
+            GuildId::new(1),
         )
         .await;
         assert_eq!(
@@ -1968,7 +2073,8 @@ mod tests {
             ("drakula tame impala", "Dracula"),
             ("hoolig bts", "Hooligan"),
         ] {
-            let resolved = resolve_request(&request(heard), &catalog, None).await;
+            let resolved =
+                resolve_request(&request(heard), &catalog, None, None, GuildId::new(1)).await;
             assert!(resolved.as_track().is_some(), "{heard}: {resolved:?}");
             let choice = find_video(&resolved, heard, &YtDlpSearch, 8, DEFAULT_MATCH_THRESHOLD)
                 .await

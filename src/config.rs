@@ -1,5 +1,6 @@
 use anyhow::Context as _;
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 /// Wake words used when `WAKE_WORDS` is unset.
 ///
@@ -207,6 +208,8 @@ pub struct Config {
     pub alert_channel_id: Option<u64>,
     /// Which music catalogs resolve spoken requests, in the order they are asked.
     pub catalog_providers: Vec<String>,
+    /// Where the song library is written, or `None` to have no memory.
+    pub library_path: Option<PathBuf>,
     /// Contact details for MusicBrainz, or `None` to leave that provider off.
     ///
     /// MusicBrainz's terms require a `User-Agent` that identifies the
@@ -266,6 +269,11 @@ impl Config {
         )?;
         Ok(Self {
             catalog_providers,
+            library_path: std::env::var("LIBRARY_PATH")
+                .ok()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from),
             musicbrainz_contact: std::env::var("MUSICBRAINZ_CONTACT")
                 .ok()
                 .map(|c| c.trim().to_string())

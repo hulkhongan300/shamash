@@ -15,6 +15,7 @@ use songbird::events::{Event, EventContext, EventHandler, TrackEvent};
 use songbird::input::{File as FileInput, Input};
 use songbird::tracks::TrackHandle;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -164,6 +165,13 @@ pub struct Player {
     catalog: Arc<resolve::Catalog>,
     /// The "which one did you mean" buttons currently on offer.
     choices: Choices,
+    /// What the bot remembers, or `None` when it has been given no place to
+    /// remember in.
+    pub library: Option<Arc<crate::library::Library>>,
+    /// Queued songs waiting to be judged: kept, or skipped too fast to trust?
+    pending: PendingLearn,
+    /// When the song now playing started, per guild.
+    started_at: StartedAt,
     /// Downloads the audio for a chosen video.
     fetch: Arc<dyn AudioFetcher>,
 }
@@ -378,6 +386,63 @@ impl Cancellation {
     }
 }
 
+/// A queued song waiting to be judged: kept, or skipped too fast to trust.
+///
+/// Keyed by the audio file, so the judgement lands on the right song however
+/// many are queued behind it. Bounded by the queue, which is bounded.
+#[derive(Debug, Clone)]
+struct Pending {
+    /// What was asked for, as heard.
+    said: String,
+    /// What it turned out to mean.
+    track: crate::library::Track,
+    /// Whether a chooser button chose it, rather than a spoken request that
+    /// resolved on its own.
+    from_chooser: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingLearn(Arc<Mutex<HashMap<std::path::PathBuf, Pending>>>);
+
+impl PendingLearn {
+    #[allow(dead_code)]
+    fn set(&self, path: std::path::PathBuf, pending: Pending) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path, pending);
+    }
+
+    /// Takes the judgement for a song, so it is made once however the song
+    /// ended.
+    fn take(&self, path: &std::path::Path) -> Option<Pending> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(path)
+    }
+}
+
+/// When the song playing now started, per guild.
+#[derive(Debug, Clone, Default)]
+struct StartedAt(Arc<Mutex<HashMap<GuildId, std::time::Instant>>>);
+
+impl StartedAt {
+    fn set(&self, guild_id: GuildId, at: std::time::Instant) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(guild_id, at);
+    }
+
+    fn take(&self, guild_id: GuildId) -> Option<std::time::Instant> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&guild_id)
+    }
+}
+
 /// A per-guild counter bumped whenever playback is cancelled.
 ///
 /// A `stop` bumps it; a request still downloading compares against the number
@@ -525,6 +590,9 @@ impl Player {
             dashboards: Dashboards::default(),
             catalog,
             choices: Choices::default(),
+            library: None,
+            pending: PendingLearn::default(),
+            started_at: StartedAt::default(),
             fetch: Arc::new(YtDlpFetch),
         }
     }
@@ -688,7 +756,14 @@ impl Player {
         // lands while this request waits its turn still counts against it.
         let (_serialised, started_at) = self.coordination.begin(guild_id).await;
 
-        let resolved = search::resolve_request(request, &self.catalog, rewrite).await;
+        let resolved = search::resolve_request(
+            request,
+            &self.catalog,
+            rewrite,
+            self.library.as_deref(),
+            guild_id,
+        )
+        .await;
         if matches!(resolved, search::Resolved::Unknown { .. }) {
             return Ok(Outcome::Unknown);
         }
@@ -728,6 +803,20 @@ impl Player {
             return Ok(Outcome::Uploads(choice));
         }
 
+        // The request is being committed; record it for the learning that
+        // happens when the song finishes (or is skipped).
+        self.pending.set(
+            PathBuf::from(best.candidate.url.clone()),
+            Pending {
+                said: request.query.clone(),
+                track: crate::library::Track {
+                    artist: resolved.as_track().unwrap().artist.clone(),
+                    title: resolved.as_track().unwrap().title.clone(),
+                    duration_secs: resolved.as_track().unwrap().duration_secs,
+                },
+                from_chooser: false,
+            },
+        );
         let song = self
             .fetch
             .fetch(guild_id, &best.candidate, &queue.in_use())
@@ -1067,11 +1156,62 @@ impl Player {
     /// was skipped.
     async fn start_next(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
         let advanced = self.queues.get(guild_id).advance();
+        // Whatever just stopped is the last word on whether the request that
+        // queued it was a good one. Checked here rather than on a track event,
+        // because this runs for a skip and for a song that finished on its own
+        // alike, and songbird reports a skipped track as ended too.
+        self.learn_from_stopped(guild_id, advanced.stopped.as_ref());
+        if advanced.current.is_some() {
+            self.started_at.set(guild_id, std::time::Instant::now());
+        }
         if let Some(handle) = start_track(&self.manager, guild_id, &advanced).await {
             self.tracks.set(guild_id, handle.clone());
             self.follow_when_finished(ctx, config, guild_id, handle, advanced.generation);
         }
         self.draw_dashboard(ctx, config, guild_id).await;
+    }
+
+    /// Decides what a finished song says about the request that queued it.
+    ///
+    /// Kept for [`crate::library::KEPT_SECS`], the request is believed and
+    /// remembered. Skipped sooner than that, it is feedback against the phrase
+    /// that asked for it -- twice, and the phrase is forgotten. A song queued by
+    /// pressing a chooser button was already believed when the button was
+    /// pressed, so it is remembered either way.
+    fn learn_from_stopped(&self, guild_id: GuildId, stopped: Option<&Queued>) {
+        let (Some(stopped), Some(library)) = (stopped, self.library.as_deref()) else {
+            return;
+        };
+        let Some(pending) = self.pending.take(&stopped.path) else {
+            return;
+        };
+
+        let played_for = self
+            .started_at
+            .take(guild_id)
+            .map_or(Duration::ZERO, |since| since.elapsed());
+        if played_for >= Duration::from_secs(crate::library::KEPT_SECS) {
+            tracing::info!(
+                guild_id = %guild_id,
+                said = %pending.said,
+                track = %stopped.title,
+                played_for_s = played_for.as_secs(),
+                "remembering what that request meant"
+            );
+            library.remember(
+                guild_id.get(),
+                &pending.said,
+                &pending.track,
+                pending.from_chooser,
+            );
+        } else if pending.from_chooser {
+            // The listener chose this by pressing it, so a quick skip is them
+            // changing their mind rather than the bot having guessed wrong.
+            library.remember(guild_id.get(), &pending.said, &pending.track, true);
+        } else {
+            library.quick_skip(&pending.said, &pending.track);
+        }
+        library.maybe_save();
     }
 
     /// Starts the next queued song once this one finishes on its own.
