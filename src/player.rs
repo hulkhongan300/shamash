@@ -791,7 +791,7 @@ impl Player {
             handle.play()
         };
         if let Err(e) = result {
-            println!("failed to change playback state: {e}");
+            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "failed to change playback state");
             return None;
         }
         queue.set_paused(paused);
@@ -1006,7 +1006,7 @@ async fn draw(
                 // The message was deleted or access was lost, so post a new
                 // dashboard rather than going quiet for the rest of the
                 // session.
-                println!("failed to update dashboard: {e:#}");
+                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "failed to update the dashboard");
                 dashboards.forget(guild_id);
                 if let Ok(sent) = channel.send_message(&ctx.http, view.into_message()).await {
                     dashboards.set(guild_id, channel, sent.id);
@@ -1015,7 +1015,9 @@ async fn draw(
         }
         None => match channel.send_message(&ctx.http, view.into_message()).await {
             Ok(sent) => dashboards.set(guild_id, channel, sent.id),
-            Err(e) => println!("failed to post dashboard: {e:#}"),
+            Err(e) => {
+                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "failed to post the dashboard")
+            }
         },
     }
 }

@@ -93,21 +93,19 @@ impl VoiceService {
         }
         {
             let handler = call.lock().await;
-            println!(
-                "  deaf: {}, mute: {}, voice server: {}",
-                handler.is_deaf(),
-                handler.is_mute(),
-                if connected {
-                    "connected"
-                } else {
-                    "NOT CONNECTED after 10s"
-                },
+            tracing::info!(
+                guild_id = %guild_id,
+                deaf = handler.is_deaf(),
+                mute = handler.is_mute(),
+                voice_server = if connected { "connected" } else { "NOT CONNECTED after 10s" },
+                "joined the voice channel"
             );
         }
         if !connected {
-            println!(
-                "No audio can arrive while the voice server connection is missing; \
-                 check RUST_LOG=debug output for the reason."
+            tracing::error!(
+                guild_id = %guild_id,
+                "no audio can arrive while the voice server connection is missing; \
+                 set RUST_LOG=shamash=debug for the reason"
             );
         }
 
@@ -135,7 +133,12 @@ impl VoiceService {
         let config = self.config.clone();
         let mut wake_words: Vec<&str> = config.wake_words.iter().map(String::as_str).collect();
         wake_words.sort_unstable();
-        println!("Listening in {channel} for: {}", wake_words.join(", "));
+        tracing::info!(
+            guild_id = %guild_id,
+            channel = %channel,
+            wake_words = %wake_words.join(", "),
+            "listening for a wake word"
+        );
         // The callback is awaited inside the gate loop rather than spawned, so a
         // request cannot be acted on while the model for its wake word is still
         // loading. Audio arriving in that window waits in the channel.
@@ -187,7 +190,7 @@ impl VoiceService {
 
         if member_count == 0 {
             if connected_to_target {
-                println!("Voice channel {target} is empty; leaving");
+                tracing::info!(guild_id = %guild_id, channel = %target, "the voice channel is empty; leaving");
                 self.manager
                     .remove(guild_id)
                     .await
@@ -195,7 +198,7 @@ impl VoiceService {
             }
         } else if !connected_to_target {
             self.join_with_retry(ctx, guild_id, target).await?;
-            println!("Joined voice channel {target}");
+            tracing::info!(guild_id = %guild_id, channel = %target, "joined the voice channel");
         }
         Ok(())
     }
@@ -217,7 +220,13 @@ impl VoiceService {
             match self.join_and_listen(ctx, guild_id, channel).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    println!("join attempt {attempt} of {JOIN_ATTEMPTS} failed: {e:#}");
+                    tracing::warn!(
+                        guild_id = %guild_id,
+                        attempt = attempt,
+                        of = JOIN_ATTEMPTS,
+                        error = %format!("{e:#}"),
+                        "joining the voice channel failed; retrying"
+                    );
                     last = Some(e);
                     tokio::time::sleep(JOIN_RETRY_DELAY).await;
                 }

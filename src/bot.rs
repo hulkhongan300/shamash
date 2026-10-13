@@ -64,60 +64,50 @@ fn build_transcriber(
     })
 }
 
-/// Prints the loaded settings so a misconfigured run is obvious at a glance.
+/// Logs the loaded settings so a misconfigured run is obvious at a glance.
+///
+/// One `info!` line per setting rather than a block of prints: `RUST_LOG` then
+/// controls this along with everything else, and the settings can be filtered
+/// out of a busy log.
 fn log_configuration(config: &Config, big_models: &BigModels) {
     let mut wake_words: Vec<&str> = config.wake_words.iter().map(String::as_str).collect();
     wake_words.sort_unstable();
-    println!("Shamash starting up");
-    match config.asr_engine {
-        AsrEngine::Direct => {
-            println!("  asr engine:    transcribe.cpp (in-process, model resident)");
-            println!("  wake model:    {}", config.wake_model);
-            println!(
-                "  request model: {} (loaded on the first wake word)",
-                config.parakeet_model
-            );
-            if let Some(language) = &config.asr_language {
-                println!("  asr language:  {language}");
-            }
-        }
-        AsrEngine::Handy => {
-            println!("  asr engine:    handy (parakeet, subprocess)");
-            println!("  wake model:    {}", config.wake_model);
-            println!(
-                "  request model: {} (loaded on the first wake word)",
-                config.parakeet_model
-            );
-        }
-    }
-    println!(
-        "  rewrite model: {}",
-        config
-            .llm_endpoint
-            .as_deref()
-            .map(|endpoint| format!("{} ({})", config.llm_model, endpoint))
-            .unwrap_or_else(|| "off, the transcript is used as heard".to_string())
-    );
-    println!("  wake words:    {}", wake_words.join(", "));
-    println!("  voice channel: {}", config.voice_channel_id);
-    match config.alert_channel_id {
-        Some(id) => println!("  text channel:  {id}"),
-        None => println!("  text channel:  auto (system channel, else first text channel)"),
-    }
-    println!(
-        "  request model loaded: {}",
-        if big_models.is_loaded() { "yes" } else { "no" }
-    );
-    match std::process::Command::new("yt-dlp")
+    let asr = match config.asr_engine {
+        AsrEngine::Direct => "transcribe.cpp (in-process, model resident)",
+        AsrEngine::Handy => "handy (parakeet, subprocess)",
+    };
+    let rewrite = config
+        .llm_endpoint
+        .as_deref()
+        .map(|endpoint| format!("{} ({})", config.llm_model, endpoint))
+        .unwrap_or_else(|| "off, the transcript is used as heard".to_string());
+    let text_channel = match config.alert_channel_id {
+        Some(id) => id.to_string(),
+        None => "auto (system channel, else first text channel)".to_string(),
+    };
+    let yt_dlp = match std::process::Command::new("yt-dlp")
         .arg("--version")
         .output()
     {
-        Ok(output) => println!(
-            "  yt-dlp:        {}",
-            String::from_utf8_lossy(&output.stdout).trim()
-        ),
-        Err(_) => println!("  yt-dlp:        NOT FOUND; playback will fail"),
-    }
+        Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        Err(_) => "NOT FOUND; playback will fail".to_string(),
+    };
+
+    tracing::info!(
+        asr_engine = asr,
+        wake_model = %config.wake_model,
+        request_model = %config.parakeet_model,
+        request_model_loaded = big_models.is_loaded(),
+        asr_language = config.asr_language.as_deref().unwrap_or("auto"),
+        rewrite_model = %rewrite,
+        wake_words = %wake_words.join(", "),
+        voice_channel = config.voice_channel_id,
+        text_channel = %text_channel,
+        catalog_provider = %config.catalog_provider,
+        catalog_match_threshold = config.catalog_match_threshold,
+        yt_dlp = %yt_dlp,
+        "Shamash starting up"
+    );
 }
 
 pub struct Handler;
@@ -125,11 +115,11 @@ pub struct Handler;
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
-        println!("Shamash is online as {}", ready.user.name);
+        tracing::info!(user = %ready.user.name, "Shamash is online");
         let command =
             CreateCommand::new("stop").description("Stop playback and leave the voice channel");
         if let Err(e) = Command::create_global_command(&ctx.http, command).await {
-            println!("failed to register /stop command: {e}");
+            tracing::warn!(error = %format!("{e:#}"), "failed to register /stop command");
         }
 
         // One player for the whole process, so the voice listener and the
@@ -138,7 +128,7 @@ impl EventHandler for Handler {
         let manager = match songbird::get(&ctx).await {
             Some(manager) => manager,
             None => {
-                println!("songbird unavailable, playback is disabled");
+                tracing::error!("songbird unavailable, playback is disabled");
                 return;
             }
         };
@@ -148,7 +138,7 @@ impl EventHandler for Handler {
         // songs, but it will pick the wrong one much more often.
         let config = ctx.data.read().await.get::<ConfigKey>().cloned();
         let Some(config) = config else {
-            println!("config unavailable, playback is disabled");
+            tracing::error!("config unavailable, playback is disabled");
             return;
         };
         match resolve::Catalog::from_config(&config) {
@@ -158,7 +148,9 @@ impl EventHandler for Handler {
                     .await
                     .insert::<PlayerKey>(Arc::new(Player::new(manager, Arc::new(catalog))));
             }
-            Err(e) => println!("could not reach the song catalog, playback is disabled: {e:#}"),
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "could not reach the song catalog, playback is disabled")
+            }
         }
     }
 
@@ -181,7 +173,7 @@ impl EventHandler for Handler {
         }
 
         if let Err(e) = service.sync_channel(&ctx, guild_id).await {
-            println!("voice channel sync failed for {guild_id}: {e:#}");
+            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "voice channel sync failed");
         }
     }
 

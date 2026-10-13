@@ -119,6 +119,14 @@ pub async fn rewrite(
         .send()
         .await
         .with_context(|| format!("could not reach the rewrite endpoint at {url}"))?;
+    // Checked before decoding: an error page, a proxy's HTML, or a 500 with an
+    // empty body all decode-fail with a message that says nothing about the
+    // real problem, and the status line does.
+    let status = response.status();
+    anyhow::ensure!(
+        status.is_success(),
+        "the rewrite endpoint at {url} answered HTTP {status}"
+    );
     let reply: ChatReply = response
         .json()
         .await
@@ -346,5 +354,97 @@ mod tests {
             .await
             .unwrap();
         assert!(outcome.is_none());
+    }
+
+    /// A failed HTTP status must be reported as itself.
+    ///
+    /// The body used to be decoded before the status was looked at, so a 500
+    /// from a proxy, an error page from a reverse proxy, or a 401 with an empty
+    /// body all failed with "did not answer with a chat reply" -- a message that
+    /// names the symptom rather than the cause, and sends you looking at the
+    /// reply format instead of at the endpoint.
+    #[tokio::test]
+    async fn a_failed_status_is_reported_as_itself() {
+        let endpoint = one_shot_endpoint(500, "upstream exploded").await;
+        let err = rewrite(
+            &reqwest::Client::new(),
+            &endpoint,
+            "llama3.2",
+            "bot play hoolig bts",
+        )
+        .await
+        .expect_err("a 500 is a failure");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("500"),
+            "the status should be named: {message}"
+        );
+        assert!(
+            !message.contains("chat reply"),
+            "the symptom must not be reported as the cause: {message}"
+        );
+    }
+
+    /// And a 200 that is not a chat reply is still reported as what it is.
+    #[tokio::test]
+    async fn a_200_that_is_not_a_chat_reply_is_still_a_decode_failure() {
+        let endpoint = one_shot_endpoint(200, "<html>hello</html>").await;
+        let err = rewrite(
+            &reqwest::Client::new(),
+            &endpoint,
+            "llama3.2",
+            "bot play hoolig bts",
+        )
+        .await
+        .expect_err("an HTML body is not a chat reply");
+        assert!(format!("{err:#}").contains("chat reply"), "{err:#}");
+    }
+
+    /// The happy path, so the status check above is not the only thing tested.
+    #[tokio::test]
+    async fn a_chat_reply_becomes_a_request() {
+        let endpoint = one_shot_endpoint(
+            200,
+            r#"{"message":{"role":"assistant","content":"Hooligan by BTS"}}"#,
+        )
+        .await;
+        assert_eq!(
+            rewrite(
+                &reqwest::Client::new(),
+                &endpoint,
+                "llama3.2",
+                "bot play hoolig bts"
+            )
+            .await
+            .expect("a chat reply"),
+            Some("Hooligan by BTS".to_string())
+        );
+    }
+
+    /// A throwaway HTTP server that answers every request with one fixed
+    /// status and body.
+    ///
+    /// Bound to an ephemeral port on loopback, so it cannot collide with
+    /// anything and needs no configuration.
+    async fn one_shot_endpoint(status: u16, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let address = listener.local_addr().expect("the bound address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("a request");
+            // Read the request far enough that the client has finished sending.
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        });
+        format!("http://{address}")
     }
 }

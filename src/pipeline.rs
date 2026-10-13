@@ -99,7 +99,7 @@ impl ListenerPipeline {
     /// comes before any waiting, so it cannot be mistaken for the answer.
     async fn handle_wake(&self, guild_id: GuildId, hit: WakeHit) {
         if let Err(e) = self.player.acknowledge(guild_id, Tone::Wake).await {
-            println!("[{guild_id}] wake tone failed: {e:#}");
+            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "wake tone failed");
         }
 
         let models = Arc::clone(&self.models);
@@ -112,21 +112,22 @@ impl ListenerPipeline {
                 // Nothing can be answered now, so the gate is not told the model
                 // is ready: it closes the capture on its length bound instead of
                 // transcribing with a model that is not there.
-                println!("[{guild_id}] could not load the larger model: {e:#}");
+                tracing::error!(guild_id = %guild_id, error = %format!("{e:#}"), "could not load the larger model");
                 return;
             }
             Err(e) => {
-                println!("[{guild_id}] model load task failed: {e}");
+                tracing::error!(guild_id = %guild_id, error = %format!("{e:#}"), "model load task failed");
                 return;
             }
         };
-        println!(
-            "[{guild_id}] larger model ready ({}), listening for a request",
-            transcriber.sample_rate()
+        tracing::info!(
+            guild_id = %guild_id,
+            sample_rate = transcriber.sample_rate(),
+            "the larger model is ready; listening for a request"
         );
 
         if let Err(e) = self.player.acknowledge(guild_id, Tone::Ready).await {
-            println!("[{guild_id}] ready tone failed: {e:#}");
+            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "ready tone failed");
         }
         // Set only now, so the silence before the speaker starts talking cannot
         // close the capture before anything has been said.
@@ -143,7 +144,7 @@ impl ListenerPipeline {
         audio: Vec<f32>,
     ) {
         if audio.is_empty() {
-            println!("[{guild_id}] ready for a request, but nothing was said");
+            tracing::debug!(guild_id = %guild_id, "ready for a request, but nothing was said");
             return;
         }
 
@@ -154,11 +155,11 @@ impl ListenerPipeline {
         let transcriber = match loaded {
             Ok(Ok(transcriber)) => transcriber,
             Ok(Err(e)) => {
-                println!("[{guild_id}] no larger model available: {e:#}");
+                tracing::error!(guild_id = %guild_id, error = %format!("{e:#}"), "no larger model available");
                 return;
             }
             Err(e) => {
-                println!("[{guild_id}] model lookup task failed: {e}");
+                tracing::error!(guild_id = %guild_id, error = %format!("{e:#}"), "model lookup task failed");
                 return;
             }
         };
@@ -167,11 +168,11 @@ impl ListenerPipeline {
         let transcript = match inferred {
             Ok(Ok(transcript)) => transcript,
             Ok(Err(e)) => {
-                println!("[{guild_id}] transcription failed: {e:#}");
+                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "transcription failed");
                 return;
             }
             Err(e) => {
-                println!("[{guild_id}] transcription task failed: {e}");
+                tracing::error!(guild_id = %guild_id, error = %format!("{e:#}"), "transcription task failed");
                 return;
             }
         };
@@ -179,24 +180,29 @@ impl ListenerPipeline {
         if transcript.trim().is_empty() {
             self.muted_utterances
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            println!("[{guild_id}] heard a request but no words in it (too quiet, or too short?)");
+            tracing::debug!(guild_id = %guild_id, "heard a request but no words in it (too quiet, or too short?)");
             return;
         }
         let skipped = self
             .muted_utterances
             .swap(0, std::sync::atomic::Ordering::Relaxed);
         if skipped > 0 {
-            println!("[{guild_id}] request: {transcript:?} (skipped {skipped} unintelligible)");
+            tracing::info!(
+                guild_id = %guild_id,
+                transcript = %transcript,
+                skipped = skipped,
+                "request heard"
+            );
         } else {
-            println!("[{guild_id}] request: {transcript:?}");
+            tracing::info!(guild_id = %guild_id, transcript = %transcript, "request heard");
         }
 
         let Some(request) = self.request_for(ctx, config, guild_id, &transcript).await else {
             return;
         };
-        println!("[{guild_id}] play {}", request.query);
+        tracing::info!(guild_id = %guild_id, request = %request.query, "playing a request");
         if let Err(e) = self.player.play(ctx, config, guild_id, &request).await {
-            println!("[{guild_id}] playback failed: {e:#}");
+            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "playback failed");
         }
     }
 
@@ -218,12 +224,13 @@ impl ListenerPipeline {
             // applied to it rather than trusting it to have stripped one.
             if let Some(query) = self.parser.strip_command(&rewritten) {
                 let request = self.parser.request_from_query(&query)?;
-                println!("[{guild_id}] rewrote the request to {request:?}");
+                tracing::info!(guild_id = %guild_id, request = %request.query, "the transcript rewrite changed the request");
                 return Some(request);
             }
-            println!(
-                "[{guild_id}] the rewrite {rewritten:?} was not a song request, \
-                 using the words as heard"
+            tracing::info!(
+                guild_id = %guild_id,
+                rewrite = %rewritten,
+                "the rewrite was not a song request; using the words as heard"
             );
         }
         self.parse_heard(guild_id, transcript)
@@ -246,7 +253,7 @@ impl ListenerPipeline {
             Ok(Some(rewritten)) => Some(rewritten),
             Ok(None) => None,
             Err(e) => {
-                println!("[{guild_id}] the transcript rewrite failed ({e:#})");
+                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "the transcript rewrite failed");
                 None
             }
         }
@@ -265,7 +272,7 @@ impl ListenerPipeline {
             }
             Err(ParseMiss::EmptyRequest) => {
                 self.awaiting_query.expect();
-                println!("[{guild_id}] heard the wake word and \"play\", waiting for a title");
+                tracing::info!(guild_id = %guild_id, "heard the wake word and \"play\"; waiting for a title");
                 None
             }
             Err(miss) => {
@@ -276,8 +283,10 @@ impl ListenerPipeline {
                     .flatten();
                 match completed {
                     Some(request) => {
-                        println!(
-                            "[{guild_id}] taking {transcript:?} as the title for that command"
+                        tracing::info!(
+                            guild_id = %guild_id,
+                            transcript = %transcript,
+                            "taking this as the title for the waiting command"
                         );
                         Some(request)
                     }
@@ -289,8 +298,11 @@ impl ListenerPipeline {
                             .cloned()
                             .collect::<Vec<_>>()
                             .join(", ");
-                        println!(
-                            "[{guild_id}] not a play command: {miss} (wake words: {wake_words})"
+                        tracing::debug!(
+                            guild_id = %guild_id,
+                            reason = %miss,
+                            wake_words = %wake_words,
+                            "not a play command"
                         );
                         None
                     }
