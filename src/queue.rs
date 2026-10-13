@@ -174,6 +174,22 @@ impl Queue {
     pub fn is_full(&self) -> bool {
         self.lock().pending.len() >= MAX_QUEUE
     }
+
+    /// Every song whose audio must be kept: the one playing, and every one
+    /// waiting behind it.
+    ///
+    /// Used by the cache to know which downloads it is not allowed to prune.
+    /// A queued song's file is read by songbird when it starts, so deleting it
+    /// because too many newer files arrived plays silence instead of the song.
+    pub fn in_use(&self) -> Vec<PathBuf> {
+        let state = self.lock();
+        state
+            .current
+            .iter()
+            .chain(state.pending.iter())
+            .map(|song| song.path.clone())
+            .collect()
+    }
 }
 
 /// The queues of every guild the bot is in, keyed by guild.
@@ -370,6 +386,44 @@ mod tests {
         let other = queue.clone();
         queue.push(song("shared"));
         assert_eq!(other.pending(), 1);
+    }
+
+    /// The cache must know which audio is still wanted: the song playing and
+    /// every one queued behind it. `prune` never deletes these.
+    #[test]
+    fn in_use_covers_the_playing_song_and_the_whole_queue() {
+        let queue = Queue::default();
+        assert!(
+            queue.in_use().is_empty(),
+            "an empty queue needs nothing kept"
+        );
+
+        assert!(queue.push(song("first")));
+        assert!(queue.push(song("second")));
+        assert_eq!(
+            queue.in_use(),
+            vec![
+                PathBuf::from("/tmp/first.m4a"),
+                PathBuf::from("/tmp/second.m4a")
+            ]
+        );
+
+        queue.advance();
+        // The playing song is still wanted, and the queue behind it too.
+        assert_eq!(queue.in_use().len(), 2);
+
+        queue.clear();
+        // With nothing playing, only the waiting song is still wanted.
+        assert_eq!(queue.in_use(), vec![PathBuf::from("/tmp/second.m4a")]);
+
+        queue.advance();
+        assert_eq!(
+            queue.in_use(),
+            vec![PathBuf::from("/tmp/second.m4a")],
+            "the song that moved to playing is still wanted"
+        );
+        queue.clear();
+        assert!(queue.in_use().is_empty());
     }
 
     #[test]

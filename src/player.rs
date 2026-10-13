@@ -101,7 +101,17 @@ pub struct Player {
 /// happens relative to the locks, which cannot be observed with a real yt-dlp.
 #[serenity::async_trait]
 pub trait AudioFetcher: Send + Sync {
-    async fn fetch(&self, guild_id: GuildId, found: &search::Candidate) -> anyhow::Result<Queued>;
+    /// Downloads `found` and returns the song to queue.
+    ///
+    /// `in_use` names the audio already playing or queued, which the download
+    /// cache must not prune: songbird reads a queued song's file when it starts,
+    /// so deleting it plays silence instead of the song.
+    async fn fetch(
+        &self,
+        guild_id: GuildId,
+        found: &search::Candidate,
+        in_use: &[std::path::PathBuf],
+    ) -> anyhow::Result<Queued>;
 }
 
 /// The real download, through yt-dlp.
@@ -109,15 +119,25 @@ pub struct YtDlpFetch;
 
 #[serenity::async_trait]
 impl AudioFetcher for YtDlpFetch {
-    async fn fetch(&self, guild_id: GuildId, found: &search::Candidate) -> anyhow::Result<Queued> {
+    async fn fetch(
+        &self,
+        guild_id: GuildId,
+        found: &search::Candidate,
+        in_use: &[std::path::PathBuf],
+    ) -> anyhow::Result<Queued> {
         // A video with no id cannot be cached or given a thumbnail, but the
         // audio is still worth playing.
         let video_id = found.video_id().unwrap_or_default().to_string();
         // Downloaded before the song joins the queue, so a failed fetch leaves
         // the queue and whatever is playing alone.
-        let path = fetch::fetch(&video_id, &found.url, &fetch::cache_dir(guild_id.get()))
-            .await
-            .with_context(|| format!("could not fetch '{}'", found.title()))?;
+        let path = fetch::fetch(
+            &video_id,
+            &found.url,
+            &fetch::cache_dir(guild_id.get()),
+            in_use,
+        )
+        .await
+        .with_context(|| format!("could not fetch '{}'", found.title()))?;
 
         Ok(Queued {
             path,
@@ -487,7 +507,10 @@ impl Player {
             return Ok(Outcome::Offered(choice));
         }
 
-        let song = self.fetch.fetch(guild_id, &best.candidate).await?;
+        let song = self
+            .fetch
+            .fetch(guild_id, &best.candidate, &queue.in_use())
+            .await?;
         Ok(self.outcome(guild_id, &queue, song, started_at).await)
     }
 
@@ -579,7 +602,10 @@ impl Player {
         // The download runs outside the playback lock for the same reason the
         // spoken path does: a press on "1" must not freeze the Skip button.
         let started_at = self.coordination.generations.get(guild_id).now();
-        let song = self.fetch.fetch(guild_id, &candidate).await?;
+        let song = self
+            .fetch
+            .fetch(guild_id, &candidate, &self.queues.get(guild_id).in_use())
+            .await?;
         let outcome = self
             .outcome(guild_id, &self.queues.get(guild_id), song, started_at)
             .await;
@@ -778,8 +804,9 @@ impl EventHandler for Ended {
 /// Stops the song that was playing and starts the next one an advance chose.
 ///
 /// Returns `None` when the queue has run dry or the bot has left the voice
-/// channel. The finished song's file is removed, which is safe because every
-/// song has a file of its own and the cache keeps the newest few.
+/// channel. The finished song's file is left on disk: `fetch::prune` removes
+/// what is neither queued nor among the newest few, so deleting it here would
+/// only undo the cache that makes a repeated request instant.
 ///
 /// The call is locked with `await` rather than `blocking_lock`, which panics
 /// when it is reached from inside a runtime thread.
@@ -788,20 +815,16 @@ async fn start_track(
     guild_id: GuildId,
     advanced: &Advanced,
 ) -> Option<TrackHandle> {
-    let started = match (manager.get(guild_id), &advanced.current) {
+    match (manager.get(guild_id), &advanced.current) {
         (Some(call), Some(song)) => {
             let mut handler = call.lock().await;
             handler.stop();
-            println!("[{guild_id}] playing \u{201c}{}\u{201d}", song.title);
+            tracing::info!(guild_id = %guild_id, title = %song.title, "playing");
             let path = song.path.clone();
             Some(handler.play_input(Input::from(FileInput::new(path))))
         }
         _ => None,
-    };
-    if let Some(song) = &advanced.stopped {
-        let _ = std::fs::remove_file(&song.path);
     }
-    started
 }
 
 /// Draws or updates a guild's dashboard message.
@@ -947,7 +970,7 @@ mod tests {
             coordination: coordination.clone(),
         };
         probe
-            .fetch(guild, &candidate("https://youtu.be/x"))
+            .fetch(guild, &candidate("https://youtu.be/x"), &[])
             .await
             .unwrap();
     }
@@ -1107,6 +1130,7 @@ mod tests {
             &self,
             guild_id: GuildId,
             found: &search::Candidate,
+            _in_use: &[std::path::PathBuf],
         ) -> anyhow::Result<Queued> {
             let lock = self.coordination.busy(guild_id);
             let guard = tokio::time::timeout(Duration::from_millis(500), lock.lock_owned())
