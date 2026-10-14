@@ -13,8 +13,7 @@ use serenity::builder::{
     CreateCommand, CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseMessage,
 };
 use serenity::model::application::{
-    Command, CommandInteraction, CommandOptionType, ComponentInteraction, Interaction,
-    ResolvedValue,
+    CommandInteraction, CommandOptionType, ComponentInteraction, Interaction, ResolvedValue,
 };
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
@@ -133,9 +132,12 @@ fn commands() -> Vec<CreateCommand> {
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(user = %ready.user.name, "Shamash is online");
-        if let Err(e) = Command::set_global_commands(&ctx.http, commands()).await {
-            tracing::warn!(error = %format!("{e:#}"), "failed to register the global commands");
-        }
+        // Deliberately no global registration. `guild_create` registers per
+        // guild, which is both instant -- a global command takes up to an hour
+        // to reach a client -- and shadowed by the guild copy, so having both
+        // only ever showed the same command twice. A guild copy works in any
+        // guild the bot is invited to later, because GUILD_CREATE fires for
+        // each of them on connect.
 
         // One player for the whole process, so the voice listener and the
         // dashboard buttons act on the same queue. Built here because that is
