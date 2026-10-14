@@ -302,13 +302,21 @@ impl Handler {
             return;
         };
 
-        // Only the person who asked may answer it. A `/play` chooser is an
-        // answer to one question, not a shared control surface.
-        if !player.ask_belongs_to(guild_id, button.user.id) {
+        // A chooser raised by speech belongs to the voice channel, so it keeps the
+        // channel's rule rather than a named person. `/play` is the other way
+        // round and is checked by `ask_belongs_to` below.
+        let spoken = player.ask_is_spoken(guild_id);
+        let may_answer = if spoken {
+            may_control(ctx, guild_id, button.user.id).await
+        } else {
+            player.ask_belongs_to(guild_id, button.user.id)
+        };
+        if !may_answer {
             tracing::info!(
                 guild_id = %guild_id,
                 user = %button.user.id,
-                "a /play result was pressed by someone who did not ask for it"
+                spoken,
+                "a song was chosen by someone who may not answer this question"
             );
             refuse(ctx, button).await;
             return;
@@ -439,56 +447,14 @@ impl Handler {
     /// The press is acknowledged straight away, because Discord fails an
     /// interaction that goes unanswered within three seconds and a skip may
     /// have to download nothing but still waits on the voice lock.
-    /// Plays the song behind a "which one did you mean" button.
-    async fn choose_song(&self, ctx: &Context, button: ComponentInteraction, key: &str) {
-        let Some(guild_id) = button.guild_id else {
-            return;
-        };
-        if !may_control(ctx, guild_id, button.user.id).await {
-            tracing::info!(
-                guild_id = %guild_id,
-                user = %button.user.id,
-                "a song choice was pressed from outside the voice channel"
-            );
-            refuse(ctx, button).await;
-            return;
-        }
-        if let Err(e) = button.defer(&ctx.http).await {
-            tracing::warn!("failed to acknowledge a song choice: {e}");
-            return;
-        }
-        let (config, player) = {
-            let data = ctx.data.read().await;
-            (
-                data.get::<ConfigKey>().cloned(),
-                data.get::<PlayerKey>().cloned(),
-            )
-        };
-        let (Some(config), Some(player)) = (config, player) else {
-            tracing::warn!("song choice pressed before the bot was ready");
-            return;
-        };
-
-        match player.play_chosen(ctx, &config, guild_id, key).await {
-            // The question has been answered, so it goes; the dashboard stays.
-            Ok(()) => {
-                tracing::info!(guild_id = %guild_id, "played the chosen song");
-                drop_question(ctx, button.channel_id, button.message.id, guild_id).await;
-            }
-            Err(e) => {
-                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not play the chosen song");
-                // The choice is spent either way, so the question goes rather
-                // than offering a second press that cannot do anything.
-                drop_question(ctx, button.channel_id, button.message.id, guild_id).await;
-            }
-        }
-    }
-
     async fn dashboard_button(&self, ctx: &Context, button: ComponentInteraction) {
-        // Checked before the playback actions, because a choice button is not
-        // one of them and would be rejected by `action_from_id`.
-        if let Some(video_id) = dashboard::picked_key(&button.data.custom_id).map(str::to_owned) {
-            return self.choose_song(ctx, button, &video_id).await;
+        // A choice button is not a playback action and would be rejected by
+        // `action_from_id`, so it is answered before the actions are read.
+        if dashboard::picked_key(&button.data.custom_id).is_some() {
+            // Left over from the previous chooser, which keyed its buttons by
+            // video id. The one chooser now numbers them instead.
+            tracing::debug!("ignoring a button from the superseded chooser");
+            return;
         }
         let Some(action) = dashboard::action_from_id(&button.data.custom_id) else {
             // Some other component's press; not ours to answer.
@@ -552,7 +518,7 @@ impl Handler {
             // Handled after the player lookup because it is not a playback
             // action and needs no dashboard.
             dashboard::ACTION_NONE => {
-                if !player.dismiss_choice(guild_id) {
+                if !player.dismiss_ask(guild_id) {
                     return;
                 }
                 drop_question(ctx, button.channel_id, button.message.id, guild_id).await;

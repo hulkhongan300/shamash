@@ -412,6 +412,13 @@ never reshuffles what you have already looked at. It is disabled on the last
 page rather than removed, because a button that vanishes makes the message look
 broken.
 
+Speech asks the same question through the same chooser. When the bot is
+confident about what it heard it just plays, as before; when it is not, or when
+the catalog has never heard of the song, it posts this same paged chooser
+instead of a separate short list. The difference is only who may answer: a
+`/play` chooser belongs to whoever typed it, while one raised by speech is the
+voice channel's, because the bot hears a voice and cannot tell who spoke.
+
 Picking a song finds its upload and queues it. The buttons name *songs*, not
 videos: that is the order that makes a second page worth having, because a
 catalog has far more songs under a query than there are uploads worth offering.
