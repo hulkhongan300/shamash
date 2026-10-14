@@ -10,9 +10,12 @@ use crate::voice::{VoiceService, decode_config};
 use crate::wake::BigModels;
 use serenity::async_trait;
 use serenity::builder::{
-    CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage,
+    CreateCommand, CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseMessage,
 };
-use serenity::model::application::{Command, ComponentInteraction, Interaction};
+use serenity::model::application::{
+    Command, CommandInteraction, CommandOptionType, ComponentInteraction, Interaction,
+    ResolvedValue,
+};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::model::voice::VoiceState;
@@ -117,10 +120,22 @@ pub struct Handler;
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(user = %ready.user.name, "Shamash is online");
-        let command =
-            CreateCommand::new("stop").description("Stop playback and leave the voice channel");
-        if let Err(e) = Command::create_global_command(&ctx.http, command).await {
-            tracing::warn!(error = %format!("{e:#}"), "failed to register /stop command");
+        for command in [
+            CreateCommand::new("stop").description("Stop playback and leave the voice channel"),
+            CreateCommand::new("play")
+                .description("Search the catalog for a song and choose from the results")
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "song",
+                        "What to search for",
+                    )
+                    .required(true),
+                ),
+        ] {
+            if let Err(e) = Command::create_global_command(&ctx.http, command).await {
+                tracing::warn!(error = %format!("{e:#}"), "failed to register a command");
+            }
         }
 
         // One player for the whole process, so the voice listener and the
@@ -201,8 +216,12 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
-            Interaction::Command(command) => self.slash_stop(&ctx, command).await,
-            Interaction::Component(button) => self.dashboard_button(&ctx, button).await,
+            Interaction::Command(command) => match command.data.name.as_str() {
+                "play" => self.slash_play(&ctx, command).await,
+                "stop" => self.slash_stop(&ctx, command).await,
+                _ => {}
+            },
+            Interaction::Component(button) => self.component(&ctx, button).await,
             // Modal submissions and autocomplete have no dashboard buttons.
             _ => {}
         }
@@ -215,6 +234,9 @@ impl EventHandler for Handler {
 /// message about someone else's failed button press.
 pub const NOT_IN_VOICE: &str =
     "Join the voice channel I'm in first — that's where playback is controlled.";
+
+/// The reply to `/play` with no words in it.
+const NOT_A_SEARCH: &str = "Tell me what to search for: `/play dracula`.";
 
 /// Whether `user_id` may drive playback for this guild.
 ///
@@ -236,6 +258,132 @@ async fn may_control(ctx: &Context, guild_id: GuildId, user_id: UserId) -> bool 
 /// The interaction handlers, split out of the [`EventHandler`] impl because
 /// they are plain methods rather than events.
 impl Handler {
+    /// Handles a press of a `/play` chooser button, or of the dashboard's.
+    ///
+    /// The two are different lists with different owners and must not reach
+    /// each other: a `/play` chooser belongs to whoever typed it, while the
+    /// dashboard belongs to everyone in the voice channel.
+    async fn component(&self, ctx: &Context, button: ComponentInteraction) {
+        let id = button.data.custom_id.as_str();
+        let action = dashboard::action_from_id(id).unwrap_or_default();
+        if let Some(index) = dashboard::asked_index(id) {
+            return self.asked_button(ctx, button, Asked::Song(index)).await;
+        }
+        if action == dashboard::ACTION_NEXT {
+            return self.asked_button(ctx, button, Asked::Next).await;
+        }
+        if action == dashboard::ACTION_NOTHING {
+            return self.asked_button(ctx, button, Asked::Dismiss).await;
+        }
+        self.dashboard_button(ctx, button).await
+    }
+
+    /// A press on the `/play` chooser: a song, the next page, or nothing.
+    async fn asked_button(&self, ctx: &Context, button: ComponentInteraction, asked: Asked) {
+        let Some(guild_id) = button.guild_id else {
+            return;
+        };
+        if let Err(e) = button.defer(&ctx.http).await {
+            tracing::warn!("failed to acknowledge a /play button: {e}");
+            return;
+        }
+        let Some((config, player)) = ready(ctx).await else {
+            tracing::warn!("a /play button was pressed before the bot was ready");
+            return;
+        };
+
+        // Only the person who asked may answer it. A `/play` chooser is an
+        // answer to one question, not a shared control surface.
+        if !player.ask_belongs_to(guild_id, button.user.id) {
+            tracing::info!(
+                guild_id = %guild_id,
+                user = %button.user.id,
+                "a /play result was pressed by someone who did not ask for it"
+            );
+            refuse(ctx, button).await;
+            return;
+        }
+
+        match asked {
+            Asked::Song(index) => {
+                if let Err(e) = player.play_asked(ctx, &config, guild_id, index).await {
+                    tracing::warn!(guild_id = %guild_id, index, error = %format!("{e:#}"), "could not play that song");
+                    refuse(ctx, button).await;
+                } else {
+                    drop_question(ctx, button.channel_id, button.message.id, guild_id).await;
+                }
+            }
+            Asked::Next => {
+                if !player.next_page(ctx, &config, guild_id).await {
+                    refuse(ctx, button).await;
+                }
+            }
+            Asked::Dismiss => {
+                player.dismiss_ask(guild_id);
+                drop_question(ctx, button.channel_id, button.message.id, guild_id).await;
+            }
+        }
+    }
+    /// Handles `/play <song>`: searches the catalog and posts the results as a
+    /// paged chooser for the asker to pick from.
+    async fn slash_play(
+        &self,
+        ctx: &Context,
+        command: serenity::model::application::CommandInteraction,
+    ) {
+        let Some(query) = typed_song(&command) else {
+            reply(ctx, command, NOT_A_SEARCH).await;
+            return;
+        };
+        let Some(guild_id) = command.guild_id else {
+            reply(ctx, command, "This command only works in a server.").await;
+            return;
+        };
+        let Some((config, player)) = ready(ctx).await else {
+            reply(
+                ctx,
+                command,
+                "I'm still starting up — try again in a moment.",
+            )
+            .await;
+            return;
+        };
+
+        // The bot has to be in the voice channel to play anything. Saying so
+        // before the search saves an API round trip and a wall of buttons that
+        // could not do anything.
+        if !in_voice(ctx, guild_id, command.user.id).await {
+            reply(ctx, command, NOT_IN_VOICE).await;
+            return;
+        }
+
+        match player
+            .search_and_ask(ctx, &config, guild_id, &query, command.user.id)
+            .await
+        {
+            Ok(found) => {
+                reply(
+                    ctx,
+                    command,
+                    &format!(
+                        "Found {found} song{} for `{query}`. Pick one below.",
+                        if found == 1 { "" } else { "s" }
+                    ),
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::info!(guild_id = %guild_id, query = %query, error = %format!("{e:#}"), "/play found nothing");
+                reply(
+                    ctx,
+                    command,
+                    &format!("Nothing in the catalog for `{query}`."),
+                )
+                .await;
+            }
+        }
+    }
+
     /// Handles `/stop`, which leaves the voice channel as well as stopping.
     async fn slash_stop(
         &self,
@@ -415,6 +563,58 @@ async fn drop_question(
 ) {
     if let Err(e) = ctx.http.delete_message(channel_id, message_id, None).await {
         tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not clear the song choice");
+    }
+}
+
+/// What a press on a `/play` chooser means.
+#[derive(Debug, Clone, Copy)]
+enum Asked {
+    Song(usize),
+    Next,
+    Dismiss,
+}
+
+/// The settings and the player, once both are in the type map.
+async fn ready(ctx: &Context) -> Option<(crate::config::Config, Arc<crate::player::Player>)> {
+    let data = ctx.data.read().await;
+    match (
+        data.get::<ConfigKey>().cloned(),
+        data.get::<PlayerKey>().cloned(),
+    ) {
+        (Some(config), Some(player)) => Some((config, player)),
+        _ => None,
+    }
+}
+
+/// The words after `/play`, if the option carried any.
+fn typed_song(command: &CommandInteraction) -> Option<String> {
+    let words = command
+        .data
+        .options()
+        .iter()
+        .find_map(|option| match option.value {
+            ResolvedValue::String(text) => Some(text.to_string()),
+            _ => None,
+        })?;
+    let query = words.trim().to_string();
+    (!query.is_empty()).then_some(query)
+}
+
+/// Whether `user` is in the voice channel, which `/play` needs: the bot plays
+/// there and nowhere else.
+async fn in_voice(ctx: &Context, guild_id: GuildId, user: UserId) -> bool {
+    may_control(ctx, guild_id, user).await
+}
+
+/// Answers a slash command privately.
+async fn reply(ctx: &Context, command: CommandInteraction, text: &str) {
+    let response = CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new()
+            .content(text)
+            .ephemeral(true),
+    );
+    if let Err(e) = command.create_response(&ctx.http, response).await {
+        tracing::warn!(error = %format!("{e:#}"), "could not answer a command");
     }
 }
 

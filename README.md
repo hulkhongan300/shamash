@@ -79,6 +79,8 @@ holding it is the whole reason the in-process engine is worth having.
   the song's thumbnail and Pause/Resume, Skip, Queue, Repeat and Stop buttons.
   The message is edited in place rather than replaced, so the channel does not
   fill up.
+- **Search it yourself**: `/play <song>` posts a paged list from the catalog and
+  plays whichever one you press
 - **Local speech-to-text**: transcription runs on your machine, no audio leaves
   the host.
 - **Few dependencies**: `serenity` + `songbird` + `transcribe-cpp` as crates
@@ -383,9 +385,46 @@ alert channel that says what was heard:
 
 There are three: no match, a download that failed, and a queue with no room.
 
+### `/play`
+
+```
+/play dracula
+```
+
+Searches the catalog for what you typed and posts the results as numbered
+buttons, nine to a page:
+
+```
+Which one?
+Searching the catalog for dracula.
+Page 1 of 3.
+1. Dracula        Tame Impala • 3:26
+2. Borderline     Tame Impala • 3:42
+...
+[1][2][3][4][5]
+[6][7][8][9]
+[Next page][None of these]
+```
+
+**Next page** shows the next nine from the *same* search — every page is a
+window onto one list, so turning the page never asks the catalog again and
+never reshuffles what you have already looked at. It is disabled on the last
+page rather than removed, because a button that vanishes makes the message look
+broken.
+
+Picking a song finds its upload and queues it. The buttons name *songs*, not
+videos: that is the order that makes a second page worth having, because a
+catalog has far more songs under a query than there are uploads worth offering.
+
+Unlike the dashboard, a `/play` chooser is private to whoever typed it — it
+answers one person's question rather than controlling a shared queue, so anyone
+else who presses gets the same "join the voice channel" refusal. Running
+`/play` itself needs you to be in the bot's voice channel, since that is the
+only place it can play anything.
+
 ### Controlling playback
 
-The dashboard in the alert channel is the only control surface:
+The dashboard in the alert channel is the only shared control surface:
 
 | Button   | Effect                                                     |
 | -------- | ---------------------------------------------------------- |

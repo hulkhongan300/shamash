@@ -8,7 +8,7 @@ use crate::search;
 use anyhow::Context;
 use serenity::async_trait;
 use serenity::model::channel::ChannelType;
-use serenity::model::id::{ChannelId, GuildId, MessageId};
+use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::prelude::Context as SerenityContext;
 use songbird::Songbird;
 use songbird::events::{Event, EventContext, EventHandler, TrackEvent};
@@ -165,6 +165,8 @@ pub struct Player {
     catalog: Arc<resolve::Catalog>,
     /// The "which one did you mean" buttons currently on offer.
     choices: Choices,
+    /// The outstanding `/play` search per guild.
+    asks: Asks,
     /// What the bot remembers, or `None` when it has been given no place to
     /// remember in.
     pub library: Option<Arc<crate::library::Library>>,
@@ -328,6 +330,67 @@ impl Choices {
 /// and the key is only meaningful alongside the question that offered it.
 fn song_key(index: usize) -> String {
     format!("song:{index}")
+}
+
+/// A `/play` search waiting to be answered, one per guild.
+///
+/// Every page is a window onto one list rather than a fresh search, so turning
+/// the page never asks the catalog again and never reshuffles what the asker
+/// has already looked at.
+#[derive(Debug, Clone)]
+struct Ask {
+    /// The words that were typed, echoed in the message and used for the upload
+    /// search of whichever song gets picked.
+    query: String,
+    /// Every song the catalog returned, in rank order.
+    tracks: Vec<resolve::CatalogTrack>,
+    /// Which window is on screen.
+    page: usize,
+    /// Who typed `/play`.
+    ///
+    /// A `/play` chooser is a private answer to a question one person asked, not
+    /// the shared dashboard, so only they may press it.
+    asker: UserId,
+    /// Where the chooser message is, so turning the page edits it in place
+    /// rather than posting a second one. Absent until the first send lands.
+    posted: Option<(ChannelId, MessageId)>,
+}
+
+impl Ask {
+    /// The songs on the page currently shown.
+    fn page_of<'a>(&self, tracks: &'a [resolve::CatalogTrack]) -> &'a [resolve::CatalogTrack] {
+        let start = (self.page * dashboard::ASK_PAGE).min(tracks.len());
+        let end = (start + dashboard::ASK_PAGE).min(tracks.len());
+        &tracks[start..end]
+    }
+}
+
+/// The outstanding `/play` search per guild.
+///
+/// One per guild, and asking again replaces the previous one: a search nobody
+/// answered must not outlive the question it was for.
+#[derive(Debug, Clone, Default)]
+struct Asks(Arc<Mutex<HashMap<GuildId, Ask>>>);
+
+impl Asks {
+    fn set(&self, guild_id: GuildId, ask: Ask) {
+        self.lock().insert(guild_id, ask);
+    }
+
+    /// Records where a guild's chooser message ended up.
+    fn posted(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId) {
+        if let Some(slot) = self.lock().get_mut(&guild_id) {
+            slot.posted = Some((channel_id, message_id));
+        }
+    }
+
+    fn clear(&self, guild_id: GuildId) -> bool {
+        self.lock().remove(&guild_id).is_some()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<GuildId, Ask>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// One lock per guild, so a command in one guild cannot hold up another.
@@ -616,6 +679,7 @@ impl Player {
             dashboards: Dashboards::default(),
             catalog,
             choices: Choices::default(),
+            asks: Asks::default(),
             library: None,
             pending: PendingLearn::default(),
             started_at: StartedAt::default(),
@@ -1092,7 +1156,21 @@ impl Player {
         let offer = self.choices.take(guild_id, key).with_context(
             || "that choice is no longer on offer; say the request again for new options",
         )?;
+        self.play_offer(ctx, config, guild_id, offer).await
+    }
 
+    /// Plays whatever an offered choice stands for.
+    ///
+    /// Split from [`Self::play_chosen`] because `/play` offers the same kind of
+    /// thing from a different place, and everything after the lookup is the
+    /// same job.
+    async fn play_offer(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        offer: Offer,
+    ) -> anyhow::Result<()> {
         // The user has already chosen the song by pressing this button, so the
         // best upload of it is taken even when the upload's own score is modest.
         // The hard part -- deciding which song it is -- was answered by the
@@ -1385,6 +1463,194 @@ impl Player {
         self.draw_dashboard(ctx, config, guild_id).await;
         repeat
     }
+
+    /// Answers a `/play` search: looks the words up in the catalog and posts the
+    /// first page of songs for the asker to choose from.
+    ///
+    /// The catalog answers rather than YouTube, because the buttons name *songs*
+    /// and the upload for the chosen one is found afterwards. A catalog has many
+    /// more songs under a query than there are uploads worth offering, which is
+    /// what makes a second page worth having at all.
+    pub async fn search_and_ask(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        query: &str,
+        asker: UserId,
+    ) -> anyhow::Result<usize> {
+        // Typed words go through the same reading logic a spoken request does, so
+        // "dracula by tame impala" searches the catalog the way it would have
+        // if it had been said rather than typed.
+        let request = PlayRequest {
+            query: query.to_string(),
+            title: None,
+            artist: None,
+            splits: Vec::new(),
+        };
+        let tracks: Vec<resolve::CatalogTrack> = self
+            .catalog
+            .hits(&resolve::Target::from_request(&request))
+            .await
+            .iter()
+            .map(|hit| hit.to_track())
+            .collect();
+
+        let total = tracks.len();
+        if total == 0 {
+            self.asks.clear(guild_id);
+            anyhow::bail!("the catalog has nothing for \"{query}\"");
+        }
+
+        let ask = Ask {
+            query: query.to_string(),
+            tracks,
+            page: 0,
+            asker,
+            posted: None,
+        };
+        let message = self.ask_message(&ask);
+        self.asks.set(guild_id, ask);
+
+        let Some(channel_id) = resolve_alert_channel(ctx, config, guild_id) else {
+            anyhow::bail!("no alert channel, so there was nowhere to post the search");
+        };
+        let sent = channel_id
+            .send_message(&ctx.http, message.into_message())
+            .await
+            .map_err(|e| anyhow::anyhow!("could not post the search: {e}"))?;
+        self.asks.posted(guild_id, channel_id, sent.id);
+        tracing::info!(guild_id = %guild_id, query = %query, found = total, "asked the catalog");
+        Ok(total)
+    }
+
+    /// Turns to the next page of a `/play` search, redrawing the same message.
+    ///
+    /// Returns whether it moved, so the caller only answers when it did.
+    pub async fn next_page(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+    ) -> bool {
+        let Some(ask) = self.ask_for(guild_id) else {
+            return false;
+        };
+        if (ask.page + 1) * dashboard::ASK_PAGE >= ask.tracks.len() {
+            return false;
+        }
+        let message = dashboard::ask(
+            &ask.query,
+            &ask_options(&ask, &ask.tracks),
+            ask.page + 1,
+            ask.tracks.len(),
+        );
+        if self.redraw_ask(ctx, config, guild_id, message).await {
+            if let Some(slot) = self.asks.lock().get_mut(&guild_id) {
+                slot.page += 1;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Plays the song a `/play` search put at `index`.
+    pub async fn play_asked(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        index: usize,
+    ) -> anyhow::Result<()> {
+        let ask = self
+            .ask_for(guild_id)
+            .context("that search is no longer on offer; run /play again")?;
+        let track = ask
+            .tracks
+            .get(index)
+            .cloned()
+            .with_context(|| "that song is not in the search")?;
+        self.asks.clear(guild_id);
+        self.play_offer(
+            ctx,
+            config,
+            guild_id,
+            Offer::Song {
+                track,
+                requested: ask.query,
+            },
+        )
+        .await
+    }
+
+    /// Throws a `/play` search away, for "None of these".
+    pub fn dismiss_ask(&self, guild_id: GuildId) -> bool {
+        self.asks.clear(guild_id)
+    }
+
+    /// Whether `user` typed the `/play` search this guild is holding.
+    ///
+    /// A `/play` chooser answers one person's question, so only they may press
+    /// it. This is deliberately not the voice-channel rule the dashboard uses:
+    /// typing a search does not make it shared.
+    pub fn ask_belongs_to(&self, guild_id: GuildId, user: UserId) -> bool {
+        self.ask_for(guild_id).is_some_and(|ask| ask.asker == user)
+    }
+
+    /// The guild's outstanding search, if it has one.
+    fn ask_for(&self, guild_id: GuildId) -> Option<Ask> {
+        self.asks.lock().get(&guild_id).cloned()
+    }
+
+    /// The message for the page an ask is on.
+    fn ask_message(&self, ask: &Ask) -> dashboard::View {
+        dashboard::ask(
+            &ask.query,
+            &ask_options(ask, &ask.tracks),
+            ask.page,
+            ask.tracks.len(),
+        )
+    }
+
+    /// Edits the outstanding search's message in place, the way the dashboard
+    /// is edited, rather than posting a second one.
+    async fn redraw_ask(
+        &self,
+        ctx: &SerenityContext,
+        _config: &Config,
+        guild_id: GuildId,
+        message: dashboard::View,
+    ) -> bool {
+        let Some((channel_id, message_id)) = self.ask_for(guild_id).and_then(|a| a.posted) else {
+            return false;
+        };
+        match channel_id
+            .edit_message(&ctx.http, message_id, message.clone().into_edit())
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not turn the search page");
+                false
+            }
+        }
+    }
+}
+
+/// The page's songs as the rows the chooser draws.
+fn ask_options<'a>(
+    ask: &Ask,
+    tracks: &'a [resolve::CatalogTrack],
+) -> Vec<dashboard::ChoiceOption<'a>> {
+    ask.page_of(tracks)
+        .iter()
+        .map(|track| dashboard::ChoiceOption {
+            title: &track.title,
+            channel: &track.artist,
+            duration_secs: track.duration_secs,
+            key: "",
+        })
+        .collect()
 }
 
 /// The parts of the player a songbird ending needs, owned so the callback can
@@ -2286,5 +2552,76 @@ mod tests {
             packets += 1;
         }
         assert!(packets > 0, "the ready tone must decode to audio samples");
+    }
+    fn track(title: &str) -> resolve::CatalogTrack {
+        resolve::CatalogTrack {
+            artist: "Tame Impala".to_string(),
+            title: title.to_string(),
+            duration_secs: Some(206.0),
+            id: String::new(),
+            provider: "catalog",
+            popularity: None,
+        }
+    }
+
+    fn ask_with(count: usize, asker: u64) -> Ask {
+        Ask {
+            query: "dracula".to_string(),
+            tracks: (0..count).map(|i| track(&format!("Song {i}"))).collect(),
+            page: 0,
+            asker: UserId::new(asker),
+            posted: None,
+        }
+    }
+
+    /// The pages are windows onto one list, so the first song of page two is
+    /// the tenth song and not the first one again.
+    #[test]
+    fn a_page_is_a_window_onto_the_whole_list() {
+        let ask = ask_with(20, 7);
+        let first = ask.page_of(&ask.tracks);
+        assert_eq!(first.len(), dashboard::ASK_PAGE);
+        assert_eq!(first[0].title, "Song 0");
+
+        let mut second = ask.clone();
+        second.page = 1;
+        let window = second.page_of(&second.tracks);
+        // Songs 9 through 17: a full page, with songs 18 and 19 behind it.
+        assert_eq!(window.len(), dashboard::ASK_PAGE, "page two is also full");
+        assert_eq!(window[0].title, "Song 9", "not the first song again");
+    }
+
+    /// A list shorter than a page must not run off the end of itself.
+    #[test]
+    fn a_short_list_pages_without_overrunning() {
+        let ask = ask_with(3, 7);
+        assert_eq!(ask.page_of(&ask.tracks).len(), 3);
+
+        let mut beyond = ask.clone();
+        beyond.page = 9;
+        assert!(beyond.page_of(&beyond.tracks).is_empty());
+    }
+
+    /// The ownership rule on its own, so it can be tested without a player.
+    fn asks_answers(asks: &Asks, guild_id: GuildId, user: UserId) -> bool {
+        asks.lock()
+            .get(&guild_id)
+            .is_some_and(|ask| ask.asker == user)
+    }
+
+    /// Only the person who typed it may press it. This is not the dashboard's
+    /// voice-channel rule, and getting it wrong would let anyone in the server
+    /// queue music off someone else's search.
+    #[test]
+    fn only_the_asker_may_answer_their_own_search() {
+        let guild = GuildId::new(3);
+        let asks = Asks::default();
+        let asker = UserId::new(42);
+        let other = UserId::new(43);
+        assert!(!asks_answers(&asks, guild, asker), "nothing to answer");
+
+        asks.set(guild, ask_with(5, asker.get()));
+        assert!(asks_answers(&asks, guild, asker));
+        assert!(!asks_answers(&asks, guild, other), "someone else must not");
     }
 }

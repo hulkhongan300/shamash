@@ -37,6 +37,22 @@ pub const ACTION_BACK: &str = "back";
 /// Turns repeat-one on or off.
 pub const ACTION_REPEAT: &str = "repeat";
 
+/// Shows the next page of a `/play` search.
+pub const ACTION_NEXT: &str = "next";
+
+/// Throws away a `/play` search.
+pub const ACTION_NOTHING: &str = "nothing";
+
+/// Marks a custom id as a `/play` song button, which names a position in the
+/// guild's outstanding search rather than an action.
+const ASK_PREFIX: &str = "ask";
+
+/// How many songs one page of a `/play` search offers.
+///
+/// Discord takes five buttons to a row and nine is two rows, which leaves room
+/// for the next-page and dismiss buttons on a row of their own.
+pub const ASK_PAGE: usize = 9;
+
 /// The button on a chooser that means "none of these".
 ///
 /// A question with no way to say no is a question that has to be answered. The
@@ -69,7 +85,7 @@ pub fn action_from_id(custom_id: &str) -> Option<&str> {
     let action = custom_id.strip_prefix(&format!("{PREFIX}:"))?;
     match action {
         ACTION_PAUSE | ACTION_RESUME | ACTION_SKIP | ACTION_STOP | ACTION_NONE | ACTION_QUEUE
-        | ACTION_BACK | ACTION_REPEAT => Some(action),
+        | ACTION_BACK | ACTION_REPEAT | ACTION_NEXT | ACTION_NOTHING => Some(action),
         _ => None,
     }
 }
@@ -91,6 +107,21 @@ pub fn picked_key(custom_id: &str) -> Option<&str> {
     let key = action.strip_prefix(&format!("{PICK_PREFIX}:"))?;
     // An empty key would match nothing and then do nothing.
     (!key.is_empty()).then_some(key)
+}
+
+/// Builds the custom id for a `/play` song button.
+pub fn ask_id(index: usize) -> String {
+    format!("{PREFIX}:{ASK_PREFIX}:{index}")
+}
+
+/// Recovers the index from a `/play` song button's custom id.
+///
+/// Separate from [`picked_key`] because a `/play` chooser is not the voice
+/// chooser: the two have different owners and different stores, and letting
+/// one id reach the other would let a press act on the wrong list.
+pub fn asked_index(custom_id: &str) -> Option<usize> {
+    let action = custom_id.strip_prefix(&format!("{PREFIX}:{ASK_PREFIX}:"))?;
+    action.parse().ok()
 }
 
 /// Shortens `text` to at most `max` characters on a word boundary.
@@ -320,6 +351,75 @@ pub fn notice(text: &str) -> View {
             .description(trim(&markdown_escape(text), MAX_DESCRIPTION))
             .color(0xcd_2f_31),
         buttons: Vec::new(),
+    }
+}
+
+/// The chooser a `/play` search posts.
+///
+/// A catalog search rather than a video search: the buttons name songs, and the
+/// upload for whichever one is picked is found afterwards. That is the order
+/// that makes a second page worth having -- the catalog has far more songs
+/// under a query than there are uploads worth offering.
+///
+/// `page` is zero-based, `total` is how many songs the search found in all, and
+/// `options` is this page's window onto them. The buttons carry positions within
+/// the whole search, not within the page, so a press still names the same song
+/// however many pages have gone by.
+pub fn ask(requested: &str, options: &[ChoiceOption<'_>], page: usize, total: usize) -> View {
+    let has_next = (page + 1) * ASK_PAGE < total;
+    let total_pages = total.div_ceil(ASK_PAGE).max(1);
+    let embed = CreateEmbed::new()
+        .title("Which one?")
+        .description(format!(
+            "Searching the catalog for {}.\nPage {} of {}.",
+            trim(&markdown_escape(requested), MAX_DESCRIPTION),
+            page + 1,
+            total_pages
+        ))
+        .color(0x1d_b9_54)
+        .fields(
+            options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    (
+                        format!("{}. {}", index + 1, trim(option.title, MAX_FIELD_NAME)),
+                        trim(&option.detail(), MAX_FIELD_VALUE),
+                        false,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+
+    // Five to a row, because that is Discord's limit for one action row. The id
+    // carries the position in the whole search, not in this page, so a press
+    // still names the same song however many pages have gone by.
+    let first = page * ASK_PAGE;
+    let numbered: Vec<CreateButton> = options
+        .iter()
+        .enumerate()
+        .map(|(offset, _)| CreateButton::new(ask_id(first + offset)))
+        .collect();
+    let mut rows: Vec<CreateActionRow> = numbered
+        .chunks(5)
+        .map(|chunk| CreateActionRow::Buttons(chunk.to_vec()))
+        .collect();
+
+    // Disabled rather than absent when the list has run out: a button that
+    // vanishes leaves the message looking broken, and a press on it would fail.
+    rows.push(CreateActionRow::Buttons(vec![
+        CreateButton::new(action_id(ACTION_NEXT))
+            .label("Next page")
+            .style(ButtonStyle::Secondary)
+            .disabled(!has_next),
+        CreateButton::new(action_id(ACTION_NOTHING))
+            .label("None of these")
+            .style(ButtonStyle::Secondary),
+    ]));
+
+    View {
+        embed,
+        buttons: rows,
     }
 }
 
@@ -727,5 +827,100 @@ mod tests {
     fn a_title_with_no_spaces_still_fits() {
         let trimmed = trim(&"y".repeat(50), 10);
         assert_eq!(trimmed.chars().count(), 10);
+    }
+
+    fn offers(n: usize) -> Vec<ChoiceOption<'static>> {
+        (0..n)
+            .map(|i| option(&format!("Song {i}"), "Tame Impala", Some(206.0)))
+            .collect()
+    }
+
+    /// A `/play` button has to survive the round trip, and must not be
+    /// readable as a voice chooser key: the two reach different stores.
+    #[test]
+    fn a_play_button_round_trips_and_is_not_a_voice_choice() {
+        assert_eq!(asked_index(&ask_id(4)), Some(4));
+        assert_eq!(
+            asked_index(&ask_id(0)),
+            Some(0),
+            "page two starts at zero again"
+        );
+        assert_eq!(
+            picked_key(&ask_id(4)),
+            None,
+            "must not reach the voice store"
+        );
+        assert_eq!(
+            action_from_id(&ask_id(4)),
+            None,
+            "must not be a playback action"
+        );
+        assert_eq!(asked_index(&pick_id("abc")), None);
+        assert_eq!(asked_index("shamash:ask:"), None);
+        assert_eq!(asked_index("other:ask:0"), None);
+    }
+
+    /// The position in the button id is the position in the whole search, not
+    /// in the page, so a press still names the same song after a redraw.
+    #[test]
+    fn the_buttons_name_songs_across_the_whole_search() {
+        let json = serde_json::to_string(&ask("dracula", &offers(9), 1, 20).into_message())
+            .expect("serialises");
+        assert!(json.contains("ask:9"), "page two starts at nine: {json}");
+        assert!(json.contains("ask:17"), "and runs to seventeen: {json}");
+        assert!(!json.contains("ask:0"), "the ids are absolute: {json}");
+    }
+
+    /// Nine songs, so two rows of five and one of four, plus a row for the page
+    /// controls. Discord takes five to a row and twenty-five in total, and
+    /// anything over is dropped by the API.
+    #[test]
+    fn the_chooser_fits_discords_buttons() {
+        let json = serde_json::to_string(&ask("dracula", &offers(9), 0, 20).into_message())
+            .expect("serialises");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        let rows = value["components"].as_array().expect("rows");
+        assert_eq!(rows.len(), 3, "5 + 4 + the controls row: {json}");
+        for row in rows {
+            let buttons = row["components"].as_array().expect("buttons");
+            assert!(buttons.len() <= 5, "a row overflowed: {json}");
+        }
+        let total: usize = rows
+            .iter()
+            .map(|r| r["components"].as_array().map(|b| b.len()).unwrap_or(0))
+            .sum();
+        assert_eq!(total, 11, "nine songs and two controls");
+    }
+
+    /// The last page says so on the button rather than leaving it to fail: a
+    /// button that vanishes makes the message look broken.
+    #[test]
+    fn the_next_page_button_is_disabled_when_the_list_has_run_out() {
+        let more = serde_json::to_string(&ask("dracula", &offers(9), 0, 20).into_message())
+            .expect("serialises");
+        assert!(
+            more.contains(
+                "\"custom_id\":\"shamash:next\",\"label\":\"Next page\",\"disabled\":false"
+            ),
+            "more results exist: {more}"
+        );
+
+        // 20 songs, 9 to a page: page three is the last, and holds two.
+        let last = serde_json::to_string(&ask("dracula", &offers(2), 2, 20).into_message())
+            .expect("serialises");
+        assert!(
+            last.contains(
+                "\"custom_id\":\"shamash:next\",\"label\":\"Next page\",\"disabled\":true"
+            ),
+            "the last page disables it: {last}"
+        );
+    }
+
+    /// The page count has to be the whole list's, not this page's.
+    #[test]
+    fn the_chooser_says_which_page_of_how_many() {
+        let json = description_of(ask("dracula", &offers(9), 1, 20));
+        assert!(json.contains("Page 2 of 3"), "{json}");
+        assert!(json.contains("dracula"), "the query is echoed: {json}");
     }
 }
