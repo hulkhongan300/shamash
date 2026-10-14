@@ -137,8 +137,10 @@ feature of `transcribe-cpp` is on; building it needs the Vulkan SDK headers and
 sudo pacman -S --needed vulkan-headers spirv-headers shaderc
 ```
 
-The startup log lists the devices that registered (`device=["Vulkan0", "CPU"]`);
-the engine picks the best one itself, so there is nothing to configure.
+The startup log names the device each model actually bound to
+(`backend=Vulkan0 device=Vulkan0`), so a silent fallback to the CPU is visible
+rather than inferred. Nothing to configure: the engine picks the best device it
+has.
 Without those packages the build fails on a missing `SPIRV-Headers`, so drop the
 feature from `Cargo.toml` to go back to CPU inference.
 
@@ -306,7 +308,7 @@ By default the bot logs only what it heard, what it did about it, and which
 models loaded:
 
 ```
-INFO shamash::direct: loaded ASR model model=... device=["Vulkan0", "CPU"]
+INFO shamash::direct: loaded ASR model model=... backend=Vulkan0 device=Vulkan0
 INFO shamash::bot: Shamash starting up request_model=... wake_model=... wake_words=bot,play,ut,ot
 INFO shamash::pipeline: request heard guild_id=... transcript="bot play dracula by tame impala"
 INFO shamash::pipeline: playing a request guild_id=... request="dracula by tame impala"

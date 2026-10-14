@@ -70,16 +70,24 @@ impl DirectTranscriber {
         let path = model::resolve(model)?;
         let loaded = Model::load(&path)
             .map_err(|e| anyhow::anyhow!("failed to load ASR model {}: {e}", path.display()))?;
-        let session = loaded.session()?;
 
+        // The backend and device the model actually *bound to*, not the devices
+        // that merely registered. That distinction is the whole question: a
+        // registered Vulkan0 alongside "CPU" says nothing about where the
+        // weights went, and silently falling back to the CPU is exactly what
+        // this reports so it can be noticed.
+        let device = loaded
+            .device()
+            .map(|d| d.name)
+            .unwrap_or_else(|e| format!("unresolved ({e})"));
         tracing::info!(
             model = %path.display(),
-            device = ?transcribe_cpp::devices()
-                .iter()
-                .map(|d| d.name.clone())
-                .collect::<Vec<_>>(),
+            backend = %loaded.backend(),
+            device = %device,
             "loaded ASR model"
         );
+
+        let session = loaded.session()?;
 
         Ok(Self {
             session: Mutex::new(session),
