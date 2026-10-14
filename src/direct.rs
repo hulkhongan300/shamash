@@ -71,6 +71,23 @@ impl DirectTranscriber {
         let loaded = Model::load(&path)
             .map_err(|e| anyhow::anyhow!("failed to load ASR model {}: {e}", path.display()))?;
 
+        // Checked here rather than left to the first utterance. The engine does
+        // not reject an unknown language at load; it rejects it at *run*, so a
+        // typo in `ASR_LANGUAGE` used to leave the bot joining the channel and
+        // then failing every single transcription, which looks like a model
+        // problem and is not one. Codes are plain ISO-639-1 -- `pt` and `en`,
+        // not `pt-PT` or `Portuguese`.
+        if let Some(language) = language {
+            let supported = loaded.capabilities().languages;
+            if !language_is_known(language, &supported) {
+                anyhow::bail!(
+                    "ASR_LANGUAGE={language} is not a language this model knows; \
+                     expected an ISO-639-1 code such as {}",
+                    supported.first().map(String::as_str).unwrap_or("en")
+                );
+            }
+        }
+
         // The backend and device the model actually *bound to*, not the devices
         // that merely registered. That distinction is the whole question: a
         // registered Vulkan0 alongside "CPU" says nothing about where the
@@ -148,6 +165,17 @@ pub fn model_exists(spec: &str) -> bool {
     Path::new(spec).is_file() || model::resolve(spec).is_ok()
 }
 
+/// Checks a language hint against what a model advertises, without a model.
+///
+/// The engine takes a language it does not know and only complains when it runs,
+/// which is far too late: the bot is already in the voice channel by then. Split
+/// out so the rule is testable without a several-hundred-megabyte GGUF.
+fn language_is_known(language: &str, supported: &[String]) -> bool {
+    // A model that advertises nothing accepts anything; some Parakeet builds do
+    // not publish a list at all.
+    supported.is_empty() || supported.iter().any(|known| known == language)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +194,37 @@ mod tests {
         // Building a real model needs a GGUF on disk, so this only checks the
         // guard that runs before the session is ever touched.
         assert!(model::DEFAULT_MODEL_ID.ends_with(".gguf"));
+    }
+
+    fn whisper_languages() -> Vec<String> {
+        ["en", "pt", "es", "fr"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// `pt-PT` is the obvious thing to type for European Portuguese and it is
+    /// wrong: the engine takes plain ISO-639-1 and rejects everything else at
+    /// *run* time, which used to mean the bot joined the channel and then failed
+    /// every transcription.
+    #[test]
+    fn a_language_the_model_does_not_know_is_refused_up_front() {
+        let known = whisper_languages();
+        assert!(language_is_known("en", &known));
+        assert!(language_is_known("pt", &known));
+
+        for wrong in ["pt-PT", "pt_PT", "Portuguese", "english", ""] {
+            assert!(
+                !language_is_known(wrong, &known),
+                "{wrong} should not have been accepted"
+            );
+        }
+    }
+
+    /// A model that publishes no language list -- some Parakeet builds -- takes
+    /// anything, and refusing to start would be worse than trying.
+    #[test]
+    fn a_model_that_advertises_nothing_accepts_anything() {
+        assert!(language_is_known("anything", &[]));
     }
 }

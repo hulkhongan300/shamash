@@ -170,6 +170,17 @@ which is resolved against the Hugging Face cache. Some models (Canary,
 Nemotron) need a language hint to produce text at all; set `ASR_LANGUAGE=en` for
 those. The Whisper default detects the language itself and does not need one.
 
+`ASR_LANGUAGE` takes **one** ISO-639-1 code — `en`, `pt`, `es`. Not `pt-PT`,
+not `pt_PT`, not `Portuguese`: those all fail, and they fail at the first
+utterance rather than at startup, so the bot used to join the channel and then
+refuse every transcription. That is checked at startup now, and the bot will not
+start with a language its model does not know.
+
+Whisper detects among 100 languages when the hint is unset, which is the right
+default for a bot that hears more than one language. Pinning it to `en` is
+usually a mistake if anyone ever speaks anything else: the audio is still heard,
+but the words come back as English, and a misheard song title is a wrong song.
+
 Whisper large-v3-turbo is multilingual, where the Parakeet it replaced was
 English-only. It is much slower on the CPU — ~17 s per short utterance against
 ~0.7 s, or ~1 s once the GPU is doing it. Set `PARAKEET_MODEL` back to a
@@ -184,7 +195,7 @@ Parakeet id if you only ever speak English and want the lower latency.
 | `ASR_ENGINE`      | no       | `direct` (default, in-process transcribe.cpp) or `handy` (subprocess) |
 | `PARAKEET_MODEL`  | no       | The large model, loaded on a wake word: a `.gguf` path or Hugging Face model id (default Whisper large-v3-turbo Q8_0) |
 | `WAKE_MODEL`      | no       | The small always-on model: a `.gguf` path or Hugging Face model id (default Parakeet TDT+CTC 110M) |
-| `ASR_LANGUAGE`    | no       | Language hint for models that need one, e.g. `en` for Canary or Nemotron |
+| `ASR_LANGUAGE`    | no       | One ISO-639-1 language code, e.g. `en` or `pt`. Unset means the model detects it. `pt-PT` is not valid |
 | `WAKE_WORDS`      | no       | Comma-separated wake words (default `bot,play,ut,ot`) |
 | `LLM_ENDPOINT`    | no       | Ollama-compatible endpoint that rewrites a misheard transcript. Unset by default, which uses the words as heard |
 | `LLM_MODEL`       | no       | Model to ask at that endpoint (default `llama3.2`) |
