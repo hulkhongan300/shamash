@@ -163,6 +163,12 @@ pub struct Candidate {
     /// Video title as shown on YouTube.
     pub title: Option<String>,
     /// Canonical watch URL.
+    ///
+    /// Read from `webpage_url` too, which is the only spelling yt-dlp emits
+    /// when a result is extracted in full rather than listed flat. Without the
+    /// alias every YouTube Music result failed to parse and the search silently
+    /// produced nothing.
+    #[serde(alias = "webpage_url")]
     pub url: String,
     /// View count, when YouTube reports one.
     pub view_count: Option<u64>,
@@ -596,6 +602,18 @@ pub fn pick(candidates: &[Candidate], target: &Target, threshold: f64) -> Choice
 /// a stalled connection would leave that guild unable to skip or stop.
 const YOUTUBE_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a YouTube Music search may take before it is treated as having
+/// failed.
+///
+/// Longer than [`YOUTUBE_SEARCH_TIMEOUT`], because this one extracts each
+/// result in full rather than listing them flat: about three seconds a
+/// candidate, so eight is nearer half a minute.
+///
+/// It is bounded for the same reason, and falling back to YouTube on a timeout
+/// is what stops a slow day from becoming a dead bot: the fallback search has
+/// its own, shorter budget.
+const YT_MUSIC_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// Searches YouTube via `yt-dlp` and returns the raw candidates.
 ///
 /// Metadata only: `--flat-playlist` reads the search page without opening each
@@ -651,6 +669,99 @@ pub async fn youtube_candidates(query: &str, count: usize) -> anyhow::Result<Vec
 #[async_trait::async_trait]
 pub trait VideoSearch: Send + Sync {
     async fn candidates(&self, query: &str, count: usize) -> anyhow::Result<Vec<Candidate>>;
+}
+
+/// Asks YouTube Music, which ranks the recording people mean.
+///
+/// YouTube Music puts the official album track first where YouTube's own search
+/// puts a clean "(Audio)" upload first: for XXXTentacion's *Look At Me!*, the
+/// explicit 126 s original against a 128 s clean version. That is the whole
+/// reason this exists.
+///
+/// The search is **not** flat, because YouTube Music's flat results carry no
+/// running time or channel, and the scorer leans on the running time hardest of
+/// all its inputs. Flat saves the requests and costs the signal, so this trades
+/// latency for a score it can actually compute -- roughly three seconds a
+/// candidate, against one and a half for the whole flat YouTube search.
+pub async fn music_candidates(query: &str, count: usize) -> anyhow::Result<Vec<Candidate>> {
+    anyhow::ensure!(count > 0, "need at least one search candidate");
+
+    let mut url = reqwest::Url::parse("https://music.youtube.com/search")?;
+    url.query_pairs_mut().append_pair("q", query);
+
+    // `kill_on_drop` matters as much as the timeout: without it, dropping the
+    // future on timeout leaves yt-dlp running, holding the network and
+    // eventually answering a socket nobody is reading.
+    let mut command = Command::new("yt-dlp");
+    command
+        .kill_on_drop(true)
+        .args(["-j", "--no-warnings", "--ignore-errors", "--playlist-end"])
+        .arg(count.to_string())
+        .arg(url.as_str())
+        .stdin(std::process::Stdio::null());
+
+    let output = tokio::time::timeout(YT_MUSIC_SEARCH_TIMEOUT, command.output())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "yt-dlp YouTube Music search for '{query}' took longer than \
+                 {YT_MUSIC_SEARCH_TIMEOUT:?}"
+            )
+        })?
+        .context("failed to run yt-dlp; is it installed and on PATH?")?;
+
+    anyhow::ensure!(
+        output.status.success(),
+        "yt-dlp YouTube Music search failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    let candidates: Vec<Candidate> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        // One bad line must not lose the rest: `--ignore-errors` already keeps
+        // going, and a parse failure here should do the same.
+        .filter_map(|line| serde_json::from_str::<Candidate>(line).ok())
+        .collect();
+
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "YouTube Music returned nothing usable for '{query}'"
+    );
+    Ok(candidates)
+}
+
+/// YouTube Music first, then YouTube.
+///
+/// The fallback is what makes this safe to default to: if YouTube Music is
+/// unreachable, rate-limited, or starts answering with nothing, the request goes
+/// to YouTube and the bot behaves as it did before. A failure in both is
+/// reported as the YouTube failure, because that is the one with a message
+/// worth reading.
+pub struct YtMusicFirst;
+
+#[async_trait::async_trait]
+impl VideoSearch for YtMusicFirst {
+    async fn candidates(&self, query: &str, count: usize) -> anyhow::Result<Vec<Candidate>> {
+        match music_candidates(query, count).await {
+            Ok(candidates) => {
+                tracing::info!(
+                    query = %query,
+                    found = candidates.len(),
+                    "found the upload on YouTube Music"
+                );
+                return Ok(candidates);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    query = %query,
+                    error = %format!("{e:#}"),
+                    "YouTube Music did not answer; falling back to YouTube"
+                );
+            }
+        }
+        youtube_candidates(query, count).await
+    }
 }
 
 /// The real search, through yt-dlp.
@@ -1063,6 +1174,32 @@ mod tests {
     /// them right is the whole reason the catalog is called at all: a
     /// misheard "hoolig" would otherwise be searched as those letters and come
     /// back as whatever matched them.
+    /// A result extracted in full spells its URL `webpage_url` and omits `url`
+    /// entirely. Without the alias every YouTube Music candidate failed to
+    /// parse, the search returned nothing, and the fallback quietly served the
+    /// wrong recording -- which is exactly the thing this search exists to stop.
+    #[test]
+    fn a_full_extraction_parses_like_a_flat_one() {
+        let full = r#"{
+            "id": "I0FKqmoK56I",
+            "webpage_url": "https://www.youtube.com/watch?v=I0FKqmoK56I",
+            "title": "Look At Me!",
+            "channel": "XXXTENTACION",
+            "duration": 126,
+            "view_count": 255283126
+        }"#;
+        let candidate: Candidate = serde_json::from_str(full).expect("a full extraction parses");
+        assert_eq!(candidate.video_id(), Some("I0FKqmoK56I"));
+        assert_eq!(candidate.duration, Some(126.0));
+        assert_eq!(candidate.channel(), "XXXTENTACION");
+        assert_eq!(candidate.view_count, Some(255_283_126));
+
+        // And the flat spelling, which is what the YouTube search returns.
+        let flat = r#"{"url": "https://youtu.be/dQw4w9WgXcQ", "title": "Dracula"}"#;
+        let candidate: Candidate = serde_json::from_str(flat).expect("a flat result still parses");
+        assert_eq!(candidate.video_id(), Some("dQw4w9WgXcQ"));
+    }
+
     #[test]
     fn the_query_uses_the_catalog_names() {
         let track = resolve::CatalogTrack {
@@ -2076,7 +2213,7 @@ mod tests {
             let resolved =
                 resolve_request(&request(heard), &catalog, None, None, GuildId::new(1)).await;
             assert!(resolved.as_track().is_some(), "{heard}: {resolved:?}");
-            let choice = find_video(&resolved, heard, &YtDlpSearch, 8, DEFAULT_MATCH_THRESHOLD)
+            let choice = find_video(&resolved, heard, &YtMusicFirst, 8, DEFAULT_MATCH_THRESHOLD)
                 .await
                 .unwrap_or_else(|e| panic!("{heard}: {e:#}"));
             for scored in &choice.ranked {
