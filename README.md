@@ -319,6 +319,18 @@ Serenity and songbird log a line per connection and per packet, which drowns
 those out, so they are silenced at info. Warnings still come through from
 everything, so a failure is never silent.
 
+One warning is dropped outright:
+
+```
+WARN songbird::driver::tasks::udp_rx: RTCP decryption failed: Crypto(Error)
+```
+
+Discord sends RTCP reports for streams the bot has no key for, so this fires
+continuously on a perfectly working connection, and there is no songbird setting
+to turn it off. It is matched by message rather than by module, because
+`RTP decryption failed` and `Decode error for SSRC` come from the same module
+and both mean the bot has stopped hearing.
+
 Set `RUST_LOG=shamash=debug` to see what the wake model heard on each check, the
 resolution, the scores and the runner-up:
 
