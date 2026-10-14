@@ -8,6 +8,10 @@ name, and plays the song that is asked for:
 
 > **"bot, play Dracula by Tame Impala"**
 
+It hears with [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp),
+linked in-process from the [handy-computer](https://github.com/handy-computer)
+group — see [Acknowledgements](#acknowledgements).
+
 ## How it works
 
 The listening is staged, because a conversation in a voice channel should not
@@ -85,20 +89,31 @@ holding it is the whole reason the in-process engine is worth having.
 - Rust (edition 2024)
 - System packages: `ffmpeg`, `yt-dlp`, `libopus-dev`, `pkg-config`, `cmake`,
   and a C/C++ toolchain (`transcribe-cpp` builds its engine from source)
-- **Two** Parakeet GGUF models: a small one for the wake word and a large one for
-  requests. The default ones come from the
-  [Handy](https://github.com/cjpais/Handy) app's Hugging Face cache, so
-  installing Handy once is the easiest way to get them
+- **Two** GGUF models: a small one for the wake word and a large one for
+  requests. Both are plain files you can download yourself — see [Setup](#setup)
 - A Discord application with a bot token (enable voice gateway intents)
 - Optional, for the rewrite stage: [Ollama](https://ollama.com) with a small
   model pulled
 
 ## Setup
 
-Install the [Handy](https://github.com/cjpais/Handy) app once and pick a
-model in it, so the weights land in the Hugging Face cache that
-`PARAKEET_MODEL` and `WAKE_MODEL` resolve against. Or skip it and point them
-straight at any transcribe.cpp GGUF.
+Fetch the two models into the Hugging Face cache, which is where `WAKE_MODEL`
+and `PARAKEET_MODEL` look by default:
+
+```sh
+huggingface-cli download handy-computer/parakeet-tdt_ctc-110m-gguf parakeet-tdt_ctc-110m-Q8_0.gguf
+huggingface-cli download handy-computer/whisper-large-v3-turbo-gguf whisper-large-v3-turbo-Q8_0.gguf
+```
+
+Either variable also takes a plain path to a `.gguf` anywhere on disk, so any
+model transcribe.cpp supports will do.
+
+You do not need the Handy app. The speech engine is
+[transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), linked into
+this process and built from source by `cargo`; see
+[Acknowledgements](#acknowledgements). `ASR_ENGINE=handy` still shells out to the
+Handy binary, but only as an opt-in way to compare the two engines on the same
+audio.
 
 Then create a gitignored `.env` next to the binary with your own values:
 
@@ -150,10 +165,10 @@ Whisper models work the same way, as GGUFs, through this engine. The old
 of `ggml` and could not be linked alongside transcribe.cpp, so one had to go.
 `ASR_ENGINE=whisper` now fails with a message saying so.
 
-`PARAKEET_MODEL` takes either a path to a `.gguf` or a Handy catalogue id, which
-is resolved against the Hugging Face cache. Some models (Canary, Nemotron) need
-a language hint to produce text at all; set `ASR_LANGUAGE=en` for those. The
-Whisper default detects the language itself and does not need one.
+`PARAKEET_MODEL` takes either a path to a `.gguf` or a Hugging Face catalogue id,
+which is resolved against the Hugging Face cache. Some models (Canary,
+Nemotron) need a language hint to produce text at all; set `ASR_LANGUAGE=en` for
+those. The Whisper default detects the language itself and does not need one.
 
 Whisper large-v3-turbo is multilingual, where the Parakeet it replaced was
 English-only. It is much slower on the CPU — ~17 s per short utterance against
@@ -167,8 +182,8 @@ Parakeet id if you only ever speak English and want the lower latency.
 | `DISCORD_TOKEN`   | yes      | Bot token from the Discord developer portal        |
 | `VOICE_CHANNEL_ID`| yes      | ID of the voice channel the bot watches and joins  |
 | `ASR_ENGINE`      | no       | `direct` (default, in-process transcribe.cpp) or `handy` (subprocess) |
-| `PARAKEET_MODEL`  | no       | The large model, loaded on a wake word: a `.gguf` path or Handy model id (default Whisper large-v3-turbo Q8_0) |
-| `WAKE_MODEL`      | no       | The small always-on model: a `.gguf` path or Handy model id (default Parakeet TDT+CTC 110M) |
+| `PARAKEET_MODEL`  | no       | The large model, loaded on a wake word: a `.gguf` path or Hugging Face model id (default Whisper large-v3-turbo Q8_0) |
+| `WAKE_MODEL`      | no       | The small always-on model: a `.gguf` path or Hugging Face model id (default Parakeet TDT+CTC 110M) |
 | `ASR_LANGUAGE`    | no       | Language hint for models that need one, e.g. `en` for Canary or Nemotron |
 | `WAKE_WORDS`      | no       | Comma-separated wake words (default `bot,play,ut,ot`) |
 | `LLM_ENDPOINT`    | no       | Ollama-compatible endpoint that rewrites a misheard transcript. Unset by default, which uses the words as heard |
@@ -417,7 +432,7 @@ play: dracula by tame impala
 
 Models and wake words come from the same settings as the bot, so a change to
 `WAKE_MODEL` or `WAKE_WORDS` is measured by re-running this. `PARAKEET_MODEL`
-and `WAKE_MODEL` both default to the Handy cache.
+and `WAKE_MODEL` both default to the Hugging Face cache.
 
 It also prints a level report: the loudest 20 ms frame against the
 voice-activity gate. If that frame sits below the gate, the bot cannot hear you
@@ -437,6 +452,34 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
+
+## Acknowledgements
+
+Shamash stands on the work of the **handy-computer** group, and owes them a
+genuine thank you.
+
+The speech engine is
+[transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), their Rust
+bindings to a C/C++ speech-to-text library built on ggml. It is what Shamash
+listens with. Before it existed here, this bot transcribed through the
+[Handy](https://github.com/cjpais/Handy) app as a subprocess, which cost a Tauri
+startup and a full model reload on *every* utterance. Linking transcribe.cpp
+directly and holding the model resident was the single biggest change in how
+this bot performs — roughly 350 ms per command down to inference alone — and
+turning on ggml's Vulkan backend afterwards took a Whisper decode from ~17 s to
+~1 s on this machine.
+
+That is not a small thing to hand someone. The library covers 16+ model
+families behind one API, it keeps the model resident so a caller can use it the
+way the caller actually wants to, and it did all of that while leaving room for
+the app's own catalogue to keep working alongside it. It has been a great
+building block, and the kind of dependency that makes a project like this
+possible at all.
+
+The model catalogue and the GGUF conversions come from the same group too, which
+is why both defaults resolve straight out of their Hugging Face repositories.
+
+If you are the maintainers: thank you, and please keep going.
 
 ## License
 
