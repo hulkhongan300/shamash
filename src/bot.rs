@@ -116,26 +116,25 @@ fn log_configuration(config: &Config, big_models: &BigModels) {
 
 pub struct Handler;
 
+/// The slash commands, in one place so both registrations cannot disagree.
+fn commands() -> Vec<CreateCommand> {
+    vec![
+        CreateCommand::new("stop").description("Stop playback and leave the voice channel"),
+        CreateCommand::new("play")
+            .description("Search the catalog for a song and choose from the results")
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "song", "What to search for")
+                    .required(true),
+            ),
+    ]
+}
+
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(user = %ready.user.name, "Shamash is online");
-        for command in [
-            CreateCommand::new("stop").description("Stop playback and leave the voice channel"),
-            CreateCommand::new("play")
-                .description("Search the catalog for a song and choose from the results")
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "song",
-                        "What to search for",
-                    )
-                    .required(true),
-                ),
-        ] {
-            if let Err(e) = Command::create_global_command(&ctx.http, command).await {
-                tracing::warn!(error = %format!("{e:#}"), "failed to register a command");
-            }
+        if let Err(e) = Command::set_global_commands(&ctx.http, commands()).await {
+            tracing::warn!(error = %format!("{e:#}"), "failed to register the global commands");
         }
 
         // One player for the whole process, so the voice listener and the
@@ -183,6 +182,15 @@ impl EventHandler for Handler {
         guild: serenity::model::guild::Guild,
         _is_new: Option<bool>,
     ) {
+        // Global commands take up to an hour to reach a client, and a bot that
+        // has just registered `/play` looks broken for all of it. A guild copy
+        // appears at once, so anyone in the server can see what the bot offers
+        // the moment it starts. This is a PUT, so it replaces rather than
+        // duplicating.
+        if let Err(e) = ctx.http.create_guild_commands(guild.id, &commands()).await {
+            tracing::warn!(guild_id = %guild.id, error = %format!("{e:#}"), "failed to register the guild commands");
+        }
+
         let Ok(service) = VoiceService::from_ctx(&ctx).await else {
             return;
         };

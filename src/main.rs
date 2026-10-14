@@ -193,9 +193,9 @@ mod tests {
                 tracing::warn!(target: "songbird::driver::tasks::udp_rx", "{message}");
             },
         );
-        let out = Arc::try_unwrap(buffer)
-            .map(|m| m.into_inner().unwrap())
-            .unwrap_or_default();
+        // Not `try_unwrap`: tracing may still hold a clone of the buffer when
+        // this runs, and that made the read come back empty at random.
+        let out = buffer.lock().unwrap().clone();
         String::from_utf8_lossy(&out).into_owned()
     }
 
@@ -253,9 +253,7 @@ mod tests {
                 tracing::warn!(target: "shamash::pipeline", "RTCP decryption failed: ours");
             },
         );
-        let out = Arc::try_unwrap(buffer)
-            .map(|m| m.into_inner().unwrap())
-            .unwrap_or_default();
+        let out = buffer.lock().unwrap().clone();
         assert!(
             String::from_utf8_lossy(&out).contains("ours"),
             "our own event was dropped by songbird's filter"
