@@ -16,7 +16,16 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libopus-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libopus-dev
+          # `transcribe-cpp` is built with its `vulkan` feature, and ggml's
+          # Vulkan backend compiles compute shaders at build time. It needs the
+          # Vulkan headers, `glslc` to compile them, and the SPIR-V headers for
+          # its shader generator. Without these the build fails at
+          # "Could NOT find Vulkan (missing: Vulkan_LIBRARY Vulkan_INCLUDE_DIR
+          # glslc)".
+          sudo apt-get install -y libvulkan-dev glslc spirv-headers
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
