@@ -163,6 +163,12 @@ pub struct Candidate {
     /// Video title as shown on YouTube.
     pub title: Option<String>,
     /// Canonical watch URL.
+    ///
+    /// Read from `webpage_url` as well. yt-dlp emits `url` for a result listed
+    /// flat and `webpage_url` for one extracted in full, and it omits the other
+    /// in each case, so a struct that only knows one spelling silently
+    /// deserialises to nothing.
+    #[serde(alias = "webpage_url")]
     pub url: String,
     /// View count, when YouTube reports one.
     pub view_count: Option<u64>,
@@ -1063,6 +1069,29 @@ mod tests {
     /// them right is the whole reason the catalog is called at all: a
     /// misheard "hoolig" would otherwise be searched as those letters and come
     /// back as whatever matched them.
+    /// yt-dlp spells a result's URL `url` when it lists results flat and
+    /// `webpage_url` when it extracts them in full, omitting the other each
+    /// time. A struct that knows only one spelling deserialises to nothing
+    /// rather than failing, which reads as "the search found nothing".
+    #[test]
+    fn a_candidate_parses_from_either_url_spelling() {
+        let flat = r#"{"url": "https://youtu.be/dQw4w9WgXcQ", "title": "Dracula"}"#;
+        let candidate: Candidate = serde_json::from_str(flat).expect("a flat result parses");
+        assert_eq!(candidate.video_id(), Some("dQw4w9WgXcQ"));
+
+        let full = r#"{
+            "id": "I0FKqmoK56I",
+            "webpage_url": "https://www.youtube.com/watch?v=I0FKqmoK56I",
+            "title": "Look At Me!",
+            "channel": "XXXTENTACION",
+            "duration": 126
+        }"#;
+        let candidate: Candidate = serde_json::from_str(full).expect("a full extraction parses");
+        assert_eq!(candidate.video_id(), Some("I0FKqmoK56I"));
+        assert_eq!(candidate.duration, Some(126.0));
+        assert_eq!(candidate.channel(), "XXXTENTACION");
+    }
+
     #[test]
     fn the_query_uses_the_catalog_names() {
         let track = resolve::CatalogTrack {
