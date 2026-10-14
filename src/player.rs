@@ -558,22 +558,42 @@ impl Tracks {
     }
 }
 
-/// The channel and message id of each guild's dashboard.
+/// Where a guild's dashboard is, and what it is showing.
+type Dashboard = (ChannelId, MessageId, Page);
+
+/// The channel, message id and page of each guild's dashboard.
 ///
 /// Only the ids are kept; the dashboard is rebuilt from the queue every time,
-/// so a cached copy of the message would go stale.
+/// so a cached copy of the message would go stale. The page is kept because a
+/// redraw must not yank the view away from someone who opened the queue to
+/// read it -- a song ending while they are looking has to leave them looking.
 #[derive(Debug, Clone, Default)]
-struct Dashboards(Arc<Mutex<HashMap<GuildId, (ChannelId, MessageId)>>>);
+struct Dashboards(Arc<Mutex<HashMap<GuildId, Dashboard>>>);
+
+/// Which view a guild's dashboard is currently showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    NowPlaying,
+    Queue,
+}
 
 impl Dashboards {
     /// The dashboard message for a guild, if it has one.
     fn get(&self, guild_id: GuildId) -> Option<MessageId> {
-        self.lock().get(&guild_id).map(|(_, id)| *id)
+        self.lock().get(&guild_id).map(|(_, id, _)| *id)
     }
 
-    /// Records where a guild's dashboard lives.
-    fn set(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId) {
-        self.lock().insert(guild_id, (channel_id, message_id));
+    /// The page a guild's dashboard is showing.
+    fn page(&self, guild_id: GuildId) -> Page {
+        self.lock()
+            .get(&guild_id)
+            .map(|(_, _, page)| *page)
+            .unwrap_or(Page::NowPlaying)
+    }
+
+    /// Records where a guild's dashboard lives and what it is showing.
+    fn set(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId, page: Page) {
+        self.lock().insert(guild_id, (channel_id, message_id, page));
     }
 
     /// Forgets a guild's dashboard, so the next update posts a new one.
@@ -581,7 +601,7 @@ impl Dashboards {
         self.lock().remove(&guild_id);
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<GuildId, (ChannelId, MessageId)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<GuildId, Dashboard>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -1319,7 +1339,38 @@ impl Player {
     /// Safe to call when no channel is available; feedback is then skipped
     /// rather than failing the command.
     pub async fn draw_dashboard(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
-        draw(&self.dashboards, &self.queues, ctx, config, guild_id).await;
+        draw(&self.dashboards, &self.queues, ctx, config, guild_id, None).await;
+    }
+
+    /// Shows what is waiting in the queue instead of the now-playing view.
+    pub async fn show_queue(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
+        draw(
+            &self.dashboards,
+            &self.queues,
+            ctx,
+            config,
+            guild_id,
+            Some(Page::Queue),
+        )
+        .await;
+    }
+
+    /// Goes back from the queue view to the now-playing one.
+    pub async fn show_now_playing(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+    ) {
+        draw(
+            &self.dashboards,
+            &self.queues,
+            ctx,
+            config,
+            guild_id,
+            Some(Page::NowPlaying),
+        )
+        .await;
     }
 }
 
@@ -1345,6 +1396,7 @@ impl Follower {
             &self.ctx,
             &self.config,
             self.guild_id,
+            None,
         )
         .await;
     }
@@ -1391,21 +1443,30 @@ async fn start_track(
 }
 
 /// Draws or updates a guild's dashboard message.
+///
+/// `page` is None to keep whichever page the dashboard is already on, which is
+/// what every ordinary redraw wants: a song ending should not pull someone out
+/// of the queue they opened.
 async fn draw(
     dashboards: &Dashboards,
     queues: &Queues,
     ctx: &SerenityContext,
     config: &Config,
     guild_id: GuildId,
+    page: Option<Page>,
 ) {
     let Some(channel) = resolve_alert_channel(ctx, config, guild_id) else {
         return;
     };
+    let page = page.unwrap_or_else(|| dashboards.page(guild_id));
     let queue = queues.get(guild_id);
     let current = queue.current();
-    let view = match &current {
-        Some(song) => dashboard::dashboard(song, queue.is_paused(), queue.pending()),
-        None => dashboard::idle_dashboard(),
+    let view = match page {
+        Page::Queue => dashboard::queue_view(&queue.pending_songs()),
+        Page::NowPlaying => match &current {
+            Some(song) => dashboard::dashboard(song, queue.is_paused(), queue.pending()),
+            None => dashboard::idle_dashboard(),
+        },
     };
 
     match dashboards.get(guild_id) {
@@ -1420,12 +1481,12 @@ async fn draw(
                 tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "failed to update the dashboard");
                 dashboards.forget(guild_id);
                 if let Ok(sent) = channel.send_message(&ctx.http, view.into_message()).await {
-                    dashboards.set(guild_id, channel, sent.id);
+                    dashboards.set(guild_id, channel, sent.id, page);
                 }
             }
         }
         None => match channel.send_message(&ctx.http, view.into_message()).await {
-            Ok(sent) => dashboards.set(guild_id, channel, sent.id),
+            Ok(sent) => dashboards.set(guild_id, channel, sent.id, page),
             Err(e) => {
                 tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "failed to post the dashboard")
             }
@@ -1495,6 +1556,25 @@ fn resolve_alert_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opening the queue is a choice, and a song ending underneath it must not
+    /// close that choice: the redraw keeps whichever page is showing.
+    #[test]
+    fn a_redraw_keeps_the_page_the_dashboard_is_on() {
+        let guild = GuildId::new(11);
+        let dashboards = Dashboards::default();
+
+        assert_eq!(dashboards.page(guild), Page::NowPlaying);
+
+        dashboards.set(guild, ChannelId::new(1), MessageId::new(2), Page::Queue);
+        assert_eq!(dashboards.page(guild), Page::Queue);
+
+        // Forgetting the dashboard is what happens when a message is deleted;
+        // the next post starts on now-playing rather than inheriting a page
+        // whose message no longer exists.
+        dashboards.forget(guild);
+        assert_eq!(dashboards.page(guild), Page::NowPlaying);
+    }
 
     /// The bug this commit exists for: `play` held the playback lock across the
     /// catalog lookup, the YouTube search *and the whole download*, and `skip()`

@@ -154,6 +154,11 @@ impl Queue {
         self.lock().pending.len()
     }
 
+    /// The songs waiting behind the current one, soonest first.
+    pub fn pending_songs(&self) -> Vec<Queued> {
+        self.lock().pending.iter().cloned().collect()
+    }
+
     /// Whether the current song is paused.
     pub fn is_paused(&self) -> bool {
         self.lock().paused

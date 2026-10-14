@@ -25,6 +25,15 @@ pub const ACTION_RESUME: &str = "resume";
 pub const ACTION_SKIP: &str = "skip";
 pub const ACTION_STOP: &str = "stop";
 
+/// Shows what is waiting in the queue, in place of the now-playing view.
+pub const ACTION_QUEUE: &str = "queue";
+
+/// Goes back to the now-playing view from the queue.
+///
+/// The same button cannot do both, because the dashboard is one message that is
+/// edited in place and the bot does not track which way round it was left.
+pub const ACTION_BACK: &str = "back";
+
 /// The button on a chooser that means "none of these".
 ///
 /// A question with no way to say no is a question that has to be answered. The
@@ -41,6 +50,8 @@ const MAX_TITLE: usize = 256;
 const MAX_DESCRIPTION: usize = 4096;
 /// Longest field name Discord accepts.
 const MAX_FIELD_NAME: usize = 256;
+/// The same limit applies to a field's value.
+const MAX_FIELD_VALUE: usize = 1024;
 /// Longest footer Discord accepts, which is lower than the description's.
 const MAX_FOOTER: usize = 2048;
 
@@ -54,7 +65,8 @@ fn button_id(action: &str) -> String {
 pub fn action_from_id(custom_id: &str) -> Option<&str> {
     let action = custom_id.strip_prefix(&format!("{PREFIX}:"))?;
     match action {
-        ACTION_PAUSE | ACTION_RESUME | ACTION_SKIP | ACTION_STOP | ACTION_NONE => Some(action),
+        ACTION_PAUSE | ACTION_RESUME | ACTION_SKIP | ACTION_STOP | ACTION_NONE | ACTION_QUEUE
+        | ACTION_BACK => Some(action),
         _ => None,
     }
 }
@@ -154,9 +166,49 @@ pub fn dashboard(song: &Queued, paused: bool, pending: usize) -> View {
         buttons: vec![CreateActionRow::Buttons(vec![
             CreateButton::new(button_id(toggle_action)).label(toggle_label),
             CreateButton::new(button_id(ACTION_SKIP)).label("Skip"),
+            CreateButton::new(button_id(ACTION_QUEUE)).label("Queue"),
             CreateButton::new(button_id(ACTION_STOP))
                 .label("Stop")
                 .style(ButtonStyle::Danger),
+        ])],
+    }
+}
+
+/// The dashboard showing what is waiting, with the way back to now-playing.
+///
+/// One field per song rather than one line in the description, so a long queue
+/// stays readable and Discord's own limit does the truncating for us.
+pub fn queue_view(pending: &[Queued]) -> View {
+    let mut embed = CreateEmbed::new().title("Up next").color(0x1d_b9_54);
+
+    if pending.is_empty() {
+        embed = embed.description("Nothing is queued.");
+    } else {
+        embed = embed.fields(
+            pending
+                .iter()
+                .enumerate()
+                .map(|(index, song)| {
+                    let name = trim(&format!("{}. {}", index + 1, song.title), MAX_FIELD_NAME);
+                    let artist = trim(&song.artist, MAX_FIELD_VALUE);
+                    (
+                        name,
+                        if artist.is_empty() {
+                            "\u{2014}".to_string()
+                        } else {
+                            artist
+                        },
+                        false,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    View {
+        embed,
+        buttons: vec![CreateActionRow::Buttons(vec![
+            CreateButton::new(button_id(ACTION_BACK)).label("Back"),
         ])],
     }
 }
@@ -467,7 +519,15 @@ mod tests {
 
     #[test]
     fn every_button_round_trips_through_its_custom_id() {
-        for action in [ACTION_PAUSE, ACTION_RESUME, ACTION_SKIP, ACTION_STOP] {
+        for action in [
+            ACTION_PAUSE,
+            ACTION_RESUME,
+            ACTION_SKIP,
+            ACTION_STOP,
+            ACTION_QUEUE,
+            ACTION_BACK,
+            ACTION_NONE,
+        ] {
             let id = button_id(action);
             assert_eq!(action_from_id(&id), Some(action));
         }
@@ -569,6 +629,62 @@ mod tests {
     #[test]
     fn short_text_is_left_alone() {
         assert_eq!(trim("short", 20), "short");
+    }
+
+    /// The now-playing view has to offer the way into the queue, or the button
+    /// is unreachable.
+    #[test]
+    fn the_dashboard_offers_the_queue_and_the_queue_offers_the_way_back() {
+        let now_playing = rendered(&dashboard(&song(), false, 1));
+        assert!(now_playing.contains("Queue"), "{now_playing}");
+        assert!(!now_playing.contains("Back"), "{now_playing}");
+
+        let queue = rendered(&queue_view(&[song()]));
+        assert!(queue.contains("Back"), "{queue}");
+        // Back is the only way off, so a queue view without it is a dead end.
+        assert!(!queue.contains("Stop"), "{queue}");
+    }
+
+    /// The queue is the reason the view exists, so the songs in it have to be
+    /// named, soonest first.
+    #[test]
+    fn the_queue_view_lists_every_waiting_song_in_order() {
+        let mut second = song();
+        second.title = "Second Song".to_string();
+        let view = queue_view(&[song(), second]);
+        let json = serde_json::to_string(&view.embed).expect("embed serialises");
+        let first_at = json.find("A Song").expect("the first song is listed");
+        let second_at = json.find("Second Song").expect("the second song is listed");
+        assert!(first_at < second_at, "out of order: {json}");
+        assert!(json.contains("An Artist"), "the artist is shown: {json}");
+    }
+
+    /// An empty queue still has to render, and must say so rather than showing
+    /// an embed with nothing in it.
+    #[test]
+    fn an_empty_queue_says_so() {
+        let view = queue_view(&[]);
+        assert!(
+            rendered(&view).contains("Nothing is queued"),
+            "{}",
+            rendered(&view)
+        );
+    }
+
+    /// A queued title can be arbitrarily long, and Discord rejects an embed
+    /// whose field name is over the limit rather than truncating it.
+    #[test]
+    fn an_over_long_queued_title_is_trimmed_rather_than_rejected() {
+        let mut long = song();
+        long.title = "x".repeat(400);
+        let json = serde_json::to_string(&queue_view(&[long]).embed).expect("serialises");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        let name = value["fields"][0]["name"].as_str().expect("a field name");
+        assert!(
+            name.chars().count() <= MAX_FIELD_NAME,
+            "field name was {} chars",
+            name.chars().count()
+        );
     }
 
     #[test]

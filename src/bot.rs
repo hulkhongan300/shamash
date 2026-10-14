@@ -378,6 +378,10 @@ impl Handler {
             dashboard::ACTION_STOP => {
                 player.stop(ctx, &config, guild_id).await;
             }
+            // Viewing pages. Neither plays anything, so neither needs the
+            // playback lock that Skip and Stop take.
+            dashboard::ACTION_QUEUE => player.show_queue(ctx, &config, guild_id).await,
+            dashboard::ACTION_BACK => player.show_now_playing(ctx, &config, guild_id).await,
             // "None of these": the listener said no, so the question goes.
             // Handled after the player lookup because it is not a playback
             // action and needs no dashboard.
