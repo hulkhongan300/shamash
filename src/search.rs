@@ -164,11 +164,9 @@ pub struct Candidate {
     pub title: Option<String>,
     /// Canonical watch URL.
     ///
-    /// Read from `webpage_url` as well. yt-dlp emits `url` for a result listed
-    /// flat and `webpage_url` for one extracted in full, and it omits the other
-    /// in each case, so a struct that only knows one spelling silently
-    /// deserialises to nothing.
-    #[serde(alias = "webpage_url")]
+    /// `url` and not `webpage_url`, and deliberately not an alias for either:
+    /// a flat listing carries *both* keys, so an alias makes serde report a
+    /// duplicate field and fail every result.
     pub url: String,
     /// View count, when YouTube reports one.
     pub view_count: Option<u64>,
@@ -1069,27 +1067,22 @@ mod tests {
     /// them right is the whole reason the catalog is called at all: a
     /// misheard "hoolig" would otherwise be searched as those letters and come
     /// back as whatever matched them.
-    /// yt-dlp spells a result's URL `url` when it lists results flat and
-    /// `webpage_url` when it extracts them in full, omitting the other each
-    /// time. A struct that knows only one spelling deserialises to nothing
-    /// rather than failing, which reads as "the search found nothing".
+    /// A flat yt-dlp listing carries both `url` and `webpage_url`. Reading
+    /// either one as an alias for the other makes serde see a duplicate field
+    /// and fail every result, which showed up as "failed to parse yt-dlp JSON
+    /// output" on every search.
     #[test]
-    fn a_candidate_parses_from_either_url_spelling() {
-        let flat = r#"{"url": "https://youtu.be/dQw4w9WgXcQ", "title": "Dracula"}"#;
-        let candidate: Candidate = serde_json::from_str(flat).expect("a flat result parses");
-        assert_eq!(candidate.video_id(), Some("dQw4w9WgXcQ"));
-
-        let full = r#"{
-            "id": "I0FKqmoK56I",
+    fn a_flat_result_with_both_url_spellings_still_parses() {
+        let line = r#"{
+            "url": "https://www.youtube.com/watch?v=I0FKqmoK56I",
             "webpage_url": "https://www.youtube.com/watch?v=I0FKqmoK56I",
             "title": "Look At Me!",
             "channel": "XXXTENTACION",
             "duration": 126
         }"#;
-        let candidate: Candidate = serde_json::from_str(full).expect("a full extraction parses");
+        let candidate: Candidate = serde_json::from_str(line).expect("a flat result parses");
         assert_eq!(candidate.video_id(), Some("I0FKqmoK56I"));
         assert_eq!(candidate.duration, Some(126.0));
-        assert_eq!(candidate.channel(), "XXXTENTACION");
     }
 
     #[test]

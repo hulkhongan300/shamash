@@ -1198,9 +1198,14 @@ impl Player {
         let candidate = match offer {
             Offer::Video(candidate) => candidate,
             Offer::Song { track, requested } => {
+                // The catalog's running time, not an empty set. Length is the
+                // scorer's heaviest input, and dropping it left the chooser
+                // ranking on relevance and views alone -- which is how a
+                // different song with the same name can win a search the
+                // asker had already narrowed down by choosing it.
                 let resolved = search::Resolved::Track {
+                    durations: track.duration_secs.into_iter().collect(),
                     track,
-                    durations: Vec::new(),
                 };
                 let choice = search::find_video(
                     &resolved,
