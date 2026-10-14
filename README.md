@@ -70,7 +70,7 @@ holding it is the whole reason the in-process engine is worth having.
   windows that contain speech. A quiet channel costs one RMS per frame.
 - **Autonomous joins**: joins when a user enters the configured channel, leaves
   when it is empty.
-- **Picks the popular song**: a request searches YouTube Music and plays the
+- **Picks the popular song**: a request searches YouTube and plays the
   most-viewed result that looks like a real song — clips, covers, remixes,
   lyric videos, and long mixes are skipped.
 - **Queues what it is asked for**: ask for a second song while one is playing
@@ -206,7 +206,7 @@ Parakeet id if you only ever speak English and want the lower latency.
 | `CATALOG_MATCH_THRESHOLD` | no | How confident a catalog match must be to correct the transcript, 0–1 (default `0.62`) |
 | `MATCH_THRESHOLD` | no       | Lowest score a candidate may reach and still be played without asking, in points (default `90`) |
 | `ALLOW_UNVERIFIED_AUTOPLAY` | no | Play a video found *without* a catalog match instead of offering a choice (default `false`) |
-| `SEARCH_CANDIDATES` | no     | How many results a request is scored against, 1–50 (default `8`). YouTube Music extracts each in full, so this is also the main latency lever |
+| `SEARCH_CANDIDATES` | no     | How many YouTube results a request is scored against, 1–50 (default `8`) |
 
 A malformed value is a startup error rather than a silent default, so a typo in
 a threshold is reported instead of quietly reverting to the default. Each
@@ -290,24 +290,6 @@ blocking. That covers every way a provider can fail, including the awkward one:
 Deezer reports a spent quota as **HTTP 200** with an `error` object in the body,
 so there is no status line to catch. The request continues on the words that
 were heard.
-
-### YouTube Music first
-
-The upload search asks **YouTube Music**, not YouTube. YouTube's own search
-puts a clean "(Audio)" upload first where YouTube Music puts the official album
-track — for XXXTentacion's *Look At Me!* that is the explicit 126 s original
-against a 128 s clean version, and the clean one is what you get otherwise.
-
-YouTube Music's flat results carry no running time, and length is the scorer's
-heaviest input, so this search is **not** flat: each result is extracted in
-full. That costs about three seconds a candidate, so a search takes roughly
-20–25 s where YouTube's took 1.5 s. `SEARCH_CANDIDATES` is the lever if that is
-too slow — four is about half the time and usually still finds the original.
-
-If YouTube Music is unreachable, rate-limited, or answers with nothing, the
-request falls back to YouTube and behaves as it always did. A search that fails
-on both is reported as the YouTube failure, which is the one with a message
-worth reading.
 
 A YouTube search returns whatever matched the words, and for a popular song that
 routinely includes other people's takes of it. Ranking those by view count picks

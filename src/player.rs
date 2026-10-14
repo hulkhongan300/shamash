@@ -905,7 +905,7 @@ impl Player {
         let choice = search::find_video(
             &resolved,
             &request.query,
-            &search::YtMusicFirst,
+            &search::YtDlpSearch,
             config.search_candidates,
             config.match_threshold,
         )
@@ -1036,7 +1036,7 @@ impl Player {
     ) {
         match search::find_unverified(
             request,
-            &search::YtMusicFirst,
+            &search::YtDlpSearch,
             config.search_candidates,
             config.match_threshold,
         )
@@ -1205,7 +1205,7 @@ impl Player {
                 let choice = search::find_video(
                     &resolved,
                     &requested,
-                    &search::YtMusicFirst,
+                    &search::YtDlpSearch,
                     config.search_candidates,
                     // The user chose; the threshold is not what is in question
                     // any more.
