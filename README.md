@@ -76,9 +76,9 @@ holding it is the whole reason the in-process engine is worth having.
 - **Queues what it is asked for**: ask for a second song while one is playing
   and it waits, starting on its own when the current one ends.
 - **Dashboard controls**: the alert channel carries a now-playing embed with
-  the song's thumbnail and Pause/Resume, Skip, Queue and Stop buttons. The
-  message is edited in place rather than replaced, so the channel does not fill
-  up.
+  the song's thumbnail and Pause/Resume, Skip, Queue, Repeat and Stop buttons.
+  The message is edited in place rather than replaced, so the channel does not
+  fill up.
 - **Local speech-to-text**: transcription runs on your machine, no audio leaves
   the host.
 - **Few dependencies**: `serenity` + `songbird` + `transcribe-cpp` as crates
@@ -382,12 +382,17 @@ The dashboard in the alert channel is the only control surface:
 | Resume   | Carries on from where the song paused                        |
 | Skip     | Drops the current song and starts the next one queued       |
 | Queue    | Lists what is waiting, soonest first                        |
+| Repeat   | Replays the current song when it ends with nothing queued after it; the button reads `Repeat: on` while it is set |
 | Stop     | Stops playback and clears the queue                         |
 
 **Queue** swaps the dashboard for a list of the waiting songs and leaves a
 **Back** button to return. The dashboard is one message edited in place, so it
 remembers which of the two it is showing: a song ending while you are reading
 the queue leaves you reading the queue.
+
+**Repeat** is repeat *one*: a song that ends with nothing queued behind it plays
+again, rather than the queue starting over. It does not interrupt the list — a
+song with others waiting still plays the next one.
 
 When the bot cannot tell which song was meant, it posts the three closest
 results in the same channel as numbered buttons and plays nothing. Pressing one

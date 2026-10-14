@@ -1372,6 +1372,19 @@ impl Player {
         )
         .await;
     }
+
+    /// Turns repeat-one on or off and redraws, so the button says which way it
+    /// went. Returns the new setting.
+    pub async fn toggle_repeat(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+    ) -> bool {
+        let repeat = self.queues.get(guild_id).toggle_repeat();
+        self.draw_dashboard(ctx, config, guild_id).await;
+        repeat
+    }
 }
 
 /// The parts of the player a songbird ending needs, owned so the callback can
@@ -1464,7 +1477,9 @@ async fn draw(
     let view = match page {
         Page::Queue => dashboard::queue_view(&queue.pending_songs()),
         Page::NowPlaying => match &current {
-            Some(song) => dashboard::dashboard(song, queue.is_paused(), queue.pending()),
+            Some(song) => {
+                dashboard::dashboard(song, queue.is_paused(), queue.pending(), queue.is_repeat())
+            }
             None => dashboard::idle_dashboard(),
         },
     };

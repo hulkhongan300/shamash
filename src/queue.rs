@@ -55,6 +55,24 @@ struct State {
     /// stopped, so the callback for a song that ends on its own has to tell
     /// itself apart from one already replaced by a skip.
     generation: u64,
+    /// Whether a song that ends with nothing queued behind it goes back on.
+    repeat: bool,
+}
+
+/// Puts a finished song back on the queue when repeat is on and nothing else is
+/// waiting.
+///
+/// Repeat means repeat *one*: a song that ends with the queue empty goes back on
+/// rather than the queue restarting from the top, because there is no top to
+/// restart from once the list has run down. Called before the next song is
+/// taken, so the requeued song is what plays next.
+fn requeue_if_repeating(state: &mut State, stopped: &Option<Queued>) {
+    if state.repeat
+        && state.pending.is_empty()
+        && let Some(song) = stopped
+    {
+        state.pending.push_back(song.clone());
+    }
 }
 
 /// The result of moving a queue on to the next song.
@@ -102,6 +120,7 @@ impl Queue {
     pub fn advance(&self) -> Advanced {
         let mut state = self.lock();
         let stopped = state.current.take();
+        requeue_if_repeating(&mut state, &stopped);
         state.current = state.pending.pop_front();
         state.paused = false;
         state.generation = state.generation.wrapping_add(1);
@@ -124,6 +143,7 @@ impl Queue {
             return None;
         }
         let stopped = state.current.take();
+        requeue_if_repeating(&mut state, &stopped);
         state.current = state.pending.pop_front();
         state.paused = false;
         state.generation = state.generation.wrapping_add(1);
@@ -132,6 +152,19 @@ impl Queue {
             current: state.current.clone(),
             generation: state.generation,
         })
+    }
+
+    /// Whether a song that ends with nothing behind it plays again.
+    pub fn is_repeat(&self) -> bool {
+        self.lock().repeat
+    }
+
+    /// Turns replaying the current song on or off, and reports the new setting
+    /// so the caller can say which way it went.
+    pub fn toggle_repeat(&self) -> bool {
+        let mut state = self.lock();
+        state.repeat = !state.repeat;
+        state.repeat
     }
 
     /// Drops the current song without starting another.
@@ -452,5 +485,79 @@ mod tests {
         .join();
 
         assert!(queue.push(song("after the panic")));
+    }
+    /// The point of repeat: a song that ends with nothing behind it plays
+    /// again, rather than the queue running dry.
+    #[test]
+    fn repeat_plays_a_song_again_when_nothing_is_queued_behind_it() {
+        let queue = Queue::default();
+        assert!(queue.push(song("only")));
+        assert!(queue.advance().current.is_some(), "the song is playing");
+        assert!(!queue.is_repeat(), "repeat is off to begin with");
+
+        assert!(queue.toggle_repeat(), "toggle turns it on");
+        let now = queue.advance();
+        assert_eq!(
+            now.stopped.expect("stopped song").title,
+            "only",
+            "the song that finished is the one reported as stopped"
+        );
+        assert_eq!(
+            now.current.expect("played again").title,
+            "only",
+            "and it is what plays next"
+        );
+    }
+
+    /// Repeat one is not repeat-all: a song that ends with others waiting plays
+    /// the next one, and only comes back when the list has run down.
+    #[test]
+    fn repeat_does_not_interrupt_the_queue_behind_the_song() {
+        let queue = Queue::default();
+        assert!(queue.toggle_repeat());
+        assert!(queue.push(song("first")));
+        assert!(queue.push(song("second")));
+        queue.advance();
+
+        let now = queue.advance();
+        assert_eq!(now.current.expect("the next song").title, "second");
+        assert_eq!(
+            queue.pending(),
+            0,
+            "the finished song did not jump the queue"
+        );
+
+        // The list has run down now, so the last song comes round again.
+        let now = queue.advance();
+        assert_eq!(now.current.expect("repeats last").title, "second");
+    }
+
+    /// Turning it off must actually stop it, or the button is a one-way door.
+    #[test]
+    fn turning_repeat_off_stops_the_song_coming_back() {
+        let queue = Queue::default();
+        assert!(queue.push(song("only")));
+        queue.advance();
+        assert!(queue.toggle_repeat());
+        assert!(!queue.toggle_repeat(), "the second press turns it off");
+
+        let now = queue.advance();
+        assert!(now.current.is_none(), "nothing left to play: {now:?}");
+        assert_eq!(queue.pending(), 0);
+    }
+
+    /// Stopping clears the queue. A repeat flag left on would otherwise put a
+    /// stopped song straight back.
+    #[test]
+    fn a_cleared_queue_does_not_resurrect_the_song_under_repeat() {
+        let queue = Queue::default();
+        assert!(queue.push(song("only")));
+        queue.advance();
+        assert!(queue.toggle_repeat());
+
+        queue.clear();
+        let now = queue.advance();
+        assert!(now.current.is_none(), "stop must beat repeat: {now:?}");
+        assert_eq!(queue.pending(), 0);
     }
 }

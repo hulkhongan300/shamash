@@ -382,6 +382,10 @@ impl Handler {
             // playback lock that Skip and Stop take.
             dashboard::ACTION_QUEUE => player.show_queue(ctx, &config, guild_id).await,
             dashboard::ACTION_BACK => player.show_now_playing(ctx, &config, guild_id).await,
+            dashboard::ACTION_REPEAT => {
+                let repeat = player.toggle_repeat(ctx, &config, guild_id).await;
+                tracing::info!(guild_id = %guild_id, repeat, "toggled repeat");
+            }
             // "None of these": the listener said no, so the question goes.
             // Handled after the player lookup because it is not a playback
             // action and needs no dashboard.

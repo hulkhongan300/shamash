@@ -34,6 +34,9 @@ pub const ACTION_QUEUE: &str = "queue";
 /// edited in place and the bot does not track which way round it was left.
 pub const ACTION_BACK: &str = "back";
 
+/// Turns repeat-one on or off.
+pub const ACTION_REPEAT: &str = "repeat";
+
 /// The button on a chooser that means "none of these".
 ///
 /// A question with no way to say no is a question that has to be answered. The
@@ -66,7 +69,7 @@ pub fn action_from_id(custom_id: &str) -> Option<&str> {
     let action = custom_id.strip_prefix(&format!("{PREFIX}:"))?;
     match action {
         ACTION_PAUSE | ACTION_RESUME | ACTION_SKIP | ACTION_STOP | ACTION_NONE | ACTION_QUEUE
-        | ACTION_BACK => Some(action),
+        | ACTION_BACK | ACTION_REPEAT => Some(action),
         _ => None,
     }
 }
@@ -129,8 +132,9 @@ impl View {
 /// Builds the dashboard for the song playing now.
 ///
 /// `paused` picks between a pause and a resume button, because a paused song
-/// needs the opposite action.
-pub fn dashboard(song: &Queued, paused: bool, pending: usize) -> View {
+/// needs the opposite action. `repeat` is stated on the button, because a
+/// toggle whose state is only visible by its effect is one nobody trusts.
+pub fn dashboard(song: &Queued, paused: bool, pending: usize, repeat: bool) -> View {
     let mut embed = CreateEmbed::new()
         .title(trim(&song.title, MAX_TITLE))
         .url(&song.url)
@@ -167,6 +171,13 @@ pub fn dashboard(song: &Queued, paused: bool, pending: usize) -> View {
             CreateButton::new(button_id(toggle_action)).label(toggle_label),
             CreateButton::new(button_id(ACTION_SKIP)).label("Skip"),
             CreateButton::new(button_id(ACTION_QUEUE)).label("Queue"),
+            CreateButton::new(button_id(ACTION_REPEAT))
+                .label(if repeat { "Repeat: on" } else { "Repeat" })
+                .style(if repeat {
+                    ButtonStyle::Secondary
+                } else {
+                    ButtonStyle::Primary
+                }),
             CreateButton::new(button_id(ACTION_STOP))
                 .label("Stop")
                 .style(ButtonStyle::Danger),
@@ -526,6 +537,7 @@ mod tests {
             ACTION_STOP,
             ACTION_QUEUE,
             ACTION_BACK,
+            ACTION_REPEAT,
             ACTION_NONE,
         ] {
             let id = button_id(action);
@@ -550,7 +562,7 @@ mod tests {
 
     #[test]
     fn the_dashboard_carries_the_title_artist_and_thumbnail() {
-        let view = dashboard(&song(), false, 0);
+        let view = dashboard(&song(), false, 0, false);
         let json = serde_json::to_string(&view.embed).expect("embed serialises");
         assert!(json.contains("A Song"), "the title must be shown: {json}");
         assert!(
@@ -569,11 +581,11 @@ mod tests {
 
     #[test]
     fn a_playing_song_offers_pause_and_a_paused_one_offers_resume() {
-        let playing = rendered(&dashboard(&song(), false, 0));
+        let playing = rendered(&dashboard(&song(), false, 0, false));
         assert!(playing.contains("Pause"), "{playing}");
         assert!(!playing.contains("Resume"), "{playing}");
 
-        let paused = rendered(&dashboard(&song(), true, 0));
+        let paused = rendered(&dashboard(&song(), true, 0, false));
         assert!(paused.contains("Resume"), "{paused}");
         assert!(
             paused.contains("Paused"),
@@ -583,13 +595,13 @@ mod tests {
 
     #[test]
     fn the_queue_length_is_summarised() {
-        let empty = rendered(&dashboard(&song(), false, 0));
+        let empty = rendered(&dashboard(&song(), false, 0, false));
         assert!(empty.contains("nothing queued"), "{empty}");
 
-        let one = rendered(&dashboard(&song(), false, 1));
+        let one = rendered(&dashboard(&song(), false, 1, false));
         assert!(one.contains("1 song"), "{one}");
 
-        let many = rendered(&dashboard(&song(), false, 3));
+        let many = rendered(&dashboard(&song(), false, 3, false));
         assert!(many.contains("3 songs"), "{many}");
     }
 
@@ -599,7 +611,8 @@ mod tests {
         // lose the whole dashboard.
         let mut long = song();
         long.title = "x".repeat(400);
-        let json = serde_json::to_string(&dashboard(&long, false, 0).embed).expect("serialises");
+        let json =
+            serde_json::to_string(&dashboard(&long, false, 0, false).embed).expect("serialises");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         let title = value["title"].as_str().expect("a title");
         assert!(
@@ -635,7 +648,7 @@ mod tests {
     /// is unreachable.
     #[test]
     fn the_dashboard_offers_the_queue_and_the_queue_offers_the_way_back() {
-        let now_playing = rendered(&dashboard(&song(), false, 1));
+        let now_playing = rendered(&dashboard(&song(), false, 1, false));
         assert!(now_playing.contains("Queue"), "{now_playing}");
         assert!(!now_playing.contains("Back"), "{now_playing}");
 
@@ -669,6 +682,29 @@ mod tests {
             "{}",
             rendered(&view)
         );
+    }
+
+    /// A toggle whose state is only visible in its effect is one nobody trusts,
+    /// so the button has to say which way it is set.
+    #[test]
+    fn the_repeat_button_says_whether_repeat_is_on() {
+        let off = rendered(&dashboard(&song(), false, 0, false));
+        assert!(off.contains("Repeat"), "{off}");
+        assert!(!off.contains("Repeat: on"), "off by default: {off}");
+
+        let on = rendered(&dashboard(&song(), false, 0, true));
+        assert!(on.contains("Repeat: on"), "{on}");
+    }
+
+    /// Discord takes at most five buttons in a row, and this row now has five.
+    /// A sixth would be dropped by the API, taking Stop with it.
+    #[test]
+    fn the_button_row_stays_within_discords_limit() {
+        let json = serde_json::to_string(&dashboard(&song(), false, 0, false).buttons)
+            .expect("serialises");
+        let buttons = json.matches("\"type\":2").count();
+        assert!(buttons <= 5, "{buttons} buttons in one row: {json}");
+        assert_eq!(buttons, 5, "the row lost a button: {json}");
     }
 
     /// A queued title can be arbitrarily long, and Discord rejects an embed
