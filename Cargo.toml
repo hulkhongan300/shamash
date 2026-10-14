@@ -46,10 +46,10 @@ tokio = { version = "1.53.1", features = ["full"] }
 # startup and a full model load on *every* utterance; holding the model in
 # process makes a command cost only inference. The crate vendors and builds the
 # C++ tree, so there is no dependency on the Handy install at runtime.
-# `vulkan` is deliberately off: the Vulkan *runtime* is installed on this
-# machine but the SDK headers are not, and the backend will not compile without
-# them. Turn the feature on after `pacman -S vulkan-headers` to use the GPU.
-transcribe-cpp = "0.2.4"
+# `vulkan` puts inference on the GPU (an RX 570 here) instead of the CPU,
+# where a Whisper decode costs ~17 s. Building it needs the Vulkan SDK headers
+# and `glslc` for the compute shaders; drop the feature to fall back to CPU.
+transcribe-cpp = { version = "0.2.4", features = ["vulkan"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 rphonetic = "3"

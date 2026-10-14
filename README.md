@@ -2,10 +2,11 @@
 
 A wake-word Discord music bot written in Rust.
 
-Shamash joins a designated voice channel whenever a member enters it, listens
-for its name, and plays the song that is asked for:
+Shamash joins a designated voice channel whenever anyone is in it — including
+when it starts up and finds the channel already occupied — listens for its
+name, and plays the song that is asked for:
 
-> **"Shamash, play Dracula by Tame Impala"**
+> **"bot, play Dracula by Tame Impala"**
 
 ## How it works
 
@@ -94,7 +95,7 @@ holding it is the whole reason the in-process engine is worth having.
 ## Setup
 
 Install the [Handy](https://github.com/cjpais/Handy) app once and pick a
-Parakeet model in it, so the weights land in the Hugging Face cache that
+model in it, so the weights land in the Hugging Face cache that
 `PARAKEET_MODEL` and `WAKE_MODEL` resolve against. Or skip it and point them
 straight at any transcribe.cpp GGUF.
 
@@ -121,11 +122,25 @@ They pay for being loaded differently, which is the whole reason there are two:
 | Loaded | at startup, always resident | on the first wake word, then resident |
 | Runs | on every window of speech in the channel | only on a request, after a wake word |
 | Job | hear one short word | turn the request into text |
-| Default | `parakeet-tdt_ctc-110m` | `parakeet-tdt-0.6b-v2` |
+| Default | `parakeet-tdt_ctc-110m` | `whisper-large-v3-turbo` |
 
 `ASR_ENGINE=handy` swaps the in-process engine back to the Handy subprocess,
 which reloads a model per call. It is slower and kept for comparing engines on
 the same audio; the staged design assumes the resident one.
+
+Inference runs on the GPU through ggml's Vulkan backend when the build has it
+compiled in and a device is registered, and on the CPU otherwise. The `vulkan`
+feature of `transcribe-cpp` is on; building it needs the Vulkan SDK headers and
+`glslc`, so on a fresh Arch box:
+
+```sh
+sudo pacman -S --needed vulkan-headers spirv-headers shaderc
+```
+
+The startup log lists the devices that registered (`device=["Vulkan0", "CPU"]`);
+the engine picks the best one itself, so there is nothing to configure.
+Without those packages the build fails on a missing `SPIRV-Headers`, so drop the
+feature from `Cargo.toml` to go back to CPU inference.
 
 Whisper models work the same way, as GGUFs, through this engine. The old
 `whisper-rs` engine and `scripts/setup.sh` are gone: it vendored its own copy
@@ -134,7 +149,13 @@ of `ggml` and could not be linked alongside transcribe.cpp, so one had to go.
 
 `PARAKEET_MODEL` takes either a path to a `.gguf` or a Handy catalogue id, which
 is resolved against the Hugging Face cache. Some models (Canary, Nemotron) need
-a language hint to produce text at all; set `ASR_LANGUAGE=en` for those.
+a language hint to produce text at all; set `ASR_LANGUAGE=en` for those. The
+Whisper default detects the language itself and does not need one.
+
+Whisper large-v3-turbo is multilingual, where the Parakeet it replaced was
+English-only. It is much slower on the CPU — ~17 s per short utterance against
+~0.7 s, or ~1 s once the GPU is doing it. Set `PARAKEET_MODEL` back to a
+Parakeet id if you only ever speak English and want the lower latency.
 
 ### Environment variables
 
@@ -143,7 +164,7 @@ a language hint to produce text at all; set `ASR_LANGUAGE=en` for those.
 | `DISCORD_TOKEN`   | yes      | Bot token from the Discord developer portal        |
 | `VOICE_CHANNEL_ID`| yes      | ID of the voice channel the bot watches and joins  |
 | `ASR_ENGINE`      | no       | `direct` (default, in-process transcribe.cpp) or `handy` (subprocess) |
-| `PARAKEET_MODEL`  | no       | The large model, loaded on a wake word: a `.gguf` path or Handy model id (default Parakeet TDT 0.6B v2) |
+| `PARAKEET_MODEL`  | no       | The large model, loaded on a wake word: a `.gguf` path or Handy model id (default Whisper large-v3-turbo Q8_0) |
 | `WAKE_MODEL`      | no       | The small always-on model: a `.gguf` path or Handy model id (default Parakeet TDT+CTC 110M) |
 | `ASR_LANGUAGE`    | no       | Language hint for models that need one, e.g. `en` for Canary or Nemotron |
 | `WAKE_WORDS`      | no       | Comma-separated wake words (default `bot,play,ut,ot`) |
@@ -281,6 +302,20 @@ turn, under one shared time budget: "stand by me by ben e king" is first tried
 as *Ben E. King — Stand By Me*, and as *Stand* by *Me by Ben E King* only if
 that finds nothing.
 
+By default the bot logs only what it heard, what it did about it, and which
+models loaded:
+
+```
+INFO shamash::direct: loaded ASR model model=... device=["Vulkan0", "CPU"]
+INFO shamash::bot: Shamash starting up request_model=... wake_model=... wake_words=bot,play,ut,ot
+INFO shamash::pipeline: request heard guild_id=... transcript="bot play dracula by tame impala"
+INFO shamash::pipeline: playing a request guild_id=... request="dracula by tame impala"
+```
+
+Serenity and songbird log a line per connection and per packet, which drowns
+those out, so they are silenced at info. Warnings still come through from
+everything, so a failure is never silent.
+
 Set `RUST_LOG=shamash=debug` to see what the wake model heard on each check, the
 resolution, the scores and the runner-up:
 
@@ -337,7 +372,7 @@ instant and stops the cache growing without bound.
 
 ## Testing without Discord
 
-Record yourself saying a wake word, pausing, then *"play Dracula by Tame
+Record yourself saying a wake word, pausing, then *"bot, play Dracula by Tame
 Impala"* — the pause matters, because it is where the bot's two tones fall:
 
 ```sh

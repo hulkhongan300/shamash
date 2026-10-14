@@ -10,11 +10,11 @@ use crate::voice::{VoiceService, decode_config};
 use crate::wake::BigModels;
 use serenity::async_trait;
 use serenity::builder::{
-    CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, EditMessage,
+    CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage,
 };
 use serenity::model::application::{Command, ComponentInteraction, Interaction};
 use serenity::model::gateway::Ready;
-use serenity::model::id::{ChannelId, GuildId, UserId};
+use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::model::voice::VoiceState;
 use serenity::prelude::*;
 use songbird::SerenityInit;
@@ -155,6 +155,27 @@ impl EventHandler for Handler {
         }
     }
 
+    /// Reconciles presence as each guild arrives.
+    ///
+    /// Without this the bot only ever joins in reaction to somebody moving, so
+    /// a channel that already had people in it when the bot started -- or a
+    /// guild it was already in -- is never noticed until someone else joins or
+    /// leaves. `GUILD_CREATE` is the first point at which that guild's voice
+    /// states are in the cache, so it is where the count can be trusted.
+    async fn guild_create(
+        &self,
+        ctx: Context,
+        guild: serenity::model::guild::Guild,
+        _is_new: Option<bool>,
+    ) {
+        let Ok(service) = VoiceService::from_ctx(&ctx).await else {
+            return;
+        };
+        if let Err(e) = service.sync_channel(&ctx, guild.id).await {
+            tracing::warn!(guild_id = %guild.id, error = %format!("{e:#}"), "voice channel sync failed");
+        }
+    }
+
     async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
         let Some(guild_id) = new.guild_id else {
             return;
@@ -287,19 +308,16 @@ impl Handler {
         };
 
         match player.play_chosen(ctx, &config, guild_id, key).await {
-            Ok(()) => tracing::info!(guild_id = %guild_id, "played the chosen song"),
+            // The question has been answered, so it goes; the dashboard stays.
+            Ok(()) => {
+                tracing::info!(guild_id = %guild_id, "played the chosen song");
+                drop_question(ctx, button.channel_id, button.message.id, guild_id).await;
+            }
             Err(e) => {
                 tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not play the chosen song");
-                // The choice is spent either way, so the buttons go rather than
-                // offering a second press that cannot do anything.
-                let edit = EditMessage::new().components(Vec::new());
-                if let Err(e) = ctx
-                    .http
-                    .edit_message(button.channel_id, button.message.id, &edit, Vec::new())
-                    .await
-                {
-                    tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not clear the song choice");
-                }
+                // The choice is spent either way, so the question goes rather
+                // than offering a second press that cannot do anything.
+                drop_question(ctx, button.channel_id, button.message.id, guild_id).await;
             }
         }
     }
@@ -367,22 +385,28 @@ impl Handler {
                 if !player.dismiss_choice(guild_id) {
                     return;
                 }
-                let edit = EditMessage::new().components(Vec::new());
-                if let Err(e) = ctx
-                    .http
-                    .edit_message(button.channel_id, button.message.id, &edit, Vec::new())
-                    .await
-                {
-                    tracing::debug!(
-                        guild_id = %guild_id,
-                        error = %format!("{e:#}"),
-                        "could not clear the dismissed question"
-                    );
-                }
+                drop_question(ctx, button.channel_id, button.message.id, guild_id).await;
             }
             // `action_from_id` only returns the four above.
             _ => {}
         }
+    }
+}
+
+/// Takes the bot's own "which one did you mean" question out of the channel
+/// once it has been answered.
+///
+/// Only the question is ever passed here. The dashboard is edited in place and
+/// is meant to stay. A bot may delete its own messages without any extra
+/// permission, so nothing else is needed to clean up after itself.
+async fn drop_question(
+    ctx: &Context,
+    channel_id: ChannelId,
+    message_id: MessageId,
+    guild_id: GuildId,
+) {
+    if let Err(e) = ctx.http.delete_message(channel_id, message_id, None).await {
+        tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not clear the song choice");
     }
 }
 

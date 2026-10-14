@@ -241,6 +241,12 @@ const CHOICE_COUNT: usize = 3;
 /// a download.
 const CHOICE_TTL: Duration = Duration::from_secs(60);
 
+/// How long a miss notice stays up before the bot cleans it away.
+///
+/// Long enough for the person who spoke to look over and read what went wrong;
+/// short enough that the channel is not a wall of past failures.
+const NOTICE_TTL: Duration = Duration::from_secs(30);
+
 /// A pending question, and what each of its buttons would play.
 ///
 /// The custom id on the buttons carries the video id, so this only has to
@@ -718,12 +724,29 @@ impl Player {
                 dashboard::notice(&failure.message(heard)).into_message(),
             )
             .await;
-        if let Err(e) = sent {
-            tracing::warn!(
-                guild_id = %guild_id,
-                error = %format!("{e:#}"),
-                "could not report the failed request"
-            );
+        match sent {
+            // The miss is worth reading once, not leaving in the channel as a
+            // record, so it takes itself away after NOTICE_TTL.
+            Ok(sent) => {
+                let http = ctx.http.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(NOTICE_TTL).await;
+                    if let Err(e) = http.delete_message(channel_id, sent.id, None).await {
+                        tracing::debug!(
+                            channel_id = %channel_id,
+                            error = %format!("{e:#}"),
+                            "could not take the notice away"
+                        );
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    guild_id = %guild_id,
+                    error = %format!("{e:#}"),
+                    "could not report the failed request"
+                );
+            }
         }
     }
 
@@ -969,12 +992,11 @@ impl Player {
             .await;
     }
 
-    /// Posts the question, and takes the buttons away again after
-    /// [`CHOICE_TTL`].
+    /// Posts the question, and takes it away again after [`CHOICE_TTL`].
     ///
-    /// A question left on offer forever is not a question. The message stays
-    /// readable, but the buttons go, so a press from ten minutes ago cannot
-    /// start a download.
+    /// An answered question is deleted outright by the press that answered it,
+    /// so a timer firing afterwards finds nothing left to remove and only has
+    /// to strip the buttons.
     async fn ask(
         &self,
         ctx: &SerenityContext,
@@ -1011,6 +1033,12 @@ impl Player {
         let http = ctx.http.clone();
         tokio::spawn(async move {
             tokio::time::sleep(CHOICE_TTL).await;
+            if http.delete_message(channel_id, sent.id, None).await.is_ok() {
+                return;
+            }
+            // Nobody answered, so the question goes. If it cannot be deleted the
+            // buttons still must go: a press from ten minutes ago cannot start
+            // a download.
             if let Err(e) = http
                 .edit_message(
                     channel_id,

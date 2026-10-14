@@ -13,6 +13,13 @@
 //!
 //! It also removes the temp WAV file: the engine takes raw f32 PCM, so the
 //! samples go straight from the voice connection to the decoder.
+//!
+//! Inference goes on the GPU when one is available, because `Model::load`
+//! leaves the backend as `Auto` and ggml picks the best device it has: Vulkan
+//! on AMD and Intel under Linux, Metal on macOS. The difference is not marginal
+//! for the Whisper models -- on an RX 570 a decode that takes ~17 s on the CPU
+//! takes ~1 s on the GPU. Requesting a backend here instead would be worse,
+//! because it would take Metal away from the macOS build for no gain.
 
 use crate::model;
 use crate::transcriber::Transcriber;
