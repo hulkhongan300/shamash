@@ -358,10 +358,30 @@ struct Ask {
 
 impl Ask {
     /// The songs on the page currently shown.
-    fn page_of<'a>(&self, tracks: &'a [resolve::CatalogTrack]) -> &'a [resolve::CatalogTrack] {
-        let start = (self.page * dashboard::ASK_PAGE).min(tracks.len());
-        let end = (start + dashboard::ASK_PAGE).min(tracks.len());
-        &tracks[start..end]
+    fn page(&self) -> &[resolve::CatalogTrack] {
+        let start = (self.page * dashboard::ASK_PAGE).min(self.tracks.len());
+        let end = (start + dashboard::ASK_PAGE).min(self.tracks.len());
+        &self.tracks[start..end]
+    }
+
+    /// Whether there is another page behind this one.
+    fn has_next(&self) -> bool {
+        (self.page + 1) * dashboard::ASK_PAGE < self.tracks.len()
+    }
+
+    /// The chooser as it would be drawn.
+    fn view(&self) -> dashboard::View {
+        let options = self
+            .page()
+            .iter()
+            .map(|track| dashboard::ChoiceOption {
+                title: &track.title,
+                channel: &track.artist,
+                duration_secs: track.duration_secs,
+                key: "",
+            })
+            .collect::<Vec<_>>();
+        dashboard::ask(&self.query, &options, self.page, self.tracks.len())
     }
 }
 
@@ -1509,7 +1529,7 @@ impl Player {
             asker,
             posted: None,
         };
-        let message = self.ask_message(&ask);
+        let message = ask.view();
         self.asks.set(guild_id, ask);
 
         let Some(channel_id) = resolve_alert_channel(ctx, config, guild_id) else {
@@ -1527,31 +1547,24 @@ impl Player {
     /// Turns to the next page of a `/play` search, redrawing the same message.
     ///
     /// Returns whether it moved, so the caller only answers when it did.
-    pub async fn next_page(
-        &self,
-        ctx: &SerenityContext,
-        config: &Config,
-        guild_id: GuildId,
-    ) -> bool {
-        let Some(ask) = self.ask_for(guild_id) else {
+    pub async fn next_page(&self, ctx: &SerenityContext, guild_id: GuildId) -> bool {
+        // Bumped on a copy and stored once, only if the redraw landed. Reading
+        // the page, rendering from it and writing it back in three steps let a
+        // second press render one page behind, and left the stored page wrong
+        // when the edit failed.
+        let Some(mut ask) = self.ask_for(guild_id) else {
             return false;
         };
-        if (ask.page + 1) * dashboard::ASK_PAGE >= ask.tracks.len() {
+        if !ask.has_next() {
             return false;
         }
-        let message = dashboard::ask(
-            &ask.query,
-            &ask_options(&ask, &ask.tracks),
-            ask.page + 1,
-            ask.tracks.len(),
-        );
-        if self.redraw_ask(ctx, config, guild_id, message).await {
-            if let Some(slot) = self.asks.lock().get_mut(&guild_id) {
-                slot.page += 1;
-            }
-            return true;
+        ask.page += 1;
+        if self.redraw_ask(ctx, guild_id, ask.view()).await {
+            self.asks.set(guild_id, ask);
+            true
+        } else {
+            false
         }
-        false
     }
 
     /// Plays the song a `/play` search put at `index`.
@@ -1602,22 +1615,11 @@ impl Player {
         self.asks.lock().get(&guild_id).cloned()
     }
 
-    /// The message for the page an ask is on.
-    fn ask_message(&self, ask: &Ask) -> dashboard::View {
-        dashboard::ask(
-            &ask.query,
-            &ask_options(ask, &ask.tracks),
-            ask.page,
-            ask.tracks.len(),
-        )
-    }
-
     /// Edits the outstanding search's message in place, the way the dashboard
     /// is edited, rather than posting a second one.
     async fn redraw_ask(
         &self,
         ctx: &SerenityContext,
-        _config: &Config,
         guild_id: GuildId,
         message: dashboard::View,
     ) -> bool {
@@ -1635,22 +1637,6 @@ impl Player {
             }
         }
     }
-}
-
-/// The page's songs as the rows the chooser draws.
-fn ask_options<'a>(
-    ask: &Ask,
-    tracks: &'a [resolve::CatalogTrack],
-) -> Vec<dashboard::ChoiceOption<'a>> {
-    ask.page_of(tracks)
-        .iter()
-        .map(|track| dashboard::ChoiceOption {
-            title: &track.title,
-            channel: &track.artist,
-            duration_secs: track.duration_secs,
-            key: "",
-        })
-        .collect()
 }
 
 /// The parts of the player a songbird ending needs, owned so the callback can
@@ -2579,13 +2565,13 @@ mod tests {
     #[test]
     fn a_page_is_a_window_onto_the_whole_list() {
         let ask = ask_with(20, 7);
-        let first = ask.page_of(&ask.tracks);
+        let first = ask.page();
         assert_eq!(first.len(), dashboard::ASK_PAGE);
         assert_eq!(first[0].title, "Song 0");
 
         let mut second = ask.clone();
         second.page = 1;
-        let window = second.page_of(&second.tracks);
+        let window = second.page();
         // Songs 9 through 17: a full page, with songs 18 and 19 behind it.
         assert_eq!(window.len(), dashboard::ASK_PAGE, "page two is also full");
         assert_eq!(window[0].title, "Song 9", "not the first song again");
@@ -2595,11 +2581,11 @@ mod tests {
     #[test]
     fn a_short_list_pages_without_overrunning() {
         let ask = ask_with(3, 7);
-        assert_eq!(ask.page_of(&ask.tracks).len(), 3);
+        assert_eq!(ask.page().len(), 3);
 
         let mut beyond = ask.clone();
         beyond.page = 9;
-        assert!(beyond.page_of(&beyond.tracks).is_empty());
+        assert!(beyond.page().is_empty());
     }
 
     /// The ownership rule on its own, so it can be tested without a player.
@@ -2607,6 +2593,22 @@ mod tests {
         asks.lock()
             .get(&guild_id)
             .is_some_and(|ask| ask.asker == user)
+    }
+
+    /// Next page has to say no on the last page rather than render an empty one.
+    #[test]
+    fn the_last_page_has_no_next_one() {
+        for (count, page, expected) in [
+            (20, 0, true),
+            (20, 1, true),
+            (20, 2, false), // 20 songs, 9 to a page: three pages, and this is the last.
+            (9, 0, false),
+            (1, 0, false),
+        ] {
+            let mut ask = ask_with(count, 7);
+            ask.page = page;
+            assert_eq!(ask.has_next(), expected, "{count} songs, page {page}");
+        }
     }
 
     /// Only the person who typed it may press it. This is not the dashboard's

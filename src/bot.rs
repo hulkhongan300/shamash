@@ -324,7 +324,7 @@ impl Handler {
                 }
             }
             Asked::Next => {
-                if !player.next_page(ctx, &config, guild_id).await {
+                if !player.next_page(ctx, guild_id).await {
                     refuse(ctx, button).await;
                 }
             }
@@ -362,7 +362,7 @@ impl Handler {
         // The bot has to be in the voice channel to play anything. Saying so
         // before the search saves an API round trip and a wall of buttons that
         // could not do anything.
-        if !in_voice(ctx, guild_id, command.user.id).await {
+        if !may_control(ctx, guild_id, command.user.id).await {
             reply(ctx, command, NOT_IN_VOICE).await;
             return;
         }
@@ -383,11 +383,15 @@ impl Handler {
                 .await;
             }
             Err(e) => {
-                tracing::info!(guild_id = %guild_id, query = %query, error = %format!("{e:#}"), "/play found nothing");
+                tracing::info!(guild_id = %guild_id, query = %query, error = %format!("{e:#}"), "/play could not answer");
+                // The catalog may well have found something and the post may
+                // have been refused, which is what this used to report as
+                // "nothing in the catalog" -- true of the second, false of the
+                // first, and the two look identical from the outside.
                 reply(
                     ctx,
                     command,
-                    &format!("Nothing in the catalog for `{query}`."),
+                    &format!("I couldn't send those results: {e:#}"),
                 )
                 .await;
             }
@@ -608,12 +612,6 @@ fn typed_song(command: &CommandInteraction) -> Option<String> {
         })?;
     let query = words.trim().to_string();
     (!query.is_empty()).then_some(query)
-}
-
-/// Whether `user` is in the voice channel, which `/play` needs: the bot plays
-/// there and nowhere else.
-async fn in_voice(ctx: &Context, guild_id: GuildId, user: UserId) -> bool {
-    may_control(ctx, guild_id, user).await
 }
 
 /// Answers a slash command privately.
