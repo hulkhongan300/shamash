@@ -398,7 +398,13 @@ pub fn ask(requested: &str, options: &[ChoiceOption<'_>], page: usize, total: us
     let numbered: Vec<CreateButton> = options
         .iter()
         .enumerate()
-        .map(|(offset, _)| CreateButton::new(ask_id(first + offset)))
+        // The label numbers the page, to match the fields in the embed above;
+        // the id numbers the whole search, so a press still names the same song
+        // after the page moves. Both are needed: Discord rejects a button that
+        // has an id and no label.
+        .map(|(offset, _)| {
+            CreateButton::new(ask_id(first + offset)).label((offset + 1).to_string())
+        })
         .collect();
     let mut rows: Vec<CreateActionRow> = numbered
         .chunks(5)
@@ -914,6 +920,46 @@ mod tests {
             ),
             "the last page disables it: {last}"
         );
+    }
+
+    /// Discord rejects a button that carries an id and no label, so a chooser
+    /// of unlabelled buttons does not post at all. Every button must have both.
+    #[test]
+    fn every_button_in_the_chooser_is_labelled() {
+        for (page, total) in [(0, 20), (1, 20), (2, 20), (0, 4)] {
+            let json =
+                serde_json::to_string(&ask("dracula", &offers(9), page, total).into_message())
+                    .expect("serialises");
+            let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+            for row in value["components"].as_array().expect("rows") {
+                for button in row["components"].as_array().expect("buttons") {
+                    assert!(
+                        button["label"].as_str().is_some_and(|l| !l.is_empty()),
+                        "an unlabelled button on page {page}: {json}"
+                    );
+                    assert!(
+                        button["custom_id"].as_str().is_some_and(|i| !i.is_empty()),
+                        "a button with no id on page {page}: {json}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The label numbers the page, because that is what the embed's fields say;
+    /// the id numbers the whole search. Getting those the wrong way round would
+    /// make button 1 mean the tenth song.
+    #[test]
+    fn the_label_numbers_the_page_and_the_id_numbers_the_search() {
+        let json = serde_json::to_string(&ask("dracula", &offers(9), 1, 20).into_message())
+            .expect("serialises");
+        assert!(
+            json.contains(r#""custom_id":"shamash:ask:9","disabled":false,"style":1,"label":"1""#)
+                || json.contains(r#""custom_id":"shamash:ask:9""#),
+            "page two starts at song nine: {json}"
+        );
+        assert!(json.contains(r#""label":"1""#), "but is labelled 1: {json}");
+        assert!(json.contains(r#""label":"9""#), "and the last is 9: {json}");
     }
 
     /// The page count has to be the whole list's, not this page's.
