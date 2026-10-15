@@ -15,6 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// The reconciliation `sync_channel` performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    Join,
+    Leave,
+    None,
+}
+
 /// How many times a join is attempted before the failure is reported.
 const JOIN_ATTEMPTS: usize = 3;
 /// Pause between join attempts.
@@ -160,6 +168,10 @@ impl VoiceService {
 
     /// Reconciles bot presence with the configured target channel: joins when
     /// members are present, leaves when it empties.
+    ///
+    /// Called both from `voice_state_update` and from `guild_create`, so a
+    /// channel that was already occupied when the bot started counts the same
+    /// as one somebody walks into afterwards.
     pub async fn sync_channel(
         &self,
         ctx: &SerenityContext,
@@ -188,19 +200,36 @@ impl VoiceService {
             None => false,
         };
 
-        if member_count == 0 {
-            if connected_to_target {
+        match Self::what_to_do(member_count, connected_to_target) {
+            Presence::Join => {
+                self.join_with_retry(ctx, guild_id, target).await?;
+                tracing::info!(guild_id = %guild_id, channel = %target, "joined the voice channel");
+            }
+            Presence::Leave => {
                 tracing::info!(guild_id = %guild_id, channel = %target, "the voice channel is empty; leaving");
                 self.manager
                     .remove(guild_id)
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to leave voice channel: {e}"))?;
             }
-        } else if !connected_to_target {
-            self.join_with_retry(ctx, guild_id, target).await?;
-            tracing::info!(guild_id = %guild_id, channel = %target, "joined the voice channel");
+            Presence::None => {}
         }
         Ok(())
+    }
+
+    /// What presence in the target channel should be reconciled to.
+    ///
+    /// Join whenever anyone is there, which is what makes a channel that was
+    /// already occupied at startup count the same as one somebody just walked
+    /// into. Leaving is only for a channel that has emptied, and a bot that is
+    /// already where it should be is left alone rather than rejoined.
+    fn what_to_do(member_count: usize, connected_to_target: bool) -> Presence {
+        match (member_count, connected_to_target) {
+            (0, true) => Presence::Leave,
+            (0, false) => Presence::None,
+            (_, true) => Presence::None,
+            (_, false) => Presence::Join,
+        }
     }
 
     /// Joins `channel`, retrying a few times before giving up.
@@ -308,5 +337,34 @@ mod tests {
         // Connected but nowhere to hear it, or not connected at all: both are a
         // member the cache has no channel for.
         assert!(!may_drive(None));
+    }
+
+    /// Someone already in the channel when the bot starts must be enough to
+    /// make it join, not only somebody who moves afterwards.
+    #[test]
+    fn an_occupied_channel_is_joined_without_anyone_moving() {
+        assert_eq!(
+            VoiceService::what_to_do(1, false),
+            Presence::Join,
+            "one person already there and the bot outside"
+        );
+        assert_eq!(
+            VoiceService::what_to_do(1, true),
+            Presence::None,
+            "already where it should be"
+        );
+    }
+
+    /// Leaving is only for a channel that has emptied. Rejoining a live channel
+    /// on every sync would tear down the call the music is playing in.
+    #[test]
+    fn only_an_emptied_channel_is_left() {
+        assert_eq!(VoiceService::what_to_do(0, true), Presence::Leave);
+        assert_eq!(
+            VoiceService::what_to_do(0, false),
+            Presence::None,
+            "nothing to leave"
+        );
+        assert_eq!(VoiceService::what_to_do(2, true), Presence::None);
     }
 }

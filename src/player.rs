@@ -2,20 +2,20 @@ use crate::config::Config;
 use crate::dashboard;
 use crate::fetch;
 use crate::parser::PlayRequest;
-use crate::queue::{Advanced, Queue, Queued, Queues};
+use crate::queue::{Advanced, Queue, Queued, Queues, Source};
 use crate::resolve;
 use crate::search;
+use crate::timing::Timing;
 use anyhow::Context;
 use serenity::async_trait;
 use serenity::model::channel::ChannelType;
-use serenity::model::id::{ChannelId, GuildId, MessageId};
+use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::prelude::Context as SerenityContext;
 use songbird::Songbird;
 use songbird::events::{Event, EventContext, EventHandler, TrackEvent};
-use songbird::input::{File as FileInput, Input};
+use songbird::input::{File as FileInput, HttpRequest, Input};
 use songbird::tracks::TrackHandle;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -164,7 +164,8 @@ pub struct Player {
     /// Resolves a spoken request to a real song before YouTube is searched.
     catalog: Arc<resolve::Catalog>,
     /// The "which one did you mean" buttons currently on offer.
-    choices: Choices,
+    /// The outstanding `/play` search per guild.
+    asks: Asks,
     /// What the bot remembers, or `None` when it has been given no place to
     /// remember in.
     pub library: Option<Arc<crate::library::Library>>,
@@ -193,6 +194,7 @@ pub trait AudioFetcher: Send + Sync {
         guild_id: GuildId,
         found: &search::Candidate,
         in_use: &[std::path::PathBuf],
+        timing: &Timing,
     ) -> anyhow::Result<Queued>;
 }
 
@@ -206,23 +208,25 @@ impl AudioFetcher for YtDlpFetch {
         guild_id: GuildId,
         found: &search::Candidate,
         in_use: &[std::path::PathBuf],
+        timing: &Timing,
     ) -> anyhow::Result<Queued> {
         // A video with no id cannot be cached or given a thumbnail, but the
         // audio is still worth playing.
         let video_id = found.video_id().unwrap_or_default().to_string();
-        // Downloaded before the song joins the queue, so a failed fetch leaves
+        // Resolved before the song joins the queue, so a failed fetch leaves
         // the queue and whatever is playing alone.
-        let path = fetch::fetch(
+        let source = fetch::fetch(
             &video_id,
             &found.url,
             &fetch::cache_dir(guild_id.get()),
             in_use,
+            timing,
         )
         .await
         .with_context(|| format!("could not fetch '{}'", found.title()))?;
 
         Ok(Queued {
-            path,
+            source,
             title: found.title().to_string(),
             artist: found.channel().to_string(),
             url: found.url.clone(),
@@ -231,27 +235,14 @@ impl AudioFetcher for YtDlpFetch {
     }
 }
 
-/// How many candidates the chooser offers.
-const CHOICE_COUNT: usize = 3;
-
-/// How long a chooser's buttons stay on offer.
+/// How long a miss notice stays up before the bot cleans it away.
 ///
-/// A question left on offer forever is not a question. After this the message
-/// stays readable and the buttons go, so a press from an hour ago cannot start
-/// a download.
-const CHOICE_TTL: Duration = Duration::from_secs(60);
+/// Long enough for the person who spoke to look over and read what went wrong;
+/// short enough that the channel is not a wall of past failures.
+const NOTICE_TTL: Duration = Duration::from_secs(30);
 
 /// A pending question, and what each of its buttons would play.
 ///
-/// The custom id on the buttons carries the video id, so this only has to
-/// remember what to play for it -- a URL and a title, which a press cannot
-/// recover on its own without another search.
-#[derive(Debug, Clone)]
-struct ChoiceEntry {
-    /// The offered options, each with the opaque key its button carries.
-    options: Vec<(String, Offer)>,
-}
-
 /// What one button on a chooser would play.
 ///
 /// Two kinds, because there are two questions. A catalog question offers
@@ -272,56 +263,116 @@ enum Offer {
     },
 }
 
-/// The chooser on offer per guild.
+/// Who may answer an outstanding question.
 ///
-/// One outstanding question per guild: asking again replaces the previous
-/// question, so this cannot grow with every ambiguous request, and a stale
-/// button cannot be pressed into playing something the listener never chose.
-#[derive(Debug, Clone, Default)]
-struct Choices(Arc<Mutex<HashMap<GuildId, ChoiceEntry>>>);
+/// The two ways into the same chooser have different owners, and the difference
+/// is not incidental. A typed search is one person's question; a spoken one is
+/// the channel's, because the bot hears a voice and cannot tell who spoke it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// Whoever typed `/play`.
+    User(UserId),
+    /// Anyone in the voice channel, which the caller has already checked.
+    Voice,
+}
 
-impl Choices {
-    /// Puts a question on offer, replacing whatever was there.
-    fn set(&self, guild_id: GuildId, options: Vec<(String, Offer)>) {
-        self.lock().insert(guild_id, ChoiceEntry { options });
+/// An outstanding question, one per guild.
+///
+/// Every page is a window onto one list rather than a fresh search, so turning
+/// the page never asks the catalog again and never reshuffles what the asker
+/// has already looked at.
+///
+/// Holds the same thing `/play` offers and the same thing a spoken request
+/// offers when it is not confident enough to play on its own: catalog songs, or
+/// -- where no catalog matched at all -- raw uploads, which are only ever played
+/// because someone pressed one.
+#[derive(Debug, Clone)]
+struct Ask {
+    /// The words that were typed or heard, echoed in the message and used for
+    /// the upload search of whichever song gets picked.
+    query: String,
+    /// Everything on offer, in rank order.
+    offers: Vec<Offer>,
+    /// Which window is on screen.
+    page: usize,
+    owner: Owner,
+    /// Where the chooser message is, so turning the page edits it in place
+    /// rather than posting a second one. Absent until the first send lands.
+    posted: Option<(ChannelId, MessageId)>,
+}
+
+impl Ask {
+    /// The offers on the page currently shown.
+    fn page(&self) -> &[Offer] {
+        let start = (self.page * dashboard::ASK_PAGE).min(self.offers.len());
+        let end = (start + dashboard::ASK_PAGE).min(self.offers.len());
+        &self.offers[start..end]
     }
 
-    /// Takes the offered choice for `key`, removing it so a second press of the
-    /// same button does nothing.
-    ///
-    /// The key is looked up rather than acted on, so a crafted button cannot be
-    /// pressed into playing something that was not on offer.
-    fn take(&self, guild_id: GuildId, key: &str) -> Option<Offer> {
-        let mut lock = self.lock();
-        let entry = lock.get_mut(&guild_id)?;
-        let index = entry
-            .options
+    /// Whether there is another page behind this one.
+    fn has_next(&self) -> bool {
+        (self.page + 1) * dashboard::ASK_PAGE < self.offers.len()
+    }
+
+    /// The chooser as it would be drawn.
+    fn view(&self) -> dashboard::View {
+        let options = self
+            .page()
             .iter()
-            .position(|(offered, _)| offered == key)?;
-        let (_, offer) = entry.options.remove(index);
-        if entry.options.is_empty() {
-            lock.remove(&guild_id);
+            .map(|offer| offer.option())
+            .collect::<Vec<_>>();
+        dashboard::ask(&self.query, &options, self.page, self.offers.len())
+    }
+}
+
+impl Offer {
+    /// How this offer is drawn in the chooser: a song shows its artist, an
+    /// upload the channel that put it up, because for an upload those are the
+    /// only things telling two of them apart.
+    fn option(&self) -> dashboard::ChoiceOption<'_> {
+        match self {
+            Offer::Video(candidate) => dashboard::ChoiceOption {
+                title: candidate.title(),
+                channel: candidate.channel(),
+                duration_secs: candidate.duration,
+                key: "",
+            },
+            Offer::Song { track, .. } => dashboard::ChoiceOption {
+                title: &track.title,
+                channel: &track.artist,
+                duration_secs: track.duration_secs,
+                key: "",
+            },
         }
-        Some(offer)
+    }
+}
+
+/// The outstanding question per guild.
+///
+/// One per guild, and asking again replaces the previous one: a question nobody
+/// answered must not outlive the question it was for.
+#[derive(Debug, Clone, Default)]
+struct Asks(Arc<Mutex<HashMap<GuildId, Ask>>>);
+
+impl Asks {
+    fn set(&self, guild_id: GuildId, ask: Ask) {
+        self.lock().insert(guild_id, ask);
     }
 
-    /// Throws a question away, for "None of these".
     fn clear(&self, guild_id: GuildId) -> bool {
         self.lock().remove(&guild_id).is_some()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<GuildId, ChoiceEntry>> {
+    /// Records where a guild's chooser message ended up.
+    fn posted(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId) {
+        if let Some(slot) = self.lock().get_mut(&guild_id) {
+            slot.posted = Some((channel_id, message_id));
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<GuildId, Ask>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-/// The custom id a press carries, and the key it names in the choice store.
-///
-/// The index is part of the id so a stale press from an older question cannot
-/// land on a different option of a newer one: the store is replaced wholesale,
-/// and the key is only meaningful alongside the question that offered it.
-fn song_key(index: usize) -> String {
-    format!("song:{index}")
 }
 
 /// One lock per guild, so a command in one guild cannot hold up another.
@@ -388,7 +439,7 @@ impl Cancellation {
 
 /// A queued song waiting to be judged: kept, or skipped too fast to trust.
 ///
-/// Keyed by the audio file, so the judgement lands on the right song however
+/// Keyed by the video URL, so the judgement lands on the right song however
 /// many are queued behind it. Bounded by the queue, which is bounded.
 #[derive(Debug, Clone)]
 struct Pending {
@@ -401,25 +452,30 @@ struct Pending {
     from_chooser: bool,
 }
 
+/// The songs waiting to be judged, by video URL.
+///
+/// The URL rather than the audio file, because the file is not a stable name
+/// for a song: a streamed song has no file until its first play finishes, and
+/// one video can be fetched twice into two of them.
 #[derive(Debug, Clone, Default)]
-struct PendingLearn(Arc<Mutex<HashMap<std::path::PathBuf, Pending>>>);
+struct PendingLearn(Arc<Mutex<HashMap<String, Pending>>>);
 
 impl PendingLearn {
     #[allow(dead_code)]
-    fn set(&self, path: std::path::PathBuf, pending: Pending) {
+    fn set(&self, url: String, pending: Pending) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(path, pending);
+            .insert(url, pending);
     }
 
     /// Takes the judgement for a song, so it is made once however the song
     /// ended.
-    fn take(&self, path: &std::path::Path) -> Option<Pending> {
+    fn take(&self, url: &str) -> Option<Pending> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(path)
+            .remove(url)
     }
 }
 
@@ -498,6 +554,24 @@ impl Coordination {
         queue: &Queue,
         song: Queued,
         started_at: u64,
+        timing: &Timing,
+    ) -> Commit {
+        timing
+            .stage(
+                "commit",
+                self.commit_locked(guild_id, queue, song, started_at),
+            )
+            .await
+    }
+
+    /// The body of [`Self::commit`], split out so the timing wrapper cannot be
+    /// skipped by one of the early returns inside it.
+    async fn commit_locked(
+        &self,
+        guild_id: GuildId,
+        queue: &Queue,
+        song: Queued,
+        started_at: u64,
     ) -> Commit {
         let busy = self.busy.get(guild_id);
         let _held = busy.lock().await;
@@ -552,22 +626,42 @@ impl Tracks {
     }
 }
 
-/// The channel and message id of each guild's dashboard.
+/// Where a guild's dashboard is, and what it is showing.
+type Dashboard = (ChannelId, MessageId, Page);
+
+/// The channel, message id and page of each guild's dashboard.
 ///
 /// Only the ids are kept; the dashboard is rebuilt from the queue every time,
-/// so a cached copy of the message would go stale.
+/// so a cached copy of the message would go stale. The page is kept because a
+/// redraw must not yank the view away from someone who opened the queue to
+/// read it -- a song ending while they are looking has to leave them looking.
 #[derive(Debug, Clone, Default)]
-struct Dashboards(Arc<Mutex<HashMap<GuildId, (ChannelId, MessageId)>>>);
+struct Dashboards(Arc<Mutex<HashMap<GuildId, Dashboard>>>);
+
+/// Which view a guild's dashboard is currently showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    NowPlaying,
+    Queue,
+}
 
 impl Dashboards {
     /// The dashboard message for a guild, if it has one.
     fn get(&self, guild_id: GuildId) -> Option<MessageId> {
-        self.lock().get(&guild_id).map(|(_, id)| *id)
+        self.lock().get(&guild_id).map(|(_, id, _)| *id)
     }
 
-    /// Records where a guild's dashboard lives.
-    fn set(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId) {
-        self.lock().insert(guild_id, (channel_id, message_id));
+    /// The page a guild's dashboard is showing.
+    fn page(&self, guild_id: GuildId) -> Page {
+        self.lock()
+            .get(&guild_id)
+            .map(|(_, _, page)| *page)
+            .unwrap_or(Page::NowPlaying)
+    }
+
+    /// Records where a guild's dashboard lives and what it is showing.
+    fn set(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId, page: Page) {
+        self.lock().insert(guild_id, (channel_id, message_id, page));
     }
 
     /// Forgets a guild's dashboard, so the next update posts a new one.
@@ -575,7 +669,7 @@ impl Dashboards {
         self.lock().remove(&guild_id);
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<GuildId, (ChannelId, MessageId)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<GuildId, Dashboard>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -589,7 +683,7 @@ impl Player {
             tracks: Tracks::default(),
             dashboards: Dashboards::default(),
             catalog,
-            choices: Choices::default(),
+            asks: Asks::default(),
             library: None,
             pending: PendingLearn::default(),
             started_at: StartedAt::default(),
@@ -635,6 +729,7 @@ impl Player {
         guild_id: GuildId,
         request: &PlayRequest,
         rewrite: Option<&str>,
+        timing: &Timing,
     ) -> anyhow::Result<()> {
         self.manager
             .get(guild_id)
@@ -642,7 +737,7 @@ impl Player {
 
         let heard = request.query.clone();
         match self
-            .resolve_and_queue(config, guild_id, request, rewrite)
+            .resolve_and_queue(config, guild_id, request, rewrite, timing)
             .await
         {
             Ok(Outcome::Asked { tracks }) => {
@@ -659,7 +754,8 @@ impl Player {
                 );
                 self.report(ctx, config, guild_id, &heard, &failure).await;
                 if config.unverified_chooser {
-                    self.offer_unverified(ctx, config, guild_id, request).await;
+                    self.offer_unverified(ctx, config, guild_id, request, timing)
+                        .await;
                 }
             }
             Ok(Outcome::Uploads(choice)) => {
@@ -668,7 +764,7 @@ impl Player {
                     .await
             }
             Ok(Outcome::Played { starting: true }) => {
-                self.start_next(ctx, config, guild_id).await;
+                self.start_next(ctx, config, guild_id, timing).await;
             }
             // Either way the dashboard is redrawn: a played song needs naming,
             // and a cancelled one may have moved the queue along underneath it.
@@ -718,12 +814,29 @@ impl Player {
                 dashboard::notice(&failure.message(heard)).into_message(),
             )
             .await;
-        if let Err(e) = sent {
-            tracing::warn!(
-                guild_id = %guild_id,
-                error = %format!("{e:#}"),
-                "could not report the failed request"
-            );
+        match sent {
+            // The miss is worth reading once, not leaving in the channel as a
+            // record, so it takes itself away after NOTICE_TTL.
+            Ok(sent) => {
+                let http = ctx.http.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(NOTICE_TTL).await;
+                    if let Err(e) = http.delete_message(channel_id, sent.id, None).await {
+                        tracing::debug!(
+                            channel_id = %channel_id,
+                            error = %format!("{e:#}"),
+                            "could not take the notice away"
+                        );
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    guild_id = %guild_id,
+                    error = %format!("{e:#}"),
+                    "could not report the failed request"
+                );
+            }
         }
     }
 
@@ -740,6 +853,7 @@ impl Player {
         guild_id: GuildId,
         request: &PlayRequest,
         rewrite: Option<&str>,
+        timing: &Timing,
     ) -> Result<Outcome, Failure> {
         let queue = self.queues.get(guild_id);
         // Checked before searching, so a full queue fails without a download.
@@ -762,6 +876,7 @@ impl Player {
             rewrite,
             self.library.as_deref(),
             guild_id,
+            timing,
         )
         .await;
         if matches!(resolved, search::Resolved::Unknown { .. }) {
@@ -781,6 +896,7 @@ impl Player {
             &search::YtDlpSearch,
             config.search_candidates,
             config.match_threshold,
+            timing,
         )
         .await
         .map_err(|e| {
@@ -806,23 +922,29 @@ impl Player {
         // The request is being committed; record it for the learning that
         // happens when the song finishes (or is skipped).
         self.pending.set(
-            PathBuf::from(best.candidate.url.clone()),
+            best.candidate.url.clone(),
             Pending {
                 said: request.query.clone(),
                 track: crate::library::Track {
                     artist: resolved.as_track().unwrap().artist.clone(),
                     title: resolved.as_track().unwrap().title.clone(),
                     duration_secs: resolved.as_track().unwrap().duration_secs,
+                    // The upload that was chosen, not the catalog's: it is the
+                    // one that played, so a phrase heard again can go straight
+                    // to it.
+                    video_id: best.candidate.video_id().map(str::to_string),
                 },
                 from_chooser: false,
             },
         );
         let song = self
             .fetch
-            .fetch(guild_id, &best.candidate, &queue.in_use())
+            .fetch(guild_id, &best.candidate, &queue.in_use(), timing)
             .await
             .map_err(|e| Failure::new(Problem::FetchFailed, e))?;
-        Ok(self.outcome(guild_id, &queue, song, started_at).await)
+        Ok(self
+            .outcome(guild_id, &queue, song, started_at, timing)
+            .await)
     }
 
     /// Adds a downloaded song and reports what became of it.
@@ -832,10 +954,11 @@ impl Player {
         queue: &Queue,
         song: Queued,
         started_at: u64,
+        timing: &Timing,
     ) -> Outcome {
         match self
             .coordination
-            .commit(guild_id, queue, song, started_at)
+            .commit(guild_id, queue, song, started_at, timing)
             .await
         {
             Commit::Played { starting } => Outcome::Played { starting },
@@ -863,33 +986,14 @@ impl Player {
         request: &PlayRequest,
         tracks: &[resolve::CatalogTrack],
     ) {
-        let keys: Vec<String> = (0..tracks.len()).map(song_key).collect();
-        let options: Vec<dashboard::ChoiceOption<'_>> = tracks
+        let offers = tracks
             .iter()
-            .zip(&keys)
-            .map(|(track, key)| dashboard::ChoiceOption {
-                title: &track.title,
-                channel: &track.artist,
-                duration_secs: track.duration_secs,
-                key,
+            .map(|track| Offer::Song {
+                track: track.clone(),
+                requested: request.query.clone(),
             })
             .collect();
-        let offered: Vec<(String, Offer)> = tracks
-            .iter()
-            .zip(&keys)
-            .map(|(track, key)| {
-                (
-                    key.clone(),
-                    Offer::Song {
-                        track: track.clone(),
-                        requested: request.query.clone(),
-                    },
-                )
-            })
-            .collect();
-        self.choices.set(guild_id, offered);
-        let question = request.query.clone();
-        self.ask(ctx, config, guild_id, &question, None, &options)
+        self.offer_choices(ctx, config, guild_id, &request.query, offers)
             .await;
     }
 
@@ -906,12 +1010,14 @@ impl Player {
         config: &Config,
         guild_id: GuildId,
         request: &PlayRequest,
+        timing: &Timing,
     ) {
         match search::find_unverified(
             request,
             &search::YtDlpSearch,
             config.search_candidates,
             config.match_threshold,
+            timing,
         )
         .await
         {
@@ -928,10 +1034,8 @@ impl Player {
         }
     }
 
-    /// Posts "which upload of this song did you mean".
-    ///
-    /// Used when the catalog named the song and the scorer was not sure which
-    /// recording of it an upload actually is.
+    /// Puts raw uploads on offer for a song the catalog named but no upload
+    /// matched well enough to play on its own.
     async fn offer_uploads(
         &self,
         ctx: &SerenityContext,
@@ -940,173 +1044,26 @@ impl Player {
         heard: &str,
         choice: &search::Choice,
     ) {
-        let options: Vec<dashboard::ChoiceOption<'_>> = choice
-            .top(CHOICE_COUNT)
+        let offers: Vec<Offer> = choice
+            .top(dashboard::ASK_PAGE)
             .iter()
-            .filter_map(|scored| {
-                let video_id = scored.candidate.video_id()?;
-                Some(dashboard::ChoiceOption {
-                    title: scored.candidate.title(),
-                    channel: scored.candidate.channel(),
-                    duration_secs: scored.candidate.duration,
-                    key: video_id,
-                })
-            })
+            // Without a video id there is nothing to play and nothing to key
+            // the button on, so it cannot be offered.
+            .filter(|scored| scored.candidate.video_id().is_some())
+            .map(|scored| Offer::Video(scored.candidate.clone()))
             .collect();
-        let offered: Vec<(String, Offer)> = choice
-            .top(CHOICE_COUNT)
-            .iter()
-            .filter_map(|scored| {
-                Some((
-                    scored.candidate.video_id()?.to_string(),
-                    Offer::Video(scored.candidate.clone()),
-                ))
-            })
-            .collect();
-        self.choices.set(guild_id, offered);
-        let resolved = choice.resolved.as_ref().map(|track| track.label());
-        self.ask(ctx, config, guild_id, heard, resolved.as_deref(), &options)
+        self.offer_choices(ctx, config, guild_id, heard, offers)
             .await;
-    }
-
-    /// Posts the question, and takes the buttons away again after
-    /// [`CHOICE_TTL`].
-    ///
-    /// A question left on offer forever is not a question. The message stays
-    /// readable, but the buttons go, so a press from ten minutes ago cannot
-    /// start a download.
-    async fn ask(
-        &self,
-        ctx: &SerenityContext,
-        config: &Config,
-        guild_id: GuildId,
-        heard: &str,
-        resolved: Option<&str>,
-        options: &[dashboard::ChoiceOption<'_>],
-    ) {
-        if options.is_empty() {
-            let failure = Failure::new(
-                Problem::NoMatch,
-                anyhow::anyhow!("there was nothing to offer"),
-            );
-            self.report(ctx, config, guild_id, heard, &failure).await;
-            return;
-        }
-
-        let Some(channel_id) = resolve_alert_channel(ctx, config, guild_id) else {
-            let failure = Failure::new(
-                Problem::NoMatch,
-                anyhow::anyhow!("no alert channel, so there was nowhere to ask"),
-            );
-            self.report(ctx, config, guild_id, heard, &failure).await;
-            return;
-        };
-        let question = format!("I heard \u{201c}{heard}\u{201d}");
-        let message = dashboard::choice(&question, resolved, options);
-        let Ok(sent) = channel_id.send_message(&ctx.http, message).await else {
-            tracing::warn!(guild_id = %guild_id, "could not ask which song was meant");
-            return;
-        };
-
-        let http = ctx.http.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(CHOICE_TTL).await;
-            if let Err(e) = http
-                .edit_message(
-                    channel_id,
-                    sent.id,
-                    &dashboard::expired(&question),
-                    Vec::new(),
-                )
-                .await
-            {
-                tracing::debug!(
-                    channel_id = %channel_id,
-                    error = %format!("{e:#}"),
-                    "could not take the chooser buttons away"
-                );
-            }
-        });
-    }
-
-    /// Plays whatever a chooser button stands for.
-    ///
-    /// The key is looked up in the guild's choice store rather than acted on, so
-    /// a crafted button cannot be pressed into playing something that was never
-    /// offered, and a press is spent so a second one does nothing.
-    pub async fn play_chosen(
-        &self,
-        ctx: &SerenityContext,
-        config: &Config,
-        guild_id: GuildId,
-        key: &str,
-    ) -> anyhow::Result<()> {
-        let offer = self.choices.take(guild_id, key).with_context(
-            || "that choice is no longer on offer; say the request again for new options",
-        )?;
-
-        // The user has already chosen the song by pressing this button, so the
-        // best upload of it is taken even when the upload's own score is modest.
-        // The hard part -- deciding which song it is -- was answered by the
-        // catalog and by them.
-        let candidate = match offer {
-            Offer::Video(candidate) => candidate,
-            Offer::Song { track, requested } => {
-                let resolved = search::Resolved::Track {
-                    track,
-                    durations: Vec::new(),
-                };
-                let choice = search::find_video(
-                    &resolved,
-                    &requested,
-                    &search::YtDlpSearch,
-                    config.search_candidates,
-                    // The user chose; the threshold is not what is in question
-                    // any more.
-                    0.0,
-                )
-                .await
-                .with_context(|| "could not find that song on YouTube")?;
-                choice
-                    .best()
-                    .map(|scored| scored.candidate.clone())
-                    .context("YouTube returned nothing for that song")?
-            }
-        };
-
-        // The download runs outside the playback lock for the same reason the
-        // spoken path does: a press on "1" must not freeze the Skip button.
-        let started_at = self.coordination.generations.get(guild_id).now();
-        let song = self
-            .fetch
-            .fetch(guild_id, &candidate, &self.queues.get(guild_id).in_use())
-            .await
-            .context("could not download that song")?;
-        let outcome = self
-            .outcome(guild_id, &self.queues.get(guild_id), song, started_at)
-            .await;
-
-        if matches!(outcome, Outcome::Played { starting: true }) {
-            self.start_next(ctx, config, guild_id).await;
-        } else {
-            self.draw_dashboard(ctx, config, guild_id).await;
-        }
-        Ok(())
-    }
-
-    /// Throws the guild's question away, for "None of these".
-    ///
-    /// Returns whether there was one, so the caller only says anything when the
-    /// press did something.
-    pub fn dismiss_choice(&self, guild_id: GuildId) -> bool {
-        self.choices.clear(guild_id)
     }
 
     /// Skips the song playing, starting the next one queued.
     pub async fn skip(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
         let lock = self.coordination.busy(guild_id);
         let _guard = lock.lock().await;
-        self.start_next(ctx, config, guild_id).await;
+        // Not part of any request, so nothing is timed: a song starting because
+        // the one before it ended is not anybody's time to first audio.
+        self.start_next(ctx, config, guild_id, &Timing::default())
+            .await;
     }
 
     /// Pauses the current song, or resumes it when already paused.
@@ -1154,7 +1111,13 @@ impl Player {
     ///
     /// The song that was playing is stopped, whether it ended on its own or
     /// was skipped.
-    async fn start_next(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
+    async fn start_next(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        timing: &Timing,
+    ) {
         let advanced = self.queues.get(guild_id).advance();
         // Whatever just stopped is the last word on whether the request that
         // queued it was a good one. Checked here rather than on a track event,
@@ -1164,7 +1127,15 @@ impl Player {
         if advanced.current.is_some() {
             self.started_at.set(guild_id, std::time::Instant::now());
         }
-        if let Some(handle) = start_track(&self.manager, guild_id, &advanced).await {
+        if let Some(handle) = start_track(
+            &self.manager,
+            guild_id,
+            &self.queues.get(guild_id),
+            &advanced,
+            timing,
+        )
+        .await
+        {
             self.tracks.set(guild_id, handle.clone());
             self.follow_when_finished(ctx, config, guild_id, handle, advanced.generation);
         }
@@ -1182,7 +1153,7 @@ impl Player {
         let (Some(stopped), Some(library)) = (stopped, self.library.as_deref()) else {
             return;
         };
-        let Some(pending) = self.pending.take(&stopped.path) else {
+        let Some(pending) = self.pending.take(&stopped.url) else {
             return;
         };
 
@@ -1264,7 +1235,15 @@ impl Player {
                 // stop after a single song.
                 generation = advanced.generation;
 
-                match start_track(&this.manager, guild_id, &advanced).await {
+                match start_track(
+                    &this.manager,
+                    guild_id,
+                    &this.queues.get(guild_id),
+                    &advanced,
+                    &Timing::default(),
+                )
+                .await
+                {
                     Some(handle) => {
                         this.tracks.set(guild_id, handle.clone());
                         // Watch the new song in turn, so the queue keeps
@@ -1291,7 +1270,372 @@ impl Player {
     /// Safe to call when no channel is available; feedback is then skipped
     /// rather than failing the command.
     pub async fn draw_dashboard(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
-        draw(&self.dashboards, &self.queues, ctx, config, guild_id).await;
+        draw(&self.dashboards, &self.queues, ctx, config, guild_id, None).await;
+    }
+
+    /// Shows what is waiting in the queue instead of the now-playing view.
+    pub async fn show_queue(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
+        draw(
+            &self.dashboards,
+            &self.queues,
+            ctx,
+            config,
+            guild_id,
+            Some(Page::Queue),
+        )
+        .await;
+    }
+
+    /// Goes back from the queue view to the now-playing one.
+    pub async fn show_now_playing(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+    ) {
+        draw(
+            &self.dashboards,
+            &self.queues,
+            ctx,
+            config,
+            guild_id,
+            Some(Page::NowPlaying),
+        )
+        .await;
+    }
+
+    /// Turns repeat-one on or off and redraws, so the button says which way it
+    /// went. Returns the new setting.
+    pub async fn toggle_repeat(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+    ) -> bool {
+        let repeat = self.queues.get(guild_id).toggle_repeat();
+        self.draw_dashboard(ctx, config, guild_id).await;
+        repeat
+    }
+
+    /// Answers a `/play` search: looks the words up in the catalog and posts the
+    /// first page of songs for the asker to choose from.
+    ///
+    /// The catalog answers rather than YouTube, because the buttons name *songs*
+    /// and the upload for the chosen one is found afterwards. A catalog has many
+    /// more songs under a query than there are uploads worth offering, which is
+    /// what makes a second page worth having at all.
+    pub async fn search_and_ask(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        query: &str,
+        asker: UserId,
+    ) -> anyhow::Result<usize> {
+        // Its own request, and its own summary line: a `/play` search is a
+        // catalog lookup and a message, not a half-finished playback.
+        let timing = Timing::default();
+        let searched = self
+            .search_and_ask_inner(ctx, config, guild_id, query, asker, &timing)
+            .await;
+        timing.log("/play search");
+        searched
+    }
+
+    async fn search_and_ask_inner(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        query: &str,
+        asker: UserId,
+        timing: &Timing,
+    ) -> anyhow::Result<usize> {
+        // Typed words go through the same reading logic a spoken request does, so
+        // "dracula by tame impala" searches the catalog the way it would have
+        // if it had been said rather than typed.
+        let request = PlayRequest {
+            query: query.to_string(),
+            title: None,
+            artist: None,
+            splits: Vec::new(),
+        };
+        let tracks: Vec<resolve::CatalogTrack> = timing
+            .stage(
+                "catalog.hits",
+                self.catalog.hits(&resolve::Target::from_request(&request)),
+            )
+            .await
+            .iter()
+            .map(|hit| hit.to_track())
+            .collect();
+
+        let total = tracks.len();
+        if total == 0 {
+            self.asks.clear(guild_id);
+            anyhow::bail!("the catalog has nothing for \"{query}\"");
+        }
+
+        let ask = Ask {
+            offers: tracks
+                .into_iter()
+                .map(|track| Offer::Song {
+                    track,
+                    requested: query.to_string(),
+                })
+                .collect(),
+            query: query.to_string(),
+            page: 0,
+            owner: Owner::User(asker),
+            posted: None,
+        };
+        let message = ask.view();
+        self.asks.set(guild_id, ask);
+        self.post_ask(ctx, config, guild_id, message).await?;
+        tracing::info!(guild_id = %guild_id, query = %query, found = total, "asked the catalog");
+        Ok(total)
+    }
+
+    /// Posts a chooser and records where it landed.
+    async fn post_ask(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        message: dashboard::View,
+    ) -> anyhow::Result<()> {
+        let Some(channel_id) = resolve_alert_channel(ctx, config, guild_id) else {
+            anyhow::bail!("no alert channel, so there was nowhere to post the search");
+        };
+        let sent = channel_id
+            .send_message(&ctx.http, message.into_message())
+            .await
+            .map_err(|e| anyhow::anyhow!("could not post the search: {e}"))?;
+        self.asks.posted(guild_id, channel_id, sent.id);
+        Ok(())
+    }
+
+    /// Turns to the next page of a `/play` search, redrawing the same message.
+    ///
+    /// Returns whether it moved, so the caller only answers when it did.
+    pub async fn next_page(&self, ctx: &SerenityContext, guild_id: GuildId) -> bool {
+        // Bumped on a copy and stored once, only if the redraw landed. Reading
+        // the page, rendering from it and writing it back in three steps let a
+        // second press render one page behind, and left the stored page wrong
+        // when the edit failed.
+        let Some(mut ask) = self.ask_for(guild_id) else {
+            return false;
+        };
+        if !ask.has_next() {
+            return false;
+        }
+        ask.page += 1;
+        if self.redraw_ask(ctx, guild_id, ask.view()).await {
+            self.asks.set(guild_id, ask);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Plays the song a `/play` search put at `index`.
+    pub async fn play_asked(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        index: usize,
+    ) -> anyhow::Result<()> {
+        let ask = self
+            .ask_for(guild_id)
+            .context("that search is no longer on offer; run /play again")?;
+        let offer = ask
+            .offers
+            .get(index)
+            .cloned()
+            .with_context(|| "that song is not in the search")?;
+        self.asks.clear(guild_id);
+        self.play_offer(ctx, config, guild_id, offer).await
+    }
+
+    /// Whether the outstanding question came from speech rather than `/play`.
+    ///
+    /// The caller needs this to know whose rule applies: a spoken one is answered
+    /// by the voice channel, a typed one by the person who typed it.
+    pub fn ask_is_spoken(&self, guild_id: GuildId) -> bool {
+        self.ask_for(guild_id)
+            .is_some_and(|ask| matches!(ask.owner, Owner::Voice))
+    }
+
+    /// Puts `offers` on offer for a spoken request and posts the chooser.
+    ///
+    /// The same question `/play` asks, drawn the same way and paged the same
+    /// way. Only the owner differs: the channel, because the bot cannot tell
+    /// who spoke.
+    async fn offer_choices(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        query: &str,
+        offers: Vec<Offer>,
+    ) {
+        if offers.is_empty() {
+            return;
+        }
+        let ask = Ask {
+            query: query.to_string(),
+            offers,
+            page: 0,
+            owner: Owner::Voice,
+            posted: None,
+        };
+        let message = ask.view();
+        self.asks.set(guild_id, ask);
+        if let Err(e) = self.post_ask(ctx, config, guild_id, message).await {
+            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not post the question");
+        }
+    }
+
+    /// Plays whatever an offered choice stands for.
+    ///
+    /// Split out because the two ways into the chooser -- a typed search and a
+    /// spoken one -- are the same job from here on.
+    async fn play_offer(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        offer: Offer,
+    ) -> anyhow::Result<()> {
+        // Pressing a button is a request of its own, with its own summary line.
+        let timing = Timing::default();
+        let played = self
+            .play_offer_inner(ctx, config, guild_id, offer, &timing)
+            .await;
+        timing.log("/play offer");
+        played
+    }
+
+    async fn play_offer_inner(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        offer: Offer,
+        timing: &Timing,
+    ) -> anyhow::Result<()> {
+        // The user has already chosen the song by pressing this button, so the
+        // best upload of it is taken even when the upload's own score is modest.
+        // The hard part -- deciding which song it is -- was answered by the
+        // catalog and by them.
+        let candidate = match offer {
+            Offer::Video(candidate) => candidate,
+            Offer::Song { track, requested } => {
+                // The catalog's running time, not an empty set. Length is the
+                // scorer's heaviest input, and dropping it left the chooser
+                // ranking on relevance and views alone -- which is how a
+                // different song with the same name can win a search the asker
+                // had already narrowed down by choosing it.
+                let resolved = search::Resolved::Track {
+                    durations: track.duration_secs.into_iter().collect(),
+                    track,
+                };
+                let choice = search::find_video(
+                    &resolved,
+                    &requested,
+                    &search::YtDlpSearch,
+                    config.search_candidates,
+                    // The user chose; the threshold is not what is in question
+                    // any more.
+                    0.0,
+                    timing,
+                )
+                .await
+                .with_context(|| "could not find that song on YouTube")?;
+                choice
+                    .best()
+                    .map(|scored| scored.candidate.clone())
+                    .context("YouTube returned nothing for that song")?
+            }
+        };
+
+        // The download runs outside the playback lock for the same reason the
+        // spoken path does: a press on "1" must not freeze the Skip button.
+        let started_at = self.coordination.generations.get(guild_id).now();
+        let song = self
+            .fetch
+            .fetch(
+                guild_id,
+                &candidate,
+                &self.queues.get(guild_id).in_use(),
+                timing,
+            )
+            .await
+            .context("could not download that song")?;
+        let outcome = self
+            .outcome(
+                guild_id,
+                &self.queues.get(guild_id),
+                song,
+                started_at,
+                timing,
+            )
+            .await;
+
+        if matches!(outcome, Outcome::Played { starting: true }) {
+            self.start_next(ctx, config, guild_id, timing).await;
+        } else {
+            self.draw_dashboard(ctx, config, guild_id).await;
+        }
+        Ok(())
+    }
+
+    /// Throws a `/play` search away, for "None of these".
+    pub fn dismiss_ask(&self, guild_id: GuildId) -> bool {
+        self.asks.clear(guild_id)
+    }
+
+    /// Whether `user` may answer the question this guild is holding.
+    ///
+    /// A typed search answers one person's question and is theirs alone. A
+    /// spoken one belongs to the voice channel, which the caller has already
+    /// checked; it returns true here rather than asking again, because the bot
+    /// cannot tell who spoke and has nobody to compare against.
+    pub fn ask_belongs_to(&self, guild_id: GuildId, user: UserId) -> bool {
+        match self.ask_for(guild_id).map(|ask| ask.owner) {
+            Some(Owner::User(asker)) => asker == user,
+            Some(Owner::Voice) => true,
+            None => false,
+        }
+    }
+
+    /// The guild's outstanding search, if it has one.
+    fn ask_for(&self, guild_id: GuildId) -> Option<Ask> {
+        self.asks.lock().get(&guild_id).cloned()
+    }
+
+    /// Edits the outstanding search's message in place, the way the dashboard
+    /// is edited, rather than posting a second one.
+    async fn redraw_ask(
+        &self,
+        ctx: &SerenityContext,
+        guild_id: GuildId,
+        message: dashboard::View,
+    ) -> bool {
+        let Some((channel_id, message_id)) = self.ask_for(guild_id).and_then(|a| a.posted) else {
+            return false;
+        };
+        match channel_id
+            .edit_message(&ctx.http, message_id, message.clone().into_edit())
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not turn the search page");
+                false
+            }
+        }
     }
 }
 
@@ -1317,6 +1661,7 @@ impl Follower {
             &self.ctx,
             &self.config,
             self.guild_id,
+            None,
         )
         .await;
     }
@@ -1338,46 +1683,157 @@ impl EventHandler for Ended {
 
 /// Stops the song that was playing and starts the next one an advance chose.
 ///
-/// Returns `None` when the queue has run dry or the bot has left the voice
-/// channel. The finished song's file is left on disk: `fetch::prune` removes
-/// what is neither queued nor among the newest few, so deleting it here would
-/// only undo the cache that makes a repeated request instant.
+/// Plays the audio where it is: off YouTube for a song whose stream is still
+/// usable, off disk otherwise. Either way the audio is written to the cache as
+/// it goes, so the next time this song is asked for it does not wait for
+/// YouTube at all.
+///
+/// Returns `None` when the queue has run dry, the bot has left the voice
+/// channel, or the audio could not be fetched at all. The finished song's file
+/// is left on disk: `fetch::prune` removes what is neither queued nor among the
+/// newest few, so deleting it here would only undo the cache that makes a
+/// repeated request instant.
 ///
 /// The call is locked with `await` rather than `blocking_lock`, which panics
 /// when it is reached from inside a runtime thread.
 async fn start_track(
     manager: &Songbird,
     guild_id: GuildId,
+    queue: &Queue,
     advanced: &Advanced,
+    timing: &Timing,
 ) -> Option<TrackHandle> {
-    match (manager.get(guild_id), &advanced.current) {
-        (Some(call), Some(song)) => {
-            let mut handler = call.lock().await;
-            handler.stop();
-            tracing::info!(guild_id = %guild_id, title = %song.title, "playing");
-            let path = song.path.clone();
-            Some(handler.play_input(Input::from(FileInput::new(path))))
+    let started = std::time::Instant::now();
+    let call = manager.get(guild_id)?;
+    let song = advanced.current.as_ref()?;
+    // Stopped before the source is resolved, because resolving one can mean a
+    // download: the song the listener skipped has to stop being audible at once
+    // rather than when the next one is ready.
+    call.lock().await.stop();
+
+    let in_use = queue.in_use();
+    let source = match fetch::resolve(&song.source, &song.url, &in_use, timing).await {
+        Ok(source) => source,
+        Err(e) => {
+            tracing::warn!(
+                guild_id = %guild_id,
+                title = %song.title,
+                error = %format!("{e:#}"),
+                "this song has no audio to play"
+            );
+            return None;
         }
-        _ => None,
+    };
+
+    // Filled while the song plays, so a repeat or a later request for it finds
+    // it on disk. Detached because nobody is waiting on the cache: playback has
+    // already begun by the time this finishes. It is a second transfer of audio
+    // songbird is already receiving, which is the price of a repeat being
+    // instant.
+    if let Some(stream) = fetch::Streamable::of(&song.source) {
+        let Source::Stream { cache, .. } = &song.source else {
+            unreachable!("a stream always carries a cache path")
+        };
+        let (cache, watch_url) = (cache.clone(), song.url.clone());
+        let in_use = in_use.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                fetch::save(&stream, &cache, &watch_url, &in_use, &Timing::default()).await
+            {
+                tracing::warn!(
+                    cache = %cache.display(),
+                    error = %format!("{e:#}"),
+                    "the streamed audio could not be cached, so a repeat will fetch it again"
+                );
+            }
+        });
+    }
+
+    let (input, route) = match &source {
+        Source::Stream {
+            url,
+            headers,
+            length,
+            ..
+        } => {
+            let mut request =
+                HttpRequest::new_with_headers(reqwest::Client::new(), url.clone(), headers.clone());
+            // The one thing that makes this URL work at all: YouTube serves it
+            // only for a closed range, and songbird only sends one when it
+            // knows how long the audio is. Without this every stream is a 403
+            // and every song falls back to being downloaded.
+            request.content_length = Some(*length);
+            (Input::from(request), "stream")
+        }
+        Source::File(path) => (Input::from(FileInput::new(path.clone())), "file"),
+    };
+    timing.set_route(route);
+    tracing::info!(guild_id = %guild_id, title = %song.title, route, "playing");
+
+    let handle = call.lock().await.play_input(input);
+    let _ = handle.add_event(
+        Event::Track(TrackEvent::Playable),
+        FirstAudio {
+            started,
+            route,
+            title: song.title.clone(),
+        },
+    );
+    Some(handle)
+}
+
+/// Reports how long a song took to produce its first audio.
+///
+/// `Playable` is the first moment songbird has decoded the source and has audio
+/// to mix, which is what "time to first audio" means here: the request's own
+/// summary line stops when the track is handed over, and this is the rest of it.
+struct FirstAudio {
+    started: std::time::Instant,
+    /// `stream` or `file`, so the log says which path the number came from.
+    route: &'static str,
+    title: String,
+}
+
+#[async_trait]
+impl EventHandler for FirstAudio {
+    async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
+        tracing::info!(
+            title = %self.title,
+            route = self.route,
+            time_to_first_audio_ms = self.started.elapsed().as_millis() as u64,
+            "first audio"
+        );
+        None
     }
 }
 
 /// Draws or updates a guild's dashboard message.
+///
+/// `page` is None to keep whichever page the dashboard is already on, which is
+/// what every ordinary redraw wants: a song ending should not pull someone out
+/// of the queue they opened.
 async fn draw(
     dashboards: &Dashboards,
     queues: &Queues,
     ctx: &SerenityContext,
     config: &Config,
     guild_id: GuildId,
+    page: Option<Page>,
 ) {
     let Some(channel) = resolve_alert_channel(ctx, config, guild_id) else {
         return;
     };
+    let page = page.unwrap_or_else(|| dashboards.page(guild_id));
     let queue = queues.get(guild_id);
     let current = queue.current();
-    let view = match &current {
-        Some(song) => dashboard::dashboard(song, queue.is_paused(), queue.pending()),
-        None => dashboard::idle_dashboard(),
+    let view = match page {
+        Page::Queue => dashboard::queue_view(&queue.pending_songs()),
+        Page::NowPlaying => match &current {
+            Some(song) => {
+                dashboard::dashboard(song, queue.is_paused(), queue.pending(), queue.is_repeat())
+            }
+            None => dashboard::idle_dashboard(),
+        },
     };
 
     match dashboards.get(guild_id) {
@@ -1392,12 +1848,12 @@ async fn draw(
                 tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "failed to update the dashboard");
                 dashboards.forget(guild_id);
                 if let Ok(sent) = channel.send_message(&ctx.http, view.into_message()).await {
-                    dashboards.set(guild_id, channel, sent.id);
+                    dashboards.set(guild_id, channel, sent.id, page);
                 }
             }
         }
         None => match channel.send_message(&ctx.http, view.into_message()).await {
-            Ok(sent) => dashboards.set(guild_id, channel, sent.id),
+            Ok(sent) => dashboards.set(guild_id, channel, sent.id, page),
             Err(e) => {
                 tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "failed to post the dashboard")
             }
@@ -1468,6 +1924,25 @@ fn resolve_alert_channel(
 mod tests {
     use super::*;
 
+    /// Opening the queue is a choice, and a song ending underneath it must not
+    /// close that choice: the redraw keeps whichever page is showing.
+    #[test]
+    fn a_redraw_keeps_the_page_the_dashboard_is_on() {
+        let guild = GuildId::new(11);
+        let dashboards = Dashboards::default();
+
+        assert_eq!(dashboards.page(guild), Page::NowPlaying);
+
+        dashboards.set(guild, ChannelId::new(1), MessageId::new(2), Page::Queue);
+        assert_eq!(dashboards.page(guild), Page::Queue);
+
+        // Forgetting the dashboard is what happens when a message is deleted;
+        // the next post starts on now-playing rather than inheriting a page
+        // whose message no longer exists.
+        dashboards.forget(guild);
+        assert_eq!(dashboards.page(guild), Page::NowPlaying);
+    }
+
     /// The bug this commit exists for: `play` held the playback lock across the
     /// catalog lookup, the YouTube search *and the whole download*, and `skip()`
     /// and `stop()` take the same lock. A slow download therefore froze every
@@ -1507,7 +1982,12 @@ mod tests {
             coordination: coordination.clone(),
         };
         probe
-            .fetch(guild, &candidate("https://youtu.be/x"), &[])
+            .fetch(
+                guild,
+                &candidate("https://youtu.be/x"),
+                &[],
+                &Timing::default(),
+            )
             .await
             .unwrap();
     }
@@ -1525,7 +2005,13 @@ mod tests {
         coordination.cancel(guild);
 
         let outcome = coordination
-            .commit(guild, &queue, queued("Dracula"), started_at)
+            .commit(
+                guild,
+                &queue,
+                queued("Dracula"),
+                started_at,
+                &Timing::default(),
+            )
             .await;
         assert_eq!(
             outcome,
@@ -1546,7 +2032,13 @@ mod tests {
 
         assert_eq!(
             coordination
-                .commit(guild, &queue, queued("Dracula"), started_at)
+                .commit(
+                    guild,
+                    &queue,
+                    queued("Dracula"),
+                    started_at,
+                    &Timing::default()
+                )
                 .await,
             Commit::Played { starting: true }
         );
@@ -1562,11 +2054,23 @@ mod tests {
         let (_serialised, started_at) = coordination.begin(guild).await;
 
         coordination
-            .commit(guild, &queue, queued("First"), started_at)
+            .commit(
+                guild,
+                &queue,
+                queued("First"),
+                started_at,
+                &Timing::default(),
+            )
             .await;
         assert_eq!(
             coordination
-                .commit(guild, &queue, queued("Second"), started_at)
+                .commit(
+                    guild,
+                    &queue,
+                    queued("Second"),
+                    started_at,
+                    &Timing::default()
+                )
                 .await,
             Commit::Played { starting: false }
         );
@@ -1585,7 +2089,13 @@ mod tests {
         let (_serialised, started_at) = coordination.begin(guild).await;
         assert_eq!(
             coordination
-                .commit(guild, &queue, queued("Dracula"), started_at)
+                .commit(
+                    guild,
+                    &queue,
+                    queued("Dracula"),
+                    started_at,
+                    &Timing::default()
+                )
                 .await,
             Commit::Played { starting: true }
         );
@@ -1650,7 +2160,13 @@ mod tests {
 
         assert_eq!(
             coordination
-                .commit(guild, &queue, queued("Dracula"), started_at)
+                .commit(
+                    guild,
+                    &queue,
+                    queued("Dracula"),
+                    started_at,
+                    &Timing::default()
+                )
                 .await,
             Commit::QueueFull
         );
@@ -1668,6 +2184,7 @@ mod tests {
             guild_id: GuildId,
             found: &search::Candidate,
             _in_use: &[std::path::PathBuf],
+            _timing: &Timing,
         ) -> anyhow::Result<Queued> {
             let lock = self.coordination.busy(guild_id);
             let guard = tokio::time::timeout(Duration::from_millis(500), lock.lock_owned())
@@ -1681,7 +2198,7 @@ mod tests {
     /// A song already in hand, as `commit` receives one.
     fn queued(title: &str) -> Queued {
         Queued {
-            path: std::path::PathBuf::from(format!("/tmp/{title}.m4a")),
+            source: Source::File(std::path::PathBuf::from(format!("/tmp/{title}.m4a"))),
             title: title.to_string(),
             artist: "someone".to_string(),
             url: "https://youtu.be/only".to_string(),
@@ -1800,179 +2317,6 @@ mod tests {
             channel: Some("Tame Impala".to_string()),
             id: None,
         }
-    }
-
-    /// One offered option: the key its button carries, and what it would play.
-    fn video_offer(url: &str) -> (String, Offer) {
-        (url.to_string(), Offer::Video(candidate(url)))
-    }
-
-    fn song_offer(key: &str, artist: &str, title: &str) -> (String, Offer) {
-        (
-            key.to_string(),
-            Offer::Song {
-                track: resolve::CatalogTrack {
-                    artist: artist.to_string(),
-                    title: title.to_string(),
-                    duration_secs: Some(191.0),
-                    id: String::new(),
-                    provider: "stub",
-                    popularity: None,
-                },
-                requested: "stand by me".to_string(),
-            },
-        )
-    }
-
-    fn url_of(offer: Offer) -> String {
-        match offer {
-            Offer::Video(candidate) => candidate.url,
-            Offer::Song { track, .. } => track.label(),
-        }
-    }
-
-    /// A press has to find the option it stands for among the offered ones.
-    #[test]
-    fn a_press_finds_the_option_it_stands_for() {
-        let choices = Choices::default();
-        let guild = GuildId::new(7);
-        choices.set(
-            guild,
-            vec![
-                video_offer("https://youtu.be/first"),
-                video_offer("https://youtu.be/second"),
-            ],
-        );
-        let picked = choices
-            .take(guild, "https://youtu.be/second")
-            .expect("was offered");
-        assert_eq!(url_of(picked), "https://youtu.be/second");
-    }
-
-    /// A catalog question offers songs, and the press carries a key that means
-    /// nothing outside the store. That is the point: the button says "song 1",
-    /// and the store says what song 1 is.
-    #[test]
-    fn a_song_press_resolves_to_the_song_it_named() {
-        let choices = Choices::default();
-        let guild = GuildId::new(7);
-        choices.set(
-            guild,
-            vec![
-                song_offer(&song_key(0), "Ben E. King", "Stand By Me"),
-                song_offer(&song_key(1), "Oasis", "Stand By Me"),
-            ],
-        );
-        let picked = choices.take(guild, &song_key(1)).expect("was offered");
-        assert_eq!(url_of(picked), "Oasis — Stand By Me");
-    }
-
-    /// The buttons are spent by a press, so a second one must not replay the
-    /// song.
-    #[test]
-    fn a_press_is_spent_once() {
-        let choices = Choices::default();
-        let guild = GuildId::new(7);
-        choices.set(guild, vec![video_offer("https://youtu.be/only")]);
-        assert!(choices.take(guild, "https://youtu.be/only").is_some());
-        assert!(choices.take(guild, "https://youtu.be/only").is_none());
-    }
-
-    /// Something that was never offered must not be playable, or a crafted
-    /// button could be pressed into playing anything at all.
-    #[test]
-    fn something_that_was_never_offered_is_refused() {
-        let choices = Choices::default();
-        let guild = GuildId::new(7);
-        choices.set(guild, vec![video_offer("https://youtu.be/offered")]);
-        assert!(choices.take(guild, "smuggled").is_none());
-        assert!(choices.take(guild, &song_key(0)).is_none());
-    }
-
-    /// Asking again replaces the question, so a stale button cannot be pressed
-    /// into playing something from a request that has since been forgotten.
-    #[test]
-    fn a_second_question_replaces_the_first() {
-        let choices = Choices::default();
-        let guild = GuildId::new(7);
-        choices.set(guild, vec![video_offer("https://youtu.be/old")]);
-        choices.set(guild, vec![video_offer("https://youtu.be/new")]);
-        assert!(choices.take(guild, "https://youtu.be/old").is_none());
-        assert!(choices.take(guild, "https://youtu.be/new").is_some());
-    }
-
-    /// The song keys restart at zero with every question, so a stale press from
-    /// an older catalog question must not land on a song from a newer one.
-    #[test]
-    fn a_stale_song_key_cannot_reach_a_newer_question() {
-        let choices = Choices::default();
-        let guild = GuildId::new(7);
-        choices.set(
-            guild,
-            vec![song_offer(&song_key(0), "Oasis", "Stand By Me")],
-        );
-        choices.set(guild, vec![song_offer(&song_key(0), "Tems", "Look at Me")]);
-        let picked = choices.take(guild, &song_key(0)).expect("was offered");
-        assert_eq!(
-            url_of(picked),
-            "Tems — Look at Me",
-            "the key means whatever the current question says it means"
-        );
-    }
-
-    /// One question per guild, so the map cannot grow with every ambiguous
-    /// request, and a press in one guild cannot play in another.
-    #[test]
-    fn questions_are_kept_per_guild() {
-        let choices = Choices::default();
-        choices.set(GuildId::new(1), vec![video_offer("https://youtu.be/one")]);
-        choices.set(GuildId::new(2), vec![video_offer("https://youtu.be/two")]);
-        assert!(
-            choices
-                .take(GuildId::new(2), "https://youtu.be/one")
-                .is_none()
-        );
-        assert_eq!(
-            url_of(
-                choices
-                    .take(GuildId::new(1), "https://youtu.be/one")
-                    .unwrap()
-            ),
-            "https://youtu.be/one"
-        );
-        // The untouched guild is unaffected by the other guild's press.
-        assert_eq!(
-            url_of(
-                choices
-                    .take(GuildId::new(2), "https://youtu.be/two")
-                    .unwrap()
-            ),
-            "https://youtu.be/two"
-        );
-    }
-
-    /// Once every button is spent the question is forgotten, rather than
-    /// leaving an empty husk behind for the guild.
-    #[test]
-    fn a_fully_spent_question_is_forgotten() {
-        let choices = Choices::default();
-        let guild = GuildId::new(7);
-        choices.set(guild, vec![video_offer("https://youtu.be/only")]);
-        assert!(choices.take(guild, "https://youtu.be/only").is_some());
-        assert!(choices.lock().is_empty());
-    }
-
-    /// "None of these" throws the question away, and says whether there was
-    /// one so the caller only replies when the press did something.
-    #[test]
-    fn none_of_these_clears_the_question() {
-        let choices = Choices::default();
-        let guild = GuildId::new(7);
-        assert!(!choices.clear(guild), "nothing was on offer");
-        choices.set(guild, vec![video_offer("https://youtu.be/only")]);
-        assert!(choices.clear(guild));
-        assert!(!choices.clear(guild), "and not twice");
-        assert!(choices.take(guild, "https://youtu.be/only").is_none());
     }
 
     #[test]
@@ -2163,5 +2507,113 @@ mod tests {
             packets += 1;
         }
         assert!(packets > 0, "the ready tone must decode to audio samples");
+    }
+    fn song_offer(artist: &str, title: &str) -> Offer {
+        Offer::Song {
+            track: resolve::CatalogTrack {
+                artist: artist.to_string(),
+                title: title.to_string(),
+                duration_secs: Some(206.0),
+                id: String::new(),
+                provider: "catalog",
+                popularity: None,
+                video_id: None,
+            },
+            requested: "dracula".to_string(),
+        }
+    }
+
+    fn ask_with(count: usize, owner: Owner) -> Ask {
+        Ask {
+            query: "dracula".to_string(),
+            offers: (0..count)
+                .map(|i| song_offer("Tame Impala", &format!("Song {i}")))
+                .collect(),
+            page: 0,
+            owner,
+            posted: None,
+        }
+    }
+
+    fn titled(offer: &Offer) -> &str {
+        match offer {
+            Offer::Video(candidate) => candidate.title(),
+            Offer::Song { track, .. } => &track.title,
+        }
+    }
+
+    /// The pages are windows onto one list, so the first song of page two is
+    /// the tenth song and not the first one again.
+    #[test]
+    fn a_page_is_a_window_onto_the_whole_list() {
+        let ask = ask_with(20, Owner::User(UserId::new(7)));
+        let first = ask.page();
+        assert_eq!(first.len(), dashboard::ASK_PAGE);
+        assert_eq!(titled(&first[0]), "Song 0");
+
+        let mut second = ask.clone();
+        second.page = 1;
+        let window = second.page();
+        // Songs 9 through 17: a full page, with songs 18 and 19 behind it.
+        assert_eq!(window.len(), dashboard::ASK_PAGE, "page two is also full");
+        assert_eq!(titled(&window[0]), "Song 9", "not the first song again");
+    }
+
+    /// A list shorter than a page must not run off the end of itself.
+    #[test]
+    fn a_short_list_pages_without_overrunning() {
+        let ask = ask_with(3, Owner::Voice);
+        assert_eq!(ask.page().len(), 3);
+
+        let mut beyond = ask.clone();
+        beyond.page = 9;
+        assert!(beyond.page().is_empty());
+    }
+
+    /// The ownership rule on its own, so it can be tested without a player.
+    fn asks_answers(asks: &Asks, guild_id: GuildId, user: UserId) -> bool {
+        match asks.lock().get(&guild_id).map(|ask| ask.owner) {
+            Some(Owner::User(asker)) => asker == user,
+            Some(Owner::Voice) => true,
+            None => false,
+        }
+    }
+
+    /// Next page has to say no on the last page rather than render an empty one.
+    #[test]
+    fn the_last_page_has_no_next_one() {
+        for (count, page, expected) in [
+            (20, 0, true),
+            (20, 1, true),
+            (20, 2, false), // 20 songs, 9 to a page: three pages, and this is the last.
+            (9, 0, false),
+            (1, 0, false),
+        ] {
+            let mut ask = ask_with(count, Owner::Voice);
+            ask.page = page;
+            assert_eq!(ask.has_next(), expected, "{count} songs, page {page}");
+        }
+    }
+
+    /// A typed search belongs to whoever typed it, and a spoken one to the
+    /// channel. They are the same buttons and the same chooser, and getting the
+    /// owner wrong either lets anyone in the server queue music off someone
+    /// else's search, or locks the channel out of its own.
+    #[test]
+    fn ownership_differs_between_a_typed_and_a_spoken_question() {
+        let guild = GuildId::new(3);
+        let asks = Asks::default();
+        let asker = UserId::new(42);
+        let other = UserId::new(43);
+        assert!(!asks_answers(&asks, guild, asker), "nothing to answer");
+
+        asks.set(guild, ask_with(5, Owner::User(asker)));
+        assert!(asks_answers(&asks, guild, asker));
+        assert!(!asks_answers(&asks, guild, other), "someone else must not");
+
+        // A spoken one has nobody to compare against: the bot cannot tell who
+        // spoke it, so the channel's own check is the only one there is.
+        asks.set(guild, ask_with(5, Owner::Voice));
+        assert!(asks_answers(&asks, guild, other));
     }
 }

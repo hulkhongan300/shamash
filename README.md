@@ -2,10 +2,15 @@
 
 A wake-word Discord music bot written in Rust.
 
-Shamash joins a designated voice channel whenever a member enters it, listens
-for its name, and plays the song that is asked for:
+Shamash joins a designated voice channel whenever anyone is in it — including
+when it starts up and finds the channel already occupied — listens for its
+name, and plays the song that is asked for:
 
-> **"Shamash, play Dracula by Tame Impala"**
+> **"bot, play Dracula by Tame Impala"**
+
+It hears with [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp),
+linked in-process from the [handy-computer](https://github.com/handy-computer)
+group — see [Acknowledgements](#acknowledgements).
 
 ## How it works
 
@@ -42,7 +47,7 @@ Parser: "play <title> by <artist>" → search query
         ▼
 Catalog (Deezer): the song's real artist, title and length
         ▼
-yt-dlp search, scored against that length ──► per-song file ──► songbird playback
+yt-dlp search, scored against that length ──► stream, cached per song ──► songbird
         │
         ├──► if no result is convincing enough, three buttons to pick from
         ▼
@@ -71,8 +76,11 @@ holding it is the whole reason the in-process engine is worth having.
 - **Queues what it is asked for**: ask for a second song while one is playing
   and it waits, starting on its own when the current one ends.
 - **Dashboard controls**: the alert channel carries a now-playing embed with
-  the song's thumbnail and Pause/Resume, Skip and Stop buttons. The message is
-  edited in place rather than replaced, so the channel does not fill up.
+  the song's thumbnail and Pause/Resume, Skip, Queue, Repeat and Stop buttons.
+  The message is edited in place rather than replaced, so the channel does not
+  fill up.
+- **Search it yourself**: `/play <song>` posts a paged list from the catalog and
+  plays whichever one you press
 - **Local speech-to-text**: transcription runs on your machine, no audio leaves
   the host.
 - **Few dependencies**: `serenity` + `songbird` + `transcribe-cpp` as crates
@@ -83,20 +91,31 @@ holding it is the whole reason the in-process engine is worth having.
 - Rust (edition 2024)
 - System packages: `ffmpeg`, `yt-dlp`, `libopus-dev`, `pkg-config`, `cmake`,
   and a C/C++ toolchain (`transcribe-cpp` builds its engine from source)
-- **Two** Parakeet GGUF models: a small one for the wake word and a large one for
-  requests. The default ones come from the
-  [Handy](https://github.com/cjpais/Handy) app's Hugging Face cache, so
-  installing Handy once is the easiest way to get them
+- **Two** GGUF models: a small one for the wake word and a large one for
+  requests. Both are plain files you can download yourself — see [Setup](#setup)
 - A Discord application with a bot token (enable voice gateway intents)
 - Optional, for the rewrite stage: [Ollama](https://ollama.com) with a small
   model pulled
 
 ## Setup
 
-Install the [Handy](https://github.com/cjpais/Handy) app once and pick a
-Parakeet model in it, so the weights land in the Hugging Face cache that
-`PARAKEET_MODEL` and `WAKE_MODEL` resolve against. Or skip it and point them
-straight at any transcribe.cpp GGUF.
+Fetch the two models into the Hugging Face cache, which is where `WAKE_MODEL`
+and `PARAKEET_MODEL` look by default:
+
+```sh
+huggingface-cli download handy-computer/parakeet-tdt_ctc-110m-gguf parakeet-tdt_ctc-110m-Q8_0.gguf
+huggingface-cli download handy-computer/whisper-large-v3-turbo-gguf whisper-large-v3-turbo-Q8_0.gguf
+```
+
+Either variable also takes a plain path to a `.gguf` anywhere on disk, so any
+model transcribe.cpp supports will do.
+
+You do not need the Handy app. The speech engine is
+[transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), linked into
+this process and built from source by `cargo`; see
+[Acknowledgements](#acknowledgements). `ASR_ENGINE=handy` still shells out to the
+Handy binary, but only as an opt-in way to compare the two engines on the same
+audio.
 
 Then create a gitignored `.env` next to the binary with your own values:
 
@@ -121,20 +140,53 @@ They pay for being loaded differently, which is the whole reason there are two:
 | Loaded | at startup, always resident | on the first wake word, then resident |
 | Runs | on every window of speech in the channel | only on a request, after a wake word |
 | Job | hear one short word | turn the request into text |
-| Default | `parakeet-tdt_ctc-110m` | `parakeet-tdt-0.6b-v2` |
+| Default | `parakeet-tdt_ctc-110m` | `whisper-large-v3-turbo` |
 
 `ASR_ENGINE=handy` swaps the in-process engine back to the Handy subprocess,
 which reloads a model per call. It is slower and kept for comparing engines on
 the same audio; the staged design assumes the resident one.
+
+Inference runs on the GPU through ggml's Vulkan backend when the build has it
+compiled in and a device is registered, and on the CPU otherwise. The `vulkan`
+feature of `transcribe-cpp` is on; building it needs the Vulkan SDK headers and
+`glslc`, so on a fresh Arch box:
+
+```sh
+sudo pacman -S --needed vulkan-headers spirv-headers shaderc
+```
+
+The startup log names the device each model actually bound to
+(`backend=Vulkan0 device=Vulkan0`), so a silent fallback to the CPU is visible
+rather than inferred. Nothing to configure: the engine picks the best device it
+has.
+Without those packages the build fails on a missing `SPIRV-Headers`, so drop the
+feature from `Cargo.toml` to go back to CPU inference.
 
 Whisper models work the same way, as GGUFs, through this engine. The old
 `whisper-rs` engine and `scripts/setup.sh` are gone: it vendored its own copy
 of `ggml` and could not be linked alongside transcribe.cpp, so one had to go.
 `ASR_ENGINE=whisper` now fails with a message saying so.
 
-`PARAKEET_MODEL` takes either a path to a `.gguf` or a Handy catalogue id, which
-is resolved against the Hugging Face cache. Some models (Canary, Nemotron) need
-a language hint to produce text at all; set `ASR_LANGUAGE=en` for those.
+`PARAKEET_MODEL` takes either a path to a `.gguf` or a Hugging Face catalogue id,
+which is resolved against the Hugging Face cache. Some models (Canary,
+Nemotron) need a language hint to produce text at all; set `ASR_LANGUAGE=en` for
+those. The Whisper default detects the language itself and does not need one.
+
+`ASR_LANGUAGE` takes **one** ISO-639-1 code — `en`, `pt`, `es`. Not `pt-PT`,
+not `pt_PT`, not `Portuguese`: those all fail, and they fail at the first
+utterance rather than at startup, so the bot used to join the channel and then
+refuse every transcription. That is checked at startup now, and the bot will not
+start with a language its model does not know.
+
+Whisper detects among 100 languages when the hint is unset, which is the right
+default for a bot that hears more than one language. Pinning it to `en` is
+usually a mistake if anyone ever speaks anything else: the audio is still heard,
+but the words come back as English, and a misheard song title is a wrong song.
+
+Whisper large-v3-turbo is multilingual, where the Parakeet it replaced was
+English-only. It is much slower on the CPU — ~17 s per short utterance against
+~0.7 s, or ~1 s once the GPU is doing it. Set `PARAKEET_MODEL` back to a
+Parakeet id if you only ever speak English and want the lower latency.
 
 ### Environment variables
 
@@ -143,9 +195,9 @@ a language hint to produce text at all; set `ASR_LANGUAGE=en` for those.
 | `DISCORD_TOKEN`   | yes      | Bot token from the Discord developer portal        |
 | `VOICE_CHANNEL_ID`| yes      | ID of the voice channel the bot watches and joins  |
 | `ASR_ENGINE`      | no       | `direct` (default, in-process transcribe.cpp) or `handy` (subprocess) |
-| `PARAKEET_MODEL`  | no       | The large model, loaded on a wake word: a `.gguf` path or Handy model id (default Parakeet TDT 0.6B v2) |
-| `WAKE_MODEL`      | no       | The small always-on model: a `.gguf` path or Handy model id (default Parakeet TDT+CTC 110M) |
-| `ASR_LANGUAGE`    | no       | Language hint for models that need one, e.g. `en` for Canary or Nemotron |
+| `PARAKEET_MODEL`  | no       | The large model, loaded on a wake word: a `.gguf` path or Hugging Face model id (default Whisper large-v3-turbo Q8_0) |
+| `WAKE_MODEL`      | no       | The small always-on model: a `.gguf` path or Hugging Face model id (default Parakeet TDT+CTC 110M) |
+| `ASR_LANGUAGE`    | no       | One ISO-639-1 language code, e.g. `en` or `pt`. Unset means the model detects it. `pt-PT` is not valid |
 | `WAKE_WORDS`      | no       | Comma-separated wake words (default `bot,play,ut,ot`) |
 | `LLM_ENDPOINT`    | no       | Ollama-compatible endpoint that rewrites a misheard transcript. Unset by default, which uses the words as heard |
 | `LLM_MODEL`       | no       | Model to ask at that endpoint (default `llama3.2`) |
@@ -281,6 +333,32 @@ turn, under one shared time budget: "stand by me by ben e king" is first tried
 as *Ben E. King — Stand By Me*, and as *Stand* by *Me by Ben E King* only if
 that finds nothing.
 
+By default the bot logs only what it heard, what it did about it, and which
+models loaded:
+
+```
+INFO shamash::direct: loaded ASR model model=... backend=Vulkan0 device=Vulkan0
+INFO shamash::bot: Shamash starting up request_model=... wake_model=... wake_words=bot,play,ut,ot
+INFO shamash::pipeline: request heard guild_id=... transcript="bot play dracula by tame impala"
+INFO shamash::pipeline: playing a request guild_id=... request="dracula by tame impala"
+```
+
+Serenity and songbird log a line per connection and per packet, which drowns
+those out, so they are silenced at info. Warnings still come through from
+everything, so a failure is never silent.
+
+One warning is dropped outright:
+
+```
+WARN songbird::driver::tasks::udp_rx: RTCP decryption failed: Crypto(Error)
+```
+
+Discord sends RTCP reports for streams the bot has no key for, so this fires
+continuously on a perfectly working connection, and there is no songbird setting
+to turn it off. It is matched by message rather than by module, because
+`RTP decryption failed` and `Decode error for SSRC` come from the same module
+and both mean the bot has stopped hearing.
+
 Set `RUST_LOG=shamash=debug` to see what the wake model heard on each check, the
 resolution, the scores and the runner-up:
 
@@ -307,16 +385,71 @@ alert channel that says what was heard:
 
 There are three: no match, a download that failed, and a queue with no room.
 
+### `/play`
+
+```
+/play dracula
+```
+
+Searches the catalog for what you typed and posts the results as numbered
+buttons, nine to a page:
+
+```
+Which one?
+Searching the catalog for dracula.
+Page 1 of 3.
+1. Dracula        Tame Impala • 3:26
+2. Borderline     Tame Impala • 3:42
+...
+[1][2][3][4][5]
+[6][7][8][9]
+[Next page][None of these]
+```
+
+**Next page** shows the next nine from the *same* search — every page is a
+window onto one list, so turning the page never asks the catalog again and
+never reshuffles what you have already looked at. It is disabled on the last
+page rather than removed, because a button that vanishes makes the message look
+broken.
+
+Speech asks the same question through the same chooser. When the bot is
+confident about what it heard it just plays, as before; when it is not, or when
+the catalog has never heard of the song, it posts this same paged chooser
+instead of a separate short list. The difference is only who may answer: a
+`/play` chooser belongs to whoever typed it, while one raised by speech is the
+voice channel's, because the bot hears a voice and cannot tell who spoke.
+
+Picking a song finds its upload and queues it. The buttons name *songs*, not
+videos: that is the order that makes a second page worth having, because a
+catalog has far more songs under a query than there are uploads worth offering.
+
+Unlike the dashboard, a `/play` chooser is private to whoever typed it — it
+answers one person's question rather than controlling a shared queue, so anyone
+else who presses gets the same "join the voice channel" refusal. Running
+`/play` itself needs you to be in the bot's voice channel, since that is the
+only place it can play anything.
+
 ### Controlling playback
 
-The dashboard in the alert channel is the only control surface:
+The dashboard in the alert channel is the only shared control surface:
 
 | Button   | Effect                                                     |
 | -------- | ---------------------------------------------------------- |
 | Pause    | Pauses the current song; the button becomes Resume         |
 | Resume   | Carries on from where the song paused                        |
 | Skip     | Drops the current song and starts the next one queued       |
+| Queue    | Lists what is waiting, soonest first                        |
+| Repeat   | Replays the current song when it ends with nothing queued after it; the button reads `Repeat: on` while it is set |
 | Stop     | Stops playback and clears the queue                         |
+
+**Queue** swaps the dashboard for a list of the waiting songs and leaves a
+**Back** button to return. The dashboard is one message edited in place, so it
+remembers which of the two it is showing: a song ending while you are reading
+the queue leaves you reading the queue.
+
+**Repeat** is repeat *one*: a song that ends with nothing queued behind it plays
+again, rather than the queue starting over. It does not interrupt the list — a
+song with others waiting still plays the next one.
 
 When the bot cannot tell which song was meant, it posts the three closest
 results in the same channel as numbered buttons and plays nothing. Pressing one
@@ -330,14 +463,29 @@ without that check anyone who could read it could stop someone else's music.
 `/stop` is separate: it also leaves the voice channel, so the bot stops
 transcribing until someone comes back.
 
-Each song is downloaded to its own file, named after its video id, so a
-request can never be served the audio of an earlier one. The newest few
-downloads are kept and the rest pruned, which keeps a repeated request
-instant and stops the cache growing without bound.
+Each song is cached under its own video id, so a request can never be served
+the audio of an earlier one. The newest few downloads are kept and the rest
+pruned, which keeps a repeated request instant and stops the cache growing
+without bound.
+
+A song usually does not wait to be cached before it plays. One yt-dlp
+extraction says which formats the video publishes, and the one symphonia can
+decode — the AAC in an MP4; symphonia 0.5 has no Opus decoder — is played
+straight off YouTube while the rest of it is written to the cache in the
+background. That is what moves the first sample from "after the whole file" to
+"after the first few kilobytes": on a ten-song cold benchmark the median drops
+from about 2.2 s to about 1.8 s, and the songs that stream need only ~8 KiB to
+start.
+
+Streaming is the fast path, not the only one. The URL is signed and expires,
+so before playback the bot asks for the same range playback will ask for: a
+403, or a connection that delivers nothing within 2.5 s, and the song is
+downloaded and played from the cache instead. Each request logs which path ran
+and how long it took to first audio.
 
 ## Testing without Discord
 
-Record yourself saying a wake word, pausing, then *"play Dracula by Tame
+Record yourself saying a wake word, pausing, then *"bot, play Dracula by Tame
 Impala"* — the pause matters, because it is where the bot's two tones fall:
 
 ```sh
@@ -361,7 +509,7 @@ play: dracula by tame impala
 
 Models and wake words come from the same settings as the bot, so a change to
 `WAKE_MODEL` or `WAKE_WORDS` is measured by re-running this. `PARAKEET_MODEL`
-and `WAKE_MODEL` both default to the Handy cache.
+and `WAKE_MODEL` both default to the Hugging Face cache.
 
 It also prints a level report: the loudest 20 ms frame against the
 voice-activity gate. If that frame sits below the gate, the bot cannot hear you
@@ -381,6 +529,34 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
+
+## Acknowledgements
+
+Shamash stands on the work of the **handy-computer** group, and owes them a
+genuine thank you.
+
+The speech engine is
+[transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), their Rust
+bindings to a C/C++ speech-to-text library built on ggml. It is what Shamash
+listens with. Before it existed here, this bot transcribed through the
+[Handy](https://github.com/cjpais/Handy) app as a subprocess, which cost a Tauri
+startup and a full model reload on *every* utterance. Linking transcribe.cpp
+directly and holding the model resident was the single biggest change in how
+this bot performs — roughly 350 ms per command down to inference alone — and
+turning on ggml's Vulkan backend afterwards took a Whisper decode from ~17 s to
+~1 s on this machine.
+
+That is not a small thing to hand someone. The library covers 16+ model
+families behind one API, it keeps the model resident so a caller can use it the
+way the caller actually wants to, and it did all of that while leaving room for
+the app's own catalogue to keep working alongside it. It has been a great
+building block, and the kind of dependency that makes a project like this
+possible at all.
+
+The model catalogue and the GGUF conversions come from the same group too, which
+is why both defaults resolve straight out of their Hugging Face repositories.
+
+If you are the maintainers: thank you, and please keep going.
 
 ## License
 

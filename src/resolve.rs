@@ -59,6 +59,13 @@ pub struct CatalogTrack {
     /// Deezer reports a `rank`; iTunes and MusicBrainz do not. Used only to
     /// settle `AMBIGUOUS_POLICY=popular`, never to choose a song outright.
     pub popularity: Option<u32>,
+    /// The YouTube video this song *is*, when a provider knows it.
+    ///
+    /// Not the same as a search result: a video id found by searching YouTube
+    /// is one upload somebody put up, which is why the search has to rank
+    /// several of them. A video id a provider reports is the song itself, so
+    /// the rest of the pipeline can use it and never search for it.
+    pub video_id: Option<String>,
 }
 
 impl CatalogTrack {
@@ -319,6 +326,16 @@ pub trait CatalogProvider: Send + Sync {
         false
     }
 
+    /// Whether this provider is only asked when nothing better answered.
+    ///
+    /// False for the provider whose hits *are* the answer -- see [`YtMusic`].
+    /// A fallback is asked after the source of truth, and only when the source
+    /// of truth had nothing confident to say, so it can never displace a hit the
+    /// source of truth stood behind.
+    fn is_fallback(&self) -> bool {
+        true
+    }
+
     /// Asks about one query.
     ///
     /// Implementations return their best results in the order the provider ranks
@@ -483,6 +500,7 @@ pub(crate) fn parse_search(body: DeezerSearch, query: &str) -> anyhow::Result<Ve
             id: hit.id.to_string(),
             provider: "deezer",
             popularity: hit.rank,
+            video_id: None,
         })
         .collect())
 }
@@ -590,6 +608,7 @@ impl ITunesHit {
             id: self.track_id.unwrap_or_default().to_string(),
             provider: "itunes",
             popularity: None,
+            video_id: None,
         })
     }
 }
@@ -746,7 +765,235 @@ impl MusicBrainzHit {
             id: String::new(),
             provider: "musicbrainz",
             popularity: self.score,
+            video_id: None,
         })
+    }
+}
+
+/// YouTube Music's own songs search, the one catalog here that is both a
+/// *catalog* and the *source* of the audio.
+///
+/// Every other provider in this file is a list of songs someone else maintains.
+/// YouTube Music is the thing the bot plays from: a songs-filtered result is an
+/// official track on an artist's own release, with the video id that carries its
+/// audio and the running time of that recording. So a hit from here needs
+/// nothing further -- no upload search, no duration scoring to work out which
+/// upload is the song (see [`crate::search::find_video`]) -- and, unlike Deezer
+/// or iTunes, it corrects a misheard name itself, because it is the same
+/// spell-correcting search the listener would have used by hand.
+///
+/// Keyless in the sense that matters: no account and no per-user credential. The
+/// `key` below is the public InnerTube client key that YouTube ships inside every
+/// web page, the same one `music.youtube.com` sends; it identifies the web client
+/// and grants nothing.
+pub struct YtMusic {
+    client: reqwest::Client,
+}
+
+/// The InnerTube search endpoint for music.youtube.com.
+const YTMUSIC_ENDPOINT: &str = "https://music.youtube.com/youtubei/v1/search";
+
+/// The web client key, which is public and grants nothing.
+///
+/// shortcut: a hardcoded key and client version. Both go stale when YouTube
+/// ships, and a stale pair fails as a 400, which this provider reports as
+/// `Unavailable` and the fan-out treats as "no opinion". Bump both, or scrape a
+/// fresh pair from music.youtube.com, when songs start coming back empty.
+const YTMUSIC_KEY: &str = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
+const YTMUSIC_CLIENT: &str = "WEB_REMIX";
+const YTMUSIC_CLIENT_VERSION: &str = "1.20240101.00.00";
+
+/// The `params` blob that asks for songs rather than videos, albums or
+/// playlists.
+///
+/// Read out of the filter chips in an ordinary search response rather than
+/// written from memory: the well-known `EgWKAQIYAWoK...` value that most of the
+/// web still quotes now selects *albums*, which is a list of albums and exactly
+/// the thing this provider exists to avoid.
+const YTMUSIC_SONGS_FILTER: &str = "EgWKAQIIAWoSEAQQAxAKEAUQCRAREBAQFRAO";
+
+impl YtMusic {
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            client: catalog_http_client()?,
+        })
+    }
+}
+
+#[async_trait]
+impl CatalogProvider for YtMusic {
+    fn name(&self) -> &'static str {
+        "ytmusic"
+    }
+
+    fn rate(&self) -> Rate {
+        // InnerTube publishes no limit. Two a second with a burst of five is a
+        // self-imposed ceiling: it keeps a burst of whispers from looking like
+        // scraping, and the whole fan-out only ever asks a handful of queries.
+        Rate::new(5.0, 2.0)
+    }
+
+    /// Not a fallback: this is the one provider whose answer stands on its own.
+    fn is_fallback(&self) -> bool {
+        false
+    }
+
+    async fn search(&self, query: &CatalogQuery) -> Result<Vec<CatalogTrack>, ProviderError> {
+        // Free text only. YouTube Music has one field for a query and no
+        // artist-only mode worth spending a request on, so the fielded shapes
+        // the other providers use would be the same string sent twice.
+        let body = serde_json::json!({
+            "context": { "client": {
+                "clientName": YTMUSIC_CLIENT,
+                "clientVersion": YTMUSIC_CLIENT_VERSION,
+                "hl": "en",
+            }},
+            "query": query.text(),
+            "params": YTMUSIC_SONGS_FILTER,
+        });
+        let response = self
+            .client
+            .post(format!("{YTMUSIC_ENDPOINT}?key={YTMUSIC_KEY}"))
+            .json(&body)
+            .header("Origin", "https://music.youtube.com")
+            .header("X-Goog-Api-Format-Version", "1")
+            .header("X-YouTube-Client-Name", "67")
+            .header("X-YouTube-Client-Version", YTMUSIC_CLIENT_VERSION)
+            .send()
+            .await
+            .map_err(|_| ProviderError::Unavailable)?;
+        let status = response.status();
+        if status.as_u16() == 429 || status.as_u16() == 403 {
+            return Err(ProviderError::RateLimited);
+        }
+        if !status.is_success() {
+            return Err(ProviderError::Unavailable);
+        }
+        // Decoded as a tree rather than into a typed body: InnerTube is a
+        // renderer tree whose shape changes with the site's experiments, and a
+        // hand-written struct would reject the whole response the first time a
+        // field moved rather than reading the songs still in there.
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| ProviderError::BadResponse)?;
+        Ok(parse_songs(&body))
+    }
+}
+
+/// Every song in an InnerTube response, best first, in the order YouTube ranked
+/// them.
+///
+/// The song rows live at different depths in different responses -- a
+/// `musicShelfRenderer` one end of a songs-filtered search, an
+/// `itemSectionRenderer` in between when a card is inserted -- so the tree is
+/// walked rather than addressed. The walk is linear in a ~600 kB response, which
+/// is nothing next to the HTTP round trip it replaces.
+pub(crate) fn parse_songs(body: &serde_json::Value) -> Vec<CatalogTrack> {
+    fn walk(node: &serde_json::Value, out: &mut Vec<CatalogTrack>) {
+        let Some(fields) = node.as_object() else {
+            return;
+        };
+        for (key, value) in fields {
+            if key == "musicResponsiveListItemRenderer" {
+                if let Some(track) = song(value) {
+                    out.push(track);
+                }
+                continue;
+            }
+            walk(value, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(body, &mut out);
+    out
+}
+
+/// One `musicResponsiveListItemRenderer` as a track, when it is a song.
+fn song(row: &serde_json::Value) -> Option<CatalogTrack> {
+    let title = column(row, 0)?;
+    // The subtitle is runs, not one string: "Ben E. King • Don't Play That Song
+    // • 2:56". The artist is the first run and the running time the last one
+    // that looks like a time, because the album name in between can be
+    // anything at all and sometimes is not a name but a count.
+    let subtitle = runs(row, 1)?;
+    let artist = subtitle.first()?.trim().to_string();
+    let duration = subtitle
+        .iter()
+        .rev()
+        .find_map(|run| run.trim().parse_clock().ok())
+        .map(|clock| clock.as_secs_f64());
+    // A row with no video id is an album or a playlist wearing a song row's
+    // shape; there is no audio to play and nothing to hand the fetch layer.
+    let video_id = row.pointer("/playlistItemData/videoId")?.as_str()?;
+    if artist.is_empty() {
+        return None;
+    }
+    Some(CatalogTrack {
+        artist,
+        title,
+        duration_secs: duration,
+        id: video_id.to_string(),
+        provider: "ytmusic",
+        // YouTube Music reports no popularity, and `AMBIGUOUS_POLICY=popular`
+        // is a guess anyway; leaving it unset makes that policy fall back to
+        // asking rather than pick a song on a number nobody published.
+        popularity: None,
+        video_id: Some(video_id.to_string()),
+    })
+}
+
+/// Every run of one `flexColumns` entry, in order, with the empty ones dropped.
+///
+/// Kept as a list rather than a joined string because a row's subtitle is
+/// several runs carrying different facts -- artist, album, running time -- and
+/// the caller has to tell them apart.
+fn runs(row: &serde_json::Value, index: usize) -> Option<Vec<String>> {
+    let text: Vec<String> = row
+        .pointer(&format!(
+            "/flexColumns/{index}/musicResponsiveListItemFlexColumnRenderer/text/runs"
+        ))?
+        .as_array()?
+        .iter()
+        .filter_map(|run| run.get("text").and_then(serde_json::Value::as_str))
+        .map(|run| run.trim().to_string())
+        .filter(|run| !run.is_empty())
+        .collect();
+    (!text.is_empty()).then_some(text)
+}
+
+/// One `flexColumns` entry as the single string it reads as.
+fn column(row: &serde_json::Value, index: usize) -> Option<String> {
+    let text = runs(row, index)?.join("");
+    (!text.is_empty()).then_some(text)
+}
+
+/// A `m:ss` or `h:mm:ss` running time, as seconds.
+///
+/// YouTube writes every one of these with at least a minutes field, so
+/// "183" is never a duration here and a single bare number is refused rather
+/// than read as seconds -- a wrong duration is worse than none, because the
+/// upload scorer trusts it completely.
+trait Clock {
+    fn parse_clock(&self) -> std::result::Result<Duration, ()>;
+}
+
+impl Clock for str {
+    fn parse_clock(&self) -> std::result::Result<Duration, ()> {
+        let mut seconds = 0u64;
+        let mut fields = 0;
+        for part in self.trim().split(':') {
+            let value: u64 = part.trim().parse().map_err(|_| ())?;
+            seconds = seconds
+                .checked_mul(60)
+                .and_then(|s| s.checked_add(value))
+                .ok_or(())?;
+            fields += 1;
+        }
+        if !(1..=3).contains(&fields) || seconds == 0 {
+            return Err(());
+        }
+        Ok(Duration::from_secs(seconds))
     }
 }
 
@@ -873,6 +1120,17 @@ pub struct Hit {
     pub agreement: usize,
     /// The highest popularity any provider reported.
     pub popularity: Option<u32>,
+    /// The YouTube video this song is on, when a provider knew it.
+    ///
+    /// Carried all the way to the fetch so the song is downloaded directly
+    /// rather than searched for first. See [`CatalogTrack::video_id`].
+    pub video_id: Option<String>,
+    /// Which provider [`Self::video_id`] came from.
+    ///
+    /// Kept because providers disagree: YouTube Music's id is the album track,
+    /// which is what was asked for, while anything else can be an upload of the
+    /// song rather than the song.
+    pub video_provider: &'static str,
 }
 
 impl Hit {
@@ -894,14 +1152,23 @@ impl Hit {
     }
 
     /// The catalog track to hand the rest of the pipeline.
+    ///
+    /// Keeps the video id, and names the provider it came from, so a song that
+    /// a provider could place on YouTube is downloaded from that video instead
+    /// of being searched for.
     pub fn to_track(&self) -> CatalogTrack {
         CatalogTrack {
             artist: self.artist.clone(),
             title: self.title.clone(),
             duration_secs: self.duration_secs(),
             id: String::new(),
-            provider: "catalog",
+            provider: if self.video_id.is_some() {
+                self.video_provider
+            } else {
+                "catalog"
+            },
             popularity: self.popularity,
+            video_id: self.video_id.clone(),
         }
     }
 }
@@ -1066,7 +1333,18 @@ impl Catalog {
             let Some(artist) = reading.artist.as_deref() else {
                 continue;
             };
-            push(CatalogQuery::ArtistTracks(artist.to_string()), &mut queries);
+            // `ArtistTracks` is Deezer's and MusicBrainz's *fielded* artist
+            // query. YouTube Music has one field, so the same request goes out
+            // as free text -- which still rescues a correct artist with a
+            // misheard title, because it does not need the title to be right.
+            push(
+                if provider == "ytmusic" {
+                    CatalogQuery::Loose(artist.to_string())
+                } else {
+                    CatalogQuery::ArtistTracks(artist.to_string())
+                },
+                &mut queries,
+            );
         }
         if let Some(title) = target
             .readings
@@ -1084,25 +1362,46 @@ impl Catalog {
     /// Never fails. Whatever has arrived by [`Self::budget`] is used, and a
     /// provider that errors, stalls or answers with a quota notice is simply
     /// one fewer opinion.
+    ///
+    /// In two stages. The source of truth ([`YtMusic`]) goes first, alone: its
+    /// results are official tracks with their own running time and their own
+    /// video, so mixing a fallback's guesses into the same ranking is how a
+    /// confidently wrong song gets played. The fallback providers only run when
+    /// that stage produced nothing, nothing confident, or an error -- and when
+    /// they do run they are the *whole* answer, not a blend, so there is no
+    /// ranking for them to win.
     pub async fn hits(&self, target: &Target) -> Vec<Hit> {
         let deadline = TokioInstant::now() + self.budget;
         let mut found = Vec::new();
 
-        for guarded in &self.providers {
-            if guarded.provider.is_slow_path() {
-                continue;
-            }
+        let (primary, fallback): (Vec<&Guarded>, Vec<&Guarded>) = self
+            .providers
+            .iter()
+            .filter(|guarded| !guarded.provider.is_slow_path())
+            .partition(|guarded| !guarded.provider.is_fallback());
+
+        for guarded in primary {
             self.ask(guarded, target, deadline, &mut found).await;
         }
 
-        // The slow path only runs when the fast providers found nothing that
-        // already explains the request, and only if there is time for it: at
-        // one request a second its own limiter is most of the budget.
-        if self.worth_the_wait(target, &found)
-            && deadline > TokioInstant::now() + self.slow_path_reserve
-        {
-            for guarded in self.providers.iter().filter(|g| g.provider.is_slow_path()) {
+        // The fallback providers only run when the source of truth has not
+        // already answered: `worth_the_wait` is "nothing found so far explains
+        // the request", so asking them otherwise would blend a second opinion
+        // into a ranking the first one already settled.
+        if self.worth_the_wait(target, &found) {
+            for guarded in fallback {
                 self.ask(guarded, target, deadline, &mut found).await;
+            }
+
+            // The slow path only runs when the fast providers found nothing that
+            // already explains the request, and only if there is time for it: at
+            // one request a second its own limiter is most of the budget.
+            if self.worth_the_wait(target, &found)
+                && deadline > TokioInstant::now() + self.slow_path_reserve
+            {
+                for guarded in self.providers.iter().filter(|g| g.provider.is_slow_path()) {
+                    self.ask(guarded, target, deadline, &mut found).await;
+                }
             }
         }
 
@@ -1122,6 +1421,15 @@ impl Catalog {
     }
 
     /// Runs one provider's queries, adding whatever it returned.
+    ///
+    /// All of a provider's queries go out at once rather than one after the
+    /// other, under the one shared budget. The plan holds the raw transcript and
+    /// every parser reading of it, and for a misheard phrase those are
+    /// independent questions whose answers do not depend on each other --
+    /// sending them in series would make the wait the sum of four round trips
+    /// when it only ever has to be the slowest one. The limiter still decides
+    /// which of them are actually served: a query with no token before the
+    /// deadline is skipped, not waited for.
     async fn ask(
         &self,
         guarded: &Guarded,
@@ -1136,69 +1444,91 @@ impl Catalog {
             );
             return;
         }
-        for query in self.plan(target, guarded.provider.name()) {
-            if deadline <= TokioInstant::now() {
-                tracing::debug!(
-                    provider = guarded.provider.name(),
-                    "out of catalog budget; stopping this provider"
-                );
-                return;
-            }
-            if !guarded.guard.take(deadline).await {
+        let queries = self.plan(target, guarded.provider.name());
+        let answers = futures::future::join_all(
+            queries
+                .iter()
+                .map(|query| self.ask_one(guarded, query, deadline)),
+        )
+        .await;
+        for tracks in answers {
+            found.extend(tracks);
+        }
+    }
+
+    /// Runs one query, or reports nothing for it.
+    async fn ask_one(
+        &self,
+        guarded: &Guarded,
+        query: &CatalogQuery,
+        deadline: tokio::time::Instant,
+    ) -> Vec<CatalogTrack> {
+        if deadline <= TokioInstant::now() {
+            tracing::debug!(
+                provider = guarded.provider.name(),
+                "out of catalog budget; skipping this query"
+            );
+            return Vec::new();
+        }
+        if !guarded.guard.take(deadline).await {
+            tracing::debug!(
+                provider = guarded.provider.name(),
+                kind = query.kind(),
+                "no rate-limit token before the deadline; skipping this query"
+            );
+            return Vec::new();
+        }
+
+        let started = TokioInstant::now();
+        let outcome = timeout_at(deadline, guarded.provider.search(query)).await;
+        match outcome {
+            Ok(Ok(tracks)) => {
+                guarded.guard.record(Ok(())).await;
                 tracing::debug!(
                     provider = guarded.provider.name(),
                     kind = query.kind(),
-                    "no rate-limit token before the deadline; skipping this query"
+                    query = %query.text(),
+                    hits = tracks.len(),
+                    took_ms = started.elapsed().as_millis() as u64,
+                    "catalog answered"
                 );
-                continue;
+                tracks
             }
-
-            let started = TokioInstant::now();
-            let outcome = timeout_at(deadline, guarded.provider.search(&query)).await;
-            let (tracks, error) = match outcome {
-                Ok(Ok(tracks)) => {
-                    guarded.guard.record(Ok(())).await;
-                    tracing::debug!(
-                        provider = guarded.provider.name(),
-                        kind = query.kind(),
-                        query = %query.text(),
-                        hits = tracks.len(),
-                        took_ms = started.elapsed().as_millis() as u64,
-                        "catalog answered"
-                    );
-                    (tracks, None)
-                }
-                Ok(Err(e)) => {
-                    guarded.guard.record(Err(e)).await;
-                    tracing::warn!(
-                        provider = guarded.provider.name(),
-                        kind = query.kind(),
-                        query = %query.text(),
-                        problem = %e,
-                        "this provider had nothing; carrying on with the others"
-                    );
-                    (Vec::new(), Some(e))
-                }
-                Err(_) => {
-                    let e = ProviderError::Unavailable;
-                    guarded.guard.record(Err(e)).await;
-                    tracing::debug!(
-                        provider = guarded.provider.name(),
-                        kind = query.kind(),
-                        query = %query.text(),
-                        "the catalog budget ran out before this answer arrived"
-                    );
-                    (Vec::new(), Some(e))
-                }
-            };
-            let _ = error;
-            found.extend(tracks);
+            Ok(Err(e)) => {
+                guarded.guard.record(Err(e)).await;
+                tracing::warn!(
+                    provider = guarded.provider.name(),
+                    kind = query.kind(),
+                    query = %query.text(),
+                    problem = %e,
+                    "this provider had nothing; carrying on with the others"
+                );
+                Vec::new()
+            }
+            Err(_) => {
+                let e = ProviderError::Unavailable;
+                guarded.guard.record(Err(e)).await;
+                tracing::debug!(
+                    provider = guarded.provider.name(),
+                    kind = query.kind(),
+                    query = %query.text(),
+                    "the catalog budget ran out before this answer arrived"
+                );
+                Vec::new()
+            }
         }
     }
 }
 
 /// How many queries one provider is asked per request.
 const MAX_QUERIES_PER_PROVIDER: usize = 4;
+
+/// The provider whose video id identifies the song rather than an upload of it.
+///
+/// Named as a constant because the merge rule below is the one place that
+/// decides between two providers' ids, and the name is what makes that
+/// decision readable.
+const YTMUSIC: &str = "ytmusic";
 
 /// Merges provider results into one list, de-duplicated on the song.
 fn merge(found: Vec<CatalogTrack>) -> Vec<Hit> {
@@ -1221,6 +1551,8 @@ fn merge(found: Vec<CatalogTrack>) -> Vec<Hit> {
                 duration_uncertain: false,
                 agreement: 1,
                 popularity: track.popularity,
+                video_id: track.video_id.clone().filter(|id| !id.is_empty()),
+                video_provider: track.provider,
             };
             index.insert(key, hits.len());
             hits.push(hit);
@@ -1238,6 +1570,18 @@ fn merge(found: Vec<CatalogTrack>) -> Vec<Hit> {
                 .any(|seen| (seen - seconds).abs() < 1.0)
         {
             hit.durations.push(seconds);
+        }
+        // Two providers can place the same song on two different videos, and
+        // only one of them is the song: YouTube Music reports the album track,
+        // while anything else can be reporting an upload of it. So the id from
+        // YouTube Music wins, and the first id reported wins over none.
+        let wins = match &hit.video_id {
+            None => true,
+            Some(_) => track.provider == YTMUSIC && hit.video_provider != YTMUSIC,
+        };
+        if wins && let Some(id) = track.video_id.filter(|id| !id.is_empty()) {
+            hit.video_id = Some(id);
+            hit.video_provider = track.provider;
         }
         hit.popularity = match (hit.popularity, track.popularity) {
             (Some(a), Some(b)) => Some(a.max(b)),
@@ -1273,6 +1617,7 @@ mod tests {
             id: "1".to_string(),
             provider: "test",
             popularity: None,
+            video_id: None,
         }
     }
 

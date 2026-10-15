@@ -6,9 +6,10 @@
 //!
 //! [`advance`]: Queue::advance
 
+use reqwest::header::HeaderMap;
 use serenity::model::id::GuildId;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// How many songs one guild may have waiting.
@@ -16,11 +17,56 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// Unbounded, a long queue of downloads would fill the disk.
 pub const MAX_QUEUE: usize = 20;
 
+/// Where a queued song's audio comes from.
+///
+/// Two, because waiting for a whole download before the first sample is the
+/// larger half of the wait: a stream starts playing while the rest of it is
+/// still arriving, and the download carries on in the background into the cache
+/// so the next time this song is asked for it plays instantly. When the stream
+/// cannot be used -- YouTube refusing a URL that has expired, or a connection
+/// that never delivers -- the song plays from the file instead.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Source {
+    /// Audio already on disk.
+    File(PathBuf),
+    /// Audio at a URL, played as it arrives.
+    Stream {
+        /// The signed format URL. It expires, so it is a source that can fail
+        /// rather than one that always works.
+        url: String,
+        /// The headers the URL must be requested with. YouTube signs the URL
+        /// against the client that asked for it and answers 403 without them.
+        headers: HeaderMap,
+        /// How long the audio is, in bytes.
+        ///
+        /// Carried because the request cannot be made without it: YouTube serves
+        /// this URL only for a closed `range`, `bytes=0-<length-1>`, and
+        /// refuses a plain GET with 403.
+        length: u64,
+        /// The file the same audio is written to while it streams, and the one
+        /// a fallback plays if the stream turns out to be unusable.
+        cache: PathBuf,
+    },
+}
+
+impl Source {
+    /// The cache file this song's audio belongs in.
+    ///
+    /// For a stream that is where the background write is going, and for a
+    /// download that is where the audio already is. The cache must never prune
+    /// either.
+    pub fn cache(&self) -> &Path {
+        match self {
+            Source::File(path) | Source::Stream { cache: path, .. } => path,
+        }
+    }
+}
+
 /// One song waiting to play, or playing now.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Queued {
-    /// Downloaded audio on disk.
-    pub path: PathBuf,
+    /// The audio to play, and where it comes from.
+    pub source: Source,
     /// Title as shown on the dashboard.
     pub title: String,
     /// Uploading channel, shown as the artist line.
@@ -55,6 +101,24 @@ struct State {
     /// stopped, so the callback for a song that ends on its own has to tell
     /// itself apart from one already replaced by a skip.
     generation: u64,
+    /// Whether a song that ends with nothing queued behind it goes back on.
+    repeat: bool,
+}
+
+/// Puts a finished song back on the queue when repeat is on and nothing else is
+/// waiting.
+///
+/// Repeat means repeat *one*: a song that ends with the queue empty goes back on
+/// rather than the queue restarting from the top, because there is no top to
+/// restart from once the list has run down. Called before the next song is
+/// taken, so the requeued song is what plays next.
+fn requeue_if_repeating(state: &mut State, stopped: &Option<Queued>) {
+    if state.repeat
+        && state.pending.is_empty()
+        && let Some(song) = stopped
+    {
+        state.pending.push_back(song.clone());
+    }
 }
 
 /// The result of moving a queue on to the next song.
@@ -102,6 +166,7 @@ impl Queue {
     pub fn advance(&self) -> Advanced {
         let mut state = self.lock();
         let stopped = state.current.take();
+        requeue_if_repeating(&mut state, &stopped);
         state.current = state.pending.pop_front();
         state.paused = false;
         state.generation = state.generation.wrapping_add(1);
@@ -124,6 +189,7 @@ impl Queue {
             return None;
         }
         let stopped = state.current.take();
+        requeue_if_repeating(&mut state, &stopped);
         state.current = state.pending.pop_front();
         state.paused = false;
         state.generation = state.generation.wrapping_add(1);
@@ -132,6 +198,19 @@ impl Queue {
             current: state.current.clone(),
             generation: state.generation,
         })
+    }
+
+    /// Whether a song that ends with nothing behind it plays again.
+    pub fn is_repeat(&self) -> bool {
+        self.lock().repeat
+    }
+
+    /// Turns replaying the current song on or off, and reports the new setting
+    /// so the caller can say which way it went.
+    pub fn toggle_repeat(&self) -> bool {
+        let mut state = self.lock();
+        state.repeat = !state.repeat;
+        state.repeat
     }
 
     /// Drops the current song without starting another.
@@ -152,6 +231,11 @@ impl Queue {
     /// How many songs are waiting behind the current one.
     pub fn pending(&self) -> usize {
         self.lock().pending.len()
+    }
+
+    /// The songs waiting behind the current one, soonest first.
+    pub fn pending_songs(&self) -> Vec<Queued> {
+        self.lock().pending.iter().cloned().collect()
     }
 
     /// Whether the current song is paused.
@@ -179,15 +263,17 @@ impl Queue {
     /// waiting behind it.
     ///
     /// Used by the cache to know which downloads it is not allowed to prune.
-    /// A queued song's file is read by songbird when it starts, so deleting it
-    /// because too many newer files arrived plays silence instead of the song.
+    /// A queued song's audio is read when it starts, so deleting it because too
+    /// many newer files arrived plays silence instead of the song. A stream's
+    /// cache file counts: it is the audio a later request and a repeat will
+    /// read without waiting for YouTube again.
     pub fn in_use(&self) -> Vec<PathBuf> {
         let state = self.lock();
         state
             .current
             .iter()
             .chain(state.pending.iter())
-            .map(|song| song.path.clone())
+            .map(|song| song.source.cache().to_path_buf())
             .collect()
     }
 }
@@ -213,7 +299,25 @@ mod tests {
 
     fn song(title: &str) -> Queued {
         Queued {
-            path: PathBuf::from(format!("/tmp/{title}.m4a")),
+            source: Source::File(PathBuf::from(format!("/tmp/{title}.m4a"))),
+            title: title.to_string(),
+            artist: "someone".to_string(),
+            url: format!("https://youtu.be/{title}"),
+            video_id: title.to_string(),
+        }
+    }
+
+    /// A song whose audio is still arriving, which is what most queued songs
+    /// are: nothing is on disk yet, but the file the stream will be written to
+    /// has to be treated the same as one that is.
+    fn streaming(title: &str) -> Queued {
+        Queued {
+            source: Source::Stream {
+                url: format!("https://video.example/{title}"),
+                headers: HeaderMap::new(),
+                length: 1024,
+                cache: PathBuf::from(format!("/tmp/{title}.m4a")),
+            },
             title: title.to_string(),
             artist: "someone".to_string(),
             url: format!("https://youtu.be/{title}"),
@@ -426,6 +530,17 @@ mod tests {
         assert!(queue.in_use().is_empty());
     }
 
+    /// A stream's audio is not on disk when it is queued, but the file it is
+    /// being written to is exactly what a later request will read, so the cache
+    /// must keep it. Pruning it would make the repeat download the song again.
+    #[test]
+    fn in_use_keeps_the_cache_file_a_stream_is_being_written_to() {
+        let queue = Queue::default();
+        assert!(queue.push(streaming("streaming")));
+        assert_eq!(queue.in_use(), vec![PathBuf::from("/tmp/streaming.m4a")]);
+        assert_eq!(streaming("x").source.cache(), Path::new("/tmp/x.m4a"));
+    }
+
     #[test]
     fn the_thumbnail_comes_from_the_video_id() {
         let song = song("dQw4w9WgXcQ");
@@ -447,5 +562,79 @@ mod tests {
         .join();
 
         assert!(queue.push(song("after the panic")));
+    }
+    /// The point of repeat: a song that ends with nothing behind it plays
+    /// again, rather than the queue running dry.
+    #[test]
+    fn repeat_plays_a_song_again_when_nothing_is_queued_behind_it() {
+        let queue = Queue::default();
+        assert!(queue.push(song("only")));
+        assert!(queue.advance().current.is_some(), "the song is playing");
+        assert!(!queue.is_repeat(), "repeat is off to begin with");
+
+        assert!(queue.toggle_repeat(), "toggle turns it on");
+        let now = queue.advance();
+        assert_eq!(
+            now.stopped.expect("stopped song").title,
+            "only",
+            "the song that finished is the one reported as stopped"
+        );
+        assert_eq!(
+            now.current.expect("played again").title,
+            "only",
+            "and it is what plays next"
+        );
+    }
+
+    /// Repeat one is not repeat-all: a song that ends with others waiting plays
+    /// the next one, and only comes back when the list has run down.
+    #[test]
+    fn repeat_does_not_interrupt_the_queue_behind_the_song() {
+        let queue = Queue::default();
+        assert!(queue.toggle_repeat());
+        assert!(queue.push(song("first")));
+        assert!(queue.push(song("second")));
+        queue.advance();
+
+        let now = queue.advance();
+        assert_eq!(now.current.expect("the next song").title, "second");
+        assert_eq!(
+            queue.pending(),
+            0,
+            "the finished song did not jump the queue"
+        );
+
+        // The list has run down now, so the last song comes round again.
+        let now = queue.advance();
+        assert_eq!(now.current.expect("repeats last").title, "second");
+    }
+
+    /// Turning it off must actually stop it, or the button is a one-way door.
+    #[test]
+    fn turning_repeat_off_stops_the_song_coming_back() {
+        let queue = Queue::default();
+        assert!(queue.push(song("only")));
+        queue.advance();
+        assert!(queue.toggle_repeat());
+        assert!(!queue.toggle_repeat(), "the second press turns it off");
+
+        let now = queue.advance();
+        assert!(now.current.is_none(), "nothing left to play: {now:?}");
+        assert_eq!(queue.pending(), 0);
+    }
+
+    /// Stopping clears the queue. A repeat flag left on would otherwise put a
+    /// stopped song straight back.
+    #[test]
+    fn a_cleared_queue_does_not_resurrect_the_song_under_repeat() {
+        let queue = Queue::default();
+        assert!(queue.push(song("only")));
+        queue.advance();
+        assert!(queue.toggle_repeat());
+
+        queue.clear();
+        let now = queue.advance();
+        assert!(now.current.is_none(), "stop must beat repeat: {now:?}");
+        assert_eq!(queue.pending(), 0);
     }
 }

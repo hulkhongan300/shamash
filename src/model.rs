@@ -12,22 +12,24 @@ use std::path::{Path, PathBuf};
 
 /// The model both engines default to.
 ///
-/// Parakeet TDT 0.6B v2, the strong English model, held resident by the direct
-/// engine. It was picked by running both over real recordings from the Handy's
-/// cache: on the two that crossed the VAD gate the 110M model returned *empty
-/// text* and this one returned what was said, which is the whole difference
-/// between hearing a command and dropping it.
+/// Whisper large-v3-turbo, Q8_0. It is the strongest recogniser the Handy
+/// catalogue offers for general speech and it detects the language itself, so
+/// `ASR_LANGUAGE` is not needed for it. The previous default, Parakeet TDT
+/// 0.6B v2, was English-only and had to be chosen for being the best *English*
+/// model available.
 ///
-/// The earlier note here said the larger models "returned nothing at all" and
-/// sent the default back to 110M. That measurement was taken through the Handy
-/// subprocess, which reloads the model per utterance and cannot pass a language
-/// hint; it does not describe `ASR_ENGINE=direct`, where the model loads once at
-/// startup and `RunOptions::language` is available. Size costs nothing there.
+/// The cost is size and, without a GPU, latency: ~870 MB of weights against
+/// the Parakeet's ~600 MB, and a transformer decode rather than a
+/// frame-aligned one. On the CPU that is ~17 s for a short utterance, which is
+/// why `transcribe-cpp`'s `vulkan` feature is on; on the GPU it is ~1 s. It is
+/// still far quicker than the old `whisper-rs` route either way, because
+/// `ASR_ENGINE=direct` holds the model resident rather than reloading it per
+/// utterance.
 ///
 /// `ASR_ENGINE=handy` still prefers [`SMALL_MODEL_ID`], where a 600 ms load per
 /// command really is the dominant cost.
 pub const DEFAULT_MODEL_ID: &str =
-    "handy-computer/parakeet-tdt-0.6b-v2-gguf/parakeet-tdt-0.6b-v2-Q8_0.gguf";
+    "handy-computer/whisper-large-v3-turbo-gguf/whisper-large-v3-turbo-Q8_0.gguf";
 
 /// The fast-loading model, for the engine that pays to load one per utterance.
 pub const SMALL_MODEL_ID: &str =
