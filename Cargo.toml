@@ -9,6 +9,9 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.104"
+# Already in the graph via serenity/hyper, so adding it as a direct dependency
+# costs no new downloads. Used for `join_all` over the catalog fan-out.
+futures = "0.3.34"
 # Object-safe async for the swappable catalog provider trait. Already in the
 # dependency graph via serenity, so this adds no new transitive downloads.
 async-trait = "0.1.92"

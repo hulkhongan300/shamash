@@ -3154,6 +3154,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dotenvy",
+ "futures",
  "reqwest",
  "rphonetic",
  "serde",
