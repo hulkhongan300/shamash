@@ -482,12 +482,12 @@ fn markdown_escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::Queued;
+    use crate::queue::{Queued, Source};
     use std::path::PathBuf;
 
     fn song() -> Queued {
         Queued {
-            path: PathBuf::from("/tmp/track.m4a"),
+            source: Source::File(PathBuf::from("/tmp/track.m4a")),
             title: "A Song".to_string(),
             artist: "An Artist".to_string(),
             url: "https://youtu.be/abc".to_string(),

@@ -6,9 +6,10 @@
 //!
 //! [`advance`]: Queue::advance
 
+use reqwest::header::HeaderMap;
 use serenity::model::id::GuildId;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// How many songs one guild may have waiting.
@@ -16,11 +17,56 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// Unbounded, a long queue of downloads would fill the disk.
 pub const MAX_QUEUE: usize = 20;
 
+/// Where a queued song's audio comes from.
+///
+/// Two, because waiting for a whole download before the first sample is the
+/// larger half of the wait: a stream starts playing while the rest of it is
+/// still arriving, and the download carries on in the background into the cache
+/// so the next time this song is asked for it plays instantly. When the stream
+/// cannot be used -- YouTube refusing a URL that has expired, or a connection
+/// that never delivers -- the song plays from the file instead.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Source {
+    /// Audio already on disk.
+    File(PathBuf),
+    /// Audio at a URL, played as it arrives.
+    Stream {
+        /// The signed format URL. It expires, so it is a source that can fail
+        /// rather than one that always works.
+        url: String,
+        /// The headers the URL must be requested with. YouTube signs the URL
+        /// against the client that asked for it and answers 403 without them.
+        headers: HeaderMap,
+        /// How long the audio is, in bytes.
+        ///
+        /// Carried because the request cannot be made without it: YouTube serves
+        /// this URL only for a closed `range`, `bytes=0-<length-1>`, and
+        /// refuses a plain GET with 403.
+        length: u64,
+        /// The file the same audio is written to while it streams, and the one
+        /// a fallback plays if the stream turns out to be unusable.
+        cache: PathBuf,
+    },
+}
+
+impl Source {
+    /// The cache file this song's audio belongs in.
+    ///
+    /// For a stream that is where the background write is going, and for a
+    /// download that is where the audio already is. The cache must never prune
+    /// either.
+    pub fn cache(&self) -> &Path {
+        match self {
+            Source::File(path) | Source::Stream { cache: path, .. } => path,
+        }
+    }
+}
+
 /// One song waiting to play, or playing now.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Queued {
-    /// Downloaded audio on disk.
-    pub path: PathBuf,
+    /// The audio to play, and where it comes from.
+    pub source: Source,
     /// Title as shown on the dashboard.
     pub title: String,
     /// Uploading channel, shown as the artist line.
@@ -217,15 +263,17 @@ impl Queue {
     /// waiting behind it.
     ///
     /// Used by the cache to know which downloads it is not allowed to prune.
-    /// A queued song's file is read by songbird when it starts, so deleting it
-    /// because too many newer files arrived plays silence instead of the song.
+    /// A queued song's audio is read when it starts, so deleting it because too
+    /// many newer files arrived plays silence instead of the song. A stream's
+    /// cache file counts: it is the audio a later request and a repeat will
+    /// read without waiting for YouTube again.
     pub fn in_use(&self) -> Vec<PathBuf> {
         let state = self.lock();
         state
             .current
             .iter()
             .chain(state.pending.iter())
-            .map(|song| song.path.clone())
+            .map(|song| song.source.cache().to_path_buf())
             .collect()
     }
 }
@@ -251,7 +299,25 @@ mod tests {
 
     fn song(title: &str) -> Queued {
         Queued {
-            path: PathBuf::from(format!("/tmp/{title}.m4a")),
+            source: Source::File(PathBuf::from(format!("/tmp/{title}.m4a"))),
+            title: title.to_string(),
+            artist: "someone".to_string(),
+            url: format!("https://youtu.be/{title}"),
+            video_id: title.to_string(),
+        }
+    }
+
+    /// A song whose audio is still arriving, which is what most queued songs
+    /// are: nothing is on disk yet, but the file the stream will be written to
+    /// has to be treated the same as one that is.
+    fn streaming(title: &str) -> Queued {
+        Queued {
+            source: Source::Stream {
+                url: format!("https://video.example/{title}"),
+                headers: HeaderMap::new(),
+                length: 1024,
+                cache: PathBuf::from(format!("/tmp/{title}.m4a")),
+            },
             title: title.to_string(),
             artist: "someone".to_string(),
             url: format!("https://youtu.be/{title}"),
@@ -462,6 +528,17 @@ mod tests {
         );
         queue.clear();
         assert!(queue.in_use().is_empty());
+    }
+
+    /// A stream's audio is not on disk when it is queued, but the file it is
+    /// being written to is exactly what a later request will read, so the cache
+    /// must keep it. Pruning it would make the repeat download the song again.
+    #[test]
+    fn in_use_keeps_the_cache_file_a_stream_is_being_written_to() {
+        let queue = Queue::default();
+        assert!(queue.push(streaming("streaming")));
+        assert_eq!(queue.in_use(), vec![PathBuf::from("/tmp/streaming.m4a")]);
+        assert_eq!(streaming("x").source.cache(), Path::new("/tmp/x.m4a"));
     }
 
     #[test]

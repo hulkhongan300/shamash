@@ -202,6 +202,24 @@ impl Candidate {
         url_video_id(&self.url)
     }
 
+    /// The one upload a track that already knows its video stands for.
+    ///
+    /// Not a search result and never ranked against others: the provider named
+    /// this video as the song, so there is nothing to choose between and the
+    /// search is a second opinion nobody asked for. The catalog's own names
+    /// stand in for the title and channel, because they are what it said the
+    /// video is.
+    pub fn for_track(track: &CatalogTrack, video_id: &str) -> Self {
+        Self {
+            title: Some(track.title.clone()),
+            url: format!("https://www.youtube.com/watch?v={video_id}"),
+            view_count: None,
+            duration: track.duration_secs,
+            channel: Some(track.artist.clone()),
+            id: Some(video_id.to_string()),
+        }
+    }
+
     /// Whether the result looks like a song rather than a clip, cover, or mix.
     /// Whether this is worth ranking against `target`.
     ///
@@ -776,6 +794,7 @@ pub async fn resolve_request(
     rewrite: Option<&str>,
     library: Option<&library::Library>,
     guild_id: serenity::model::id::GuildId,
+    timing: &crate::timing::Timing,
 ) -> Resolved {
     let heard = request.query.clone();
 
@@ -791,7 +810,12 @@ pub async fn resolve_request(
 
     // The target carries every reading of the phrase, which is what the query
     // plan is built from; the caller keeps the request for its own text.
-    let mut hits = catalog.hits(&resolve::Target::from_request(request)).await;
+    let mut hits = timing
+        .stage(
+            "catalog.hits",
+            catalog.hits(&resolve::Target::from_request(request)),
+        )
+        .await;
 
     // Songs this guild has played before are candidates too, judged by the same
     // matcher as the catalog's own. They are added *after* the catalog so a
@@ -819,7 +843,7 @@ pub async fn resolve_request(
         (hit.artist.as_str(), hit.title.as_str())
     });
     if let Resolved::Track { .. } = decide(&verdict)
-        && let Some((rewritten, rewritten_hits)) = try_rewrite(catalog, rewrite).await
+        && let Some((rewritten, rewritten_hits)) = try_rewrite(catalog, rewrite, timing).await
     {
         let alternative = matcher::decide(&rewritten, &rewritten_hits, |hit: &resolve::Hit| {
             (hit.artist.as_str(), hit.title.as_str())
@@ -845,6 +869,7 @@ pub async fn resolve_request(
 async fn try_rewrite(
     catalog: &resolve::Catalog,
     rewrite: Option<&str>,
+    timing: &crate::timing::Timing,
 ) -> Option<(String, Vec<resolve::Hit>)> {
     let rewritten = rewrite
         .map(|text| text.trim())
@@ -858,8 +883,11 @@ async fn try_rewrite(
             .filter_map(|(title, artist)| Some((title?, artist?)))
             .collect(),
     };
-    let hits = catalog
-        .hits(&resolve::Target::from_request(&alternative))
+    let hits = timing
+        .stage(
+            "catalog.hits_rewrite",
+            catalog.hits(&resolve::Target::from_request(&alternative)),
+        )
         .await;
     Some((rewritten.to_string(), hits))
 }
@@ -914,14 +942,18 @@ pub async fn find_video(
     searcher: &dyn VideoSearch,
     candidate_count: usize,
     threshold: f64,
+    timing: &crate::timing::Timing,
 ) -> anyhow::Result<Choice> {
     let Resolved::Track { track, durations } = resolved else {
         anyhow::bail!("find_video needs a resolved song, not a question or nothing");
     };
     let target = Target::from_track(track, durations.clone(), requested);
     let query = target.search_query();
-    let candidates = searcher
-        .candidates(&query, candidate_count)
+    let candidates = timing
+        .stage(
+            "youtube_candidates",
+            searcher.candidates(&query, candidate_count),
+        )
         .await
         .with_context(|| format!("could not search YouTube for '{query}'"))?;
     anyhow::ensure!(
@@ -947,11 +979,15 @@ pub async fn find_unverified(
     searcher: &dyn VideoSearch,
     candidate_count: usize,
     threshold: f64,
+    timing: &crate::timing::Timing,
 ) -> anyhow::Result<Choice> {
     let target = Target::from_request(request);
     let query = target.search_query();
-    let candidates = searcher
-        .candidates(&query, candidate_count)
+    let candidates = timing
+        .stage(
+            "youtube_candidates",
+            searcher.candidates(&query, candidate_count),
+        )
         .await
         .with_context(|| format!("could not search YouTube for '{query}'"))?;
     anyhow::ensure!(
@@ -1093,6 +1129,7 @@ mod tests {
             duration_secs: Some(182.0),
             id: "1".to_string(),
             provider: "catalog",
+            video_id: None,
             popularity: None,
         };
         let target = Target::from_track(&track, vec![182.0], "hoolig by bts");
@@ -1655,6 +1692,7 @@ mod tests {
             duration_secs: duration,
             id: "1".to_string(),
             provider: "stub",
+            video_id: None,
             popularity: None,
         }
     }
@@ -1709,6 +1747,7 @@ mod tests {
             None,
             None,
             GuildId::new(1),
+            &crate::timing::Timing::default(),
         )
         .await;
         let track = resolved.as_track().expect("one song");
@@ -1731,6 +1770,7 @@ mod tests {
             None,
             None,
             GuildId::new(1),
+            &crate::timing::Timing::default(),
         )
         .await
         {
@@ -1754,7 +1794,8 @@ mod tests {
                 &catalog,
                 None,
                 None,
-                GuildId::new(1)
+                GuildId::new(1),
+                &crate::timing::Timing::default()
             )
             .await,
             Resolved::Unknown { .. }
@@ -1786,6 +1827,7 @@ mod tests {
             None,
             None,
             GuildId::new(1),
+            &crate::timing::Timing::default(),
         )
         .await;
         assert!(matches!(resolved, Resolved::Unknown { .. }));
@@ -1804,6 +1846,7 @@ mod tests {
             Some("dracula tame impala"),
             None,
             GuildId::new(1),
+            &crate::timing::Timing::default(),
         )
         .await;
         assert_eq!(
@@ -1827,6 +1870,7 @@ mod tests {
             Some("bohemian rhapsody queen"),
             None,
             GuildId::new(1),
+            &crate::timing::Timing::default(),
         )
         .await;
         assert_eq!(
@@ -1846,6 +1890,7 @@ mod tests {
             Some("hello there"),
             None,
             GuildId::new(1),
+            &crate::timing::Timing::default(),
         )
         .await;
         assert_eq!(
@@ -1875,6 +1920,7 @@ mod tests {
             &searcher,
             8,
             DEFAULT_MATCH_THRESHOLD,
+            &crate::timing::Timing::default(),
         )
         .await
         .expect("a result");
@@ -1912,6 +1958,7 @@ mod tests {
             &searcher,
             8,
             DEFAULT_MATCH_THRESHOLD,
+            &crate::timing::Timing::default(),
         )
         .await
         .expect("a result");
@@ -1941,6 +1988,7 @@ mod tests {
             &searcher,
             8,
             DEFAULT_MATCH_THRESHOLD,
+            &crate::timing::Timing::default(),
         )
         .await
         .expect("a result");
@@ -1966,9 +2014,15 @@ mod tests {
             "BANGTANTV",
         )];
         let searcher = FakeSearch::with(entries.to_vec());
-        let choice = find_unverified(&request("hoolig bts"), &searcher, 8, 0.0)
-            .await
-            .expect("a result");
+        let choice = find_unverified(
+            &request("hoolig bts"),
+            &searcher,
+            8,
+            0.0,
+            &crate::timing::Timing::default(),
+        )
+        .await
+        .expect("a result");
         assert!(!choice.confident);
         assert!(choice.best().is_some(), "but it is still offered");
     }
@@ -1982,10 +2036,17 @@ mod tests {
             durations: vec![205.0],
         };
         let searcher = FakeSearch::with(Vec::new());
-        let err = find_video(&resolved, "drakula", &searcher, 8, DEFAULT_MATCH_THRESHOLD)
-            .await
-            .expect_err("an empty search is a failure")
-            .to_string();
+        let err = find_video(
+            &resolved,
+            "drakula",
+            &searcher,
+            8,
+            DEFAULT_MATCH_THRESHOLD,
+            &crate::timing::Timing::default(),
+        )
+        .await
+        .expect_err("an empty search is a failure")
+        .to_string();
         assert!(err.contains("no results"), "unhelpful: {err}");
     }
 
@@ -2004,10 +2065,17 @@ mod tests {
             track: catalog_track("BTS", "Hooligan", Some(182.0)),
             durations: vec![182.0],
         };
-        let err = find_video(&resolved, "hoolig bts", &Broken, 8, DEFAULT_MATCH_THRESHOLD)
-            .await
-            .expect_err("a failed search is a failure")
-            .to_string();
+        let err = find_video(
+            &resolved,
+            "hoolig bts",
+            &Broken,
+            8,
+            DEFAULT_MATCH_THRESHOLD,
+            &crate::timing::Timing::default(),
+        )
+        .await
+        .expect_err("a failed search is a failure")
+        .to_string();
         assert_eq!(err, "could not search YouTube for 'BTS Hooligan'");
     }
 
@@ -2017,10 +2085,17 @@ mod tests {
     async fn a_question_cannot_be_turned_into_a_video() {
         let asked = Resolved::Ask(vec![catalog_track("Oasis", "Stand By Me", Some(254.0))]);
         let searcher = FakeSearch::with(vec![candidate("Stand By Me", Some(1), Some(254.0))]);
-        let err = find_video(&asked, "stand by me", &searcher, 8, DEFAULT_MATCH_THRESHOLD)
-            .await
-            .expect_err("a question is not a song")
-            .to_string();
+        let err = find_video(
+            &asked,
+            "stand by me",
+            &searcher,
+            8,
+            DEFAULT_MATCH_THRESHOLD,
+            &crate::timing::Timing::default(),
+        )
+        .await
+        .expect_err("a question is not a song")
+        .to_string();
         assert!(err.contains("a resolved song"), "unhelpful: {err}");
         assert!(
             searcher.seen.lock().unwrap().is_empty(),
@@ -2095,12 +2170,26 @@ mod tests {
             ("drakula tame impala", "Dracula"),
             ("hoolig bts", "Hooligan"),
         ] {
-            let resolved =
-                resolve_request(&request(heard), &catalog, None, None, GuildId::new(1)).await;
+            let resolved = resolve_request(
+                &request(heard),
+                &catalog,
+                None,
+                None,
+                GuildId::new(1),
+                &crate::timing::Timing::default(),
+            )
+            .await;
             assert!(resolved.as_track().is_some(), "{heard}: {resolved:?}");
-            let choice = find_video(&resolved, heard, &YtDlpSearch, 8, DEFAULT_MATCH_THRESHOLD)
-                .await
-                .unwrap_or_else(|e| panic!("{heard}: {e:#}"));
+            let choice = find_video(
+                &resolved,
+                heard,
+                &YtDlpSearch,
+                8,
+                DEFAULT_MATCH_THRESHOLD,
+                &crate::timing::Timing::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{heard}: {e:#}"));
             for scored in &choice.ranked {
                 println!(
                     "{:7.1} {:7.1}s {}",
@@ -2140,6 +2229,7 @@ mod tests {
                 id: "1".to_string(),
                 provider: "catalog",
                 popularity: None,
+                video_id: None,
             },
             durations: vec![205.0],
         };

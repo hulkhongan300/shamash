@@ -2,9 +2,10 @@ use crate::config::Config;
 use crate::dashboard;
 use crate::fetch;
 use crate::parser::PlayRequest;
-use crate::queue::{Advanced, Queue, Queued, Queues};
+use crate::queue::{Advanced, Queue, Queued, Queues, Source};
 use crate::resolve;
 use crate::search;
+use crate::timing::Timing;
 use anyhow::Context;
 use serenity::async_trait;
 use serenity::model::channel::ChannelType;
@@ -12,10 +13,9 @@ use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::prelude::Context as SerenityContext;
 use songbird::Songbird;
 use songbird::events::{Event, EventContext, EventHandler, TrackEvent};
-use songbird::input::{File as FileInput, Input};
+use songbird::input::{File as FileInput, HttpRequest, Input};
 use songbird::tracks::TrackHandle;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -194,6 +194,7 @@ pub trait AudioFetcher: Send + Sync {
         guild_id: GuildId,
         found: &search::Candidate,
         in_use: &[std::path::PathBuf],
+        timing: &Timing,
     ) -> anyhow::Result<Queued>;
 }
 
@@ -207,23 +208,25 @@ impl AudioFetcher for YtDlpFetch {
         guild_id: GuildId,
         found: &search::Candidate,
         in_use: &[std::path::PathBuf],
+        timing: &Timing,
     ) -> anyhow::Result<Queued> {
         // A video with no id cannot be cached or given a thumbnail, but the
         // audio is still worth playing.
         let video_id = found.video_id().unwrap_or_default().to_string();
-        // Downloaded before the song joins the queue, so a failed fetch leaves
+        // Resolved before the song joins the queue, so a failed fetch leaves
         // the queue and whatever is playing alone.
-        let path = fetch::fetch(
+        let source = fetch::fetch(
             &video_id,
             &found.url,
             &fetch::cache_dir(guild_id.get()),
             in_use,
+            timing,
         )
         .await
         .with_context(|| format!("could not fetch '{}'", found.title()))?;
 
         Ok(Queued {
-            path,
+            source,
             title: found.title().to_string(),
             artist: found.channel().to_string(),
             url: found.url.clone(),
@@ -436,7 +439,7 @@ impl Cancellation {
 
 /// A queued song waiting to be judged: kept, or skipped too fast to trust.
 ///
-/// Keyed by the audio file, so the judgement lands on the right song however
+/// Keyed by the video URL, so the judgement lands on the right song however
 /// many are queued behind it. Bounded by the queue, which is bounded.
 #[derive(Debug, Clone)]
 struct Pending {
@@ -449,25 +452,30 @@ struct Pending {
     from_chooser: bool,
 }
 
+/// The songs waiting to be judged, by video URL.
+///
+/// The URL rather than the audio file, because the file is not a stable name
+/// for a song: a streamed song has no file until its first play finishes, and
+/// one video can be fetched twice into two of them.
 #[derive(Debug, Clone, Default)]
-struct PendingLearn(Arc<Mutex<HashMap<std::path::PathBuf, Pending>>>);
+struct PendingLearn(Arc<Mutex<HashMap<String, Pending>>>);
 
 impl PendingLearn {
     #[allow(dead_code)]
-    fn set(&self, path: std::path::PathBuf, pending: Pending) {
+    fn set(&self, url: String, pending: Pending) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(path, pending);
+            .insert(url, pending);
     }
 
     /// Takes the judgement for a song, so it is made once however the song
     /// ended.
-    fn take(&self, path: &std::path::Path) -> Option<Pending> {
+    fn take(&self, url: &str) -> Option<Pending> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(path)
+            .remove(url)
     }
 }
 
@@ -541,6 +549,24 @@ impl Coordination {
     /// The only place a spoken request takes the playback lock, and it is taken
     /// after the search and the download rather than around them.
     async fn commit(
+        &self,
+        guild_id: GuildId,
+        queue: &Queue,
+        song: Queued,
+        started_at: u64,
+        timing: &Timing,
+    ) -> Commit {
+        timing
+            .stage(
+                "commit",
+                self.commit_locked(guild_id, queue, song, started_at),
+            )
+            .await
+    }
+
+    /// The body of [`Self::commit`], split out so the timing wrapper cannot be
+    /// skipped by one of the early returns inside it.
+    async fn commit_locked(
         &self,
         guild_id: GuildId,
         queue: &Queue,
@@ -703,6 +729,7 @@ impl Player {
         guild_id: GuildId,
         request: &PlayRequest,
         rewrite: Option<&str>,
+        timing: &Timing,
     ) -> anyhow::Result<()> {
         self.manager
             .get(guild_id)
@@ -710,7 +737,7 @@ impl Player {
 
         let heard = request.query.clone();
         match self
-            .resolve_and_queue(config, guild_id, request, rewrite)
+            .resolve_and_queue(config, guild_id, request, rewrite, timing)
             .await
         {
             Ok(Outcome::Asked { tracks }) => {
@@ -727,7 +754,8 @@ impl Player {
                 );
                 self.report(ctx, config, guild_id, &heard, &failure).await;
                 if config.unverified_chooser {
-                    self.offer_unverified(ctx, config, guild_id, request).await;
+                    self.offer_unverified(ctx, config, guild_id, request, timing)
+                        .await;
                 }
             }
             Ok(Outcome::Uploads(choice)) => {
@@ -736,7 +764,7 @@ impl Player {
                     .await
             }
             Ok(Outcome::Played { starting: true }) => {
-                self.start_next(ctx, config, guild_id).await;
+                self.start_next(ctx, config, guild_id, timing).await;
             }
             // Either way the dashboard is redrawn: a played song needs naming,
             // and a cancelled one may have moved the queue along underneath it.
@@ -825,6 +853,7 @@ impl Player {
         guild_id: GuildId,
         request: &PlayRequest,
         rewrite: Option<&str>,
+        timing: &Timing,
     ) -> Result<Outcome, Failure> {
         let queue = self.queues.get(guild_id);
         // Checked before searching, so a full queue fails without a download.
@@ -847,6 +876,7 @@ impl Player {
             rewrite,
             self.library.as_deref(),
             guild_id,
+            timing,
         )
         .await;
         if matches!(resolved, search::Resolved::Unknown { .. }) {
@@ -866,6 +896,7 @@ impl Player {
             &search::YtDlpSearch,
             config.search_candidates,
             config.match_threshold,
+            timing,
         )
         .await
         .map_err(|e| {
@@ -891,23 +922,29 @@ impl Player {
         // The request is being committed; record it for the learning that
         // happens when the song finishes (or is skipped).
         self.pending.set(
-            PathBuf::from(best.candidate.url.clone()),
+            best.candidate.url.clone(),
             Pending {
                 said: request.query.clone(),
                 track: crate::library::Track {
                     artist: resolved.as_track().unwrap().artist.clone(),
                     title: resolved.as_track().unwrap().title.clone(),
                     duration_secs: resolved.as_track().unwrap().duration_secs,
+                    // The upload that was chosen, not the catalog's: it is the
+                    // one that played, so a phrase heard again can go straight
+                    // to it.
+                    video_id: best.candidate.video_id().map(str::to_string),
                 },
                 from_chooser: false,
             },
         );
         let song = self
             .fetch
-            .fetch(guild_id, &best.candidate, &queue.in_use())
+            .fetch(guild_id, &best.candidate, &queue.in_use(), timing)
             .await
             .map_err(|e| Failure::new(Problem::FetchFailed, e))?;
-        Ok(self.outcome(guild_id, &queue, song, started_at).await)
+        Ok(self
+            .outcome(guild_id, &queue, song, started_at, timing)
+            .await)
     }
 
     /// Adds a downloaded song and reports what became of it.
@@ -917,10 +954,11 @@ impl Player {
         queue: &Queue,
         song: Queued,
         started_at: u64,
+        timing: &Timing,
     ) -> Outcome {
         match self
             .coordination
-            .commit(guild_id, queue, song, started_at)
+            .commit(guild_id, queue, song, started_at, timing)
             .await
         {
             Commit::Played { starting } => Outcome::Played { starting },
@@ -972,12 +1010,14 @@ impl Player {
         config: &Config,
         guild_id: GuildId,
         request: &PlayRequest,
+        timing: &Timing,
     ) {
         match search::find_unverified(
             request,
             &search::YtDlpSearch,
             config.search_candidates,
             config.match_threshold,
+            timing,
         )
         .await
         {
@@ -1020,7 +1060,10 @@ impl Player {
     pub async fn skip(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
         let lock = self.coordination.busy(guild_id);
         let _guard = lock.lock().await;
-        self.start_next(ctx, config, guild_id).await;
+        // Not part of any request, so nothing is timed: a song starting because
+        // the one before it ended is not anybody's time to first audio.
+        self.start_next(ctx, config, guild_id, &Timing::default())
+            .await;
     }
 
     /// Pauses the current song, or resumes it when already paused.
@@ -1068,7 +1111,13 @@ impl Player {
     ///
     /// The song that was playing is stopped, whether it ended on its own or
     /// was skipped.
-    async fn start_next(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
+    async fn start_next(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        timing: &Timing,
+    ) {
         let advanced = self.queues.get(guild_id).advance();
         // Whatever just stopped is the last word on whether the request that
         // queued it was a good one. Checked here rather than on a track event,
@@ -1078,7 +1127,15 @@ impl Player {
         if advanced.current.is_some() {
             self.started_at.set(guild_id, std::time::Instant::now());
         }
-        if let Some(handle) = start_track(&self.manager, guild_id, &advanced).await {
+        if let Some(handle) = start_track(
+            &self.manager,
+            guild_id,
+            &self.queues.get(guild_id),
+            &advanced,
+            timing,
+        )
+        .await
+        {
             self.tracks.set(guild_id, handle.clone());
             self.follow_when_finished(ctx, config, guild_id, handle, advanced.generation);
         }
@@ -1096,7 +1153,7 @@ impl Player {
         let (Some(stopped), Some(library)) = (stopped, self.library.as_deref()) else {
             return;
         };
-        let Some(pending) = self.pending.take(&stopped.path) else {
+        let Some(pending) = self.pending.take(&stopped.url) else {
             return;
         };
 
@@ -1178,7 +1235,15 @@ impl Player {
                 // stop after a single song.
                 generation = advanced.generation;
 
-                match start_track(&this.manager, guild_id, &advanced).await {
+                match start_track(
+                    &this.manager,
+                    guild_id,
+                    &this.queues.get(guild_id),
+                    &advanced,
+                    &Timing::default(),
+                )
+                .await
+                {
                     Some(handle) => {
                         this.tracks.set(guild_id, handle.clone());
                         // Watch the new song in turn, so the queue keeps
@@ -1267,6 +1332,25 @@ impl Player {
         query: &str,
         asker: UserId,
     ) -> anyhow::Result<usize> {
+        // Its own request, and its own summary line: a `/play` search is a
+        // catalog lookup and a message, not a half-finished playback.
+        let timing = Timing::default();
+        let searched = self
+            .search_and_ask_inner(ctx, config, guild_id, query, asker, &timing)
+            .await;
+        timing.log("/play search");
+        searched
+    }
+
+    async fn search_and_ask_inner(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        query: &str,
+        asker: UserId,
+        timing: &Timing,
+    ) -> anyhow::Result<usize> {
         // Typed words go through the same reading logic a spoken request does, so
         // "dracula by tame impala" searches the catalog the way it would have
         // if it had been said rather than typed.
@@ -1276,9 +1360,11 @@ impl Player {
             artist: None,
             splits: Vec::new(),
         };
-        let tracks: Vec<resolve::CatalogTrack> = self
-            .catalog
-            .hits(&resolve::Target::from_request(&request))
+        let tracks: Vec<resolve::CatalogTrack> = timing
+            .stage(
+                "catalog.hits",
+                self.catalog.hits(&resolve::Target::from_request(&request)),
+            )
             .await
             .iter()
             .map(|hit| hit.to_track())
@@ -1422,6 +1508,23 @@ impl Player {
         guild_id: GuildId,
         offer: Offer,
     ) -> anyhow::Result<()> {
+        // Pressing a button is a request of its own, with its own summary line.
+        let timing = Timing::default();
+        let played = self
+            .play_offer_inner(ctx, config, guild_id, offer, &timing)
+            .await;
+        timing.log("/play offer");
+        played
+    }
+
+    async fn play_offer_inner(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        offer: Offer,
+        timing: &Timing,
+    ) -> anyhow::Result<()> {
         // The user has already chosen the song by pressing this button, so the
         // best upload of it is taken even when the upload's own score is modest.
         // The hard part -- deciding which song it is -- was answered by the
@@ -1446,6 +1549,7 @@ impl Player {
                     // The user chose; the threshold is not what is in question
                     // any more.
                     0.0,
+                    timing,
                 )
                 .await
                 .with_context(|| "could not find that song on YouTube")?;
@@ -1461,15 +1565,26 @@ impl Player {
         let started_at = self.coordination.generations.get(guild_id).now();
         let song = self
             .fetch
-            .fetch(guild_id, &candidate, &self.queues.get(guild_id).in_use())
+            .fetch(
+                guild_id,
+                &candidate,
+                &self.queues.get(guild_id).in_use(),
+                timing,
+            )
             .await
             .context("could not download that song")?;
         let outcome = self
-            .outcome(guild_id, &self.queues.get(guild_id), song, started_at)
+            .outcome(
+                guild_id,
+                &self.queues.get(guild_id),
+                song,
+                started_at,
+                timing,
+            )
             .await;
 
         if matches!(outcome, Outcome::Played { starting: true }) {
-            self.start_next(ctx, config, guild_id).await;
+            self.start_next(ctx, config, guild_id, timing).await;
         } else {
             self.draw_dashboard(ctx, config, guild_id).await;
         }
@@ -1568,27 +1683,127 @@ impl EventHandler for Ended {
 
 /// Stops the song that was playing and starts the next one an advance chose.
 ///
-/// Returns `None` when the queue has run dry or the bot has left the voice
-/// channel. The finished song's file is left on disk: `fetch::prune` removes
-/// what is neither queued nor among the newest few, so deleting it here would
-/// only undo the cache that makes a repeated request instant.
+/// Plays the audio where it is: off YouTube for a song whose stream is still
+/// usable, off disk otherwise. Either way the audio is written to the cache as
+/// it goes, so the next time this song is asked for it does not wait for
+/// YouTube at all.
+///
+/// Returns `None` when the queue has run dry, the bot has left the voice
+/// channel, or the audio could not be fetched at all. The finished song's file
+/// is left on disk: `fetch::prune` removes what is neither queued nor among the
+/// newest few, so deleting it here would only undo the cache that makes a
+/// repeated request instant.
 ///
 /// The call is locked with `await` rather than `blocking_lock`, which panics
 /// when it is reached from inside a runtime thread.
 async fn start_track(
     manager: &Songbird,
     guild_id: GuildId,
+    queue: &Queue,
     advanced: &Advanced,
+    timing: &Timing,
 ) -> Option<TrackHandle> {
-    match (manager.get(guild_id), &advanced.current) {
-        (Some(call), Some(song)) => {
-            let mut handler = call.lock().await;
-            handler.stop();
-            tracing::info!(guild_id = %guild_id, title = %song.title, "playing");
-            let path = song.path.clone();
-            Some(handler.play_input(Input::from(FileInput::new(path))))
+    let started = std::time::Instant::now();
+    let call = manager.get(guild_id)?;
+    let song = advanced.current.as_ref()?;
+    // Stopped before the source is resolved, because resolving one can mean a
+    // download: the song the listener skipped has to stop being audible at once
+    // rather than when the next one is ready.
+    call.lock().await.stop();
+
+    let in_use = queue.in_use();
+    let source = match fetch::resolve(&song.source, &song.url, &in_use, timing).await {
+        Ok(source) => source,
+        Err(e) => {
+            tracing::warn!(
+                guild_id = %guild_id,
+                title = %song.title,
+                error = %format!("{e:#}"),
+                "this song has no audio to play"
+            );
+            return None;
         }
-        _ => None,
+    };
+
+    // Filled while the song plays, so a repeat or a later request for it finds
+    // it on disk. Detached because nobody is waiting on the cache: playback has
+    // already begun by the time this finishes. It is a second transfer of audio
+    // songbird is already receiving, which is the price of a repeat being
+    // instant.
+    if let Some(stream) = fetch::Streamable::of(&song.source) {
+        let Source::Stream { cache, .. } = &song.source else {
+            unreachable!("a stream always carries a cache path")
+        };
+        let (cache, watch_url) = (cache.clone(), song.url.clone());
+        let in_use = in_use.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                fetch::save(&stream, &cache, &watch_url, &in_use, &Timing::default()).await
+            {
+                tracing::warn!(
+                    cache = %cache.display(),
+                    error = %format!("{e:#}"),
+                    "the streamed audio could not be cached, so a repeat will fetch it again"
+                );
+            }
+        });
+    }
+
+    let (input, route) = match &source {
+        Source::Stream {
+            url,
+            headers,
+            length,
+            ..
+        } => {
+            let mut request =
+                HttpRequest::new_with_headers(reqwest::Client::new(), url.clone(), headers.clone());
+            // The one thing that makes this URL work at all: YouTube serves it
+            // only for a closed range, and songbird only sends one when it
+            // knows how long the audio is. Without this every stream is a 403
+            // and every song falls back to being downloaded.
+            request.content_length = Some(*length);
+            (Input::from(request), "stream")
+        }
+        Source::File(path) => (Input::from(FileInput::new(path.clone())), "file"),
+    };
+    timing.set_route(route);
+    tracing::info!(guild_id = %guild_id, title = %song.title, route, "playing");
+
+    let handle = call.lock().await.play_input(input);
+    let _ = handle.add_event(
+        Event::Track(TrackEvent::Playable),
+        FirstAudio {
+            started,
+            route,
+            title: song.title.clone(),
+        },
+    );
+    Some(handle)
+}
+
+/// Reports how long a song took to produce its first audio.
+///
+/// `Playable` is the first moment songbird has decoded the source and has audio
+/// to mix, which is what "time to first audio" means here: the request's own
+/// summary line stops when the track is handed over, and this is the rest of it.
+struct FirstAudio {
+    started: std::time::Instant,
+    /// `stream` or `file`, so the log says which path the number came from.
+    route: &'static str,
+    title: String,
+}
+
+#[async_trait]
+impl EventHandler for FirstAudio {
+    async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
+        tracing::info!(
+            title = %self.title,
+            route = self.route,
+            time_to_first_audio_ms = self.started.elapsed().as_millis() as u64,
+            "first audio"
+        );
+        None
     }
 }
 
@@ -1767,7 +1982,12 @@ mod tests {
             coordination: coordination.clone(),
         };
         probe
-            .fetch(guild, &candidate("https://youtu.be/x"), &[])
+            .fetch(
+                guild,
+                &candidate("https://youtu.be/x"),
+                &[],
+                &Timing::default(),
+            )
             .await
             .unwrap();
     }
@@ -1785,7 +2005,13 @@ mod tests {
         coordination.cancel(guild);
 
         let outcome = coordination
-            .commit(guild, &queue, queued("Dracula"), started_at)
+            .commit(
+                guild,
+                &queue,
+                queued("Dracula"),
+                started_at,
+                &Timing::default(),
+            )
             .await;
         assert_eq!(
             outcome,
@@ -1806,7 +2032,13 @@ mod tests {
 
         assert_eq!(
             coordination
-                .commit(guild, &queue, queued("Dracula"), started_at)
+                .commit(
+                    guild,
+                    &queue,
+                    queued("Dracula"),
+                    started_at,
+                    &Timing::default()
+                )
                 .await,
             Commit::Played { starting: true }
         );
@@ -1822,11 +2054,23 @@ mod tests {
         let (_serialised, started_at) = coordination.begin(guild).await;
 
         coordination
-            .commit(guild, &queue, queued("First"), started_at)
+            .commit(
+                guild,
+                &queue,
+                queued("First"),
+                started_at,
+                &Timing::default(),
+            )
             .await;
         assert_eq!(
             coordination
-                .commit(guild, &queue, queued("Second"), started_at)
+                .commit(
+                    guild,
+                    &queue,
+                    queued("Second"),
+                    started_at,
+                    &Timing::default()
+                )
                 .await,
             Commit::Played { starting: false }
         );
@@ -1845,7 +2089,13 @@ mod tests {
         let (_serialised, started_at) = coordination.begin(guild).await;
         assert_eq!(
             coordination
-                .commit(guild, &queue, queued("Dracula"), started_at)
+                .commit(
+                    guild,
+                    &queue,
+                    queued("Dracula"),
+                    started_at,
+                    &Timing::default()
+                )
                 .await,
             Commit::Played { starting: true }
         );
@@ -1910,7 +2160,13 @@ mod tests {
 
         assert_eq!(
             coordination
-                .commit(guild, &queue, queued("Dracula"), started_at)
+                .commit(
+                    guild,
+                    &queue,
+                    queued("Dracula"),
+                    started_at,
+                    &Timing::default()
+                )
                 .await,
             Commit::QueueFull
         );
@@ -1928,6 +2184,7 @@ mod tests {
             guild_id: GuildId,
             found: &search::Candidate,
             _in_use: &[std::path::PathBuf],
+            _timing: &Timing,
         ) -> anyhow::Result<Queued> {
             let lock = self.coordination.busy(guild_id);
             let guard = tokio::time::timeout(Duration::from_millis(500), lock.lock_owned())
@@ -1941,7 +2198,7 @@ mod tests {
     /// A song already in hand, as `commit` receives one.
     fn queued(title: &str) -> Queued {
         Queued {
-            path: std::path::PathBuf::from(format!("/tmp/{title}.m4a")),
+            source: Source::File(std::path::PathBuf::from(format!("/tmp/{title}.m4a"))),
             title: title.to_string(),
             artist: "someone".to_string(),
             url: "https://youtu.be/only".to_string(),
@@ -2260,6 +2517,7 @@ mod tests {
                 id: String::new(),
                 provider: "catalog",
                 popularity: None,
+                video_id: None,
             },
             requested: "dracula".to_string(),
         }
