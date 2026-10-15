@@ -47,7 +47,7 @@ Parser: "play <title> by <artist>" → search query
         ▼
 Catalog (Deezer): the song's real artist, title and length
         ▼
-yt-dlp search, scored against that length ──► per-song file ──► songbird playback
+yt-dlp search, scored against that length ──► stream, cached per song ──► songbird
         │
         ├──► if no result is convincing enough, three buttons to pick from
         ▼
@@ -463,10 +463,25 @@ without that check anyone who could read it could stop someone else's music.
 `/stop` is separate: it also leaves the voice channel, so the bot stops
 transcribing until someone comes back.
 
-Each song is downloaded to its own file, named after its video id, so a
-request can never be served the audio of an earlier one. The newest few
-downloads are kept and the rest pruned, which keeps a repeated request
-instant and stops the cache growing without bound.
+Each song is cached under its own video id, so a request can never be served
+the audio of an earlier one. The newest few downloads are kept and the rest
+pruned, which keeps a repeated request instant and stops the cache growing
+without bound.
+
+A song usually does not wait to be cached before it plays. One yt-dlp
+extraction says which formats the video publishes, and the one symphonia can
+decode — the AAC in an MP4; symphonia 0.5 has no Opus decoder — is played
+straight off YouTube while the rest of it is written to the cache in the
+background. That is what moves the first sample from "after the whole file" to
+"after the first few kilobytes": on a ten-song cold benchmark the median drops
+from about 2.2 s to about 1.8 s, and the songs that stream need only ~8 KiB to
+start.
+
+Streaming is the fast path, not the only one. The URL is signed and expires,
+so before playback the bot asks for the same range playback will ask for: a
+403, or a connection that delivers nothing within 2.5 s, and the song is
+downloaded and played from the cache instead. Each request logs which path ran
+and how long it took to first audio.
 
 ## Testing without Discord
 

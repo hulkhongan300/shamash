@@ -77,6 +77,14 @@ pub struct Track {
     pub artist: String,
     pub title: String,
     pub duration_secs: Option<f64>,
+    /// The YouTube video this song is on, when one is known.
+    ///
+    /// Stored so a phrase heard again goes straight to the download instead of
+    /// through the catalog and a YouTube search a second time. Optional and
+    /// omitted when empty, so a library written before this existed still reads
+    /// and is only worth one lookup less per alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_id: Option<String>,
 }
 
 impl Track {
@@ -85,6 +93,7 @@ impl Track {
             artist: track.artist.clone(),
             title: track.title.clone(),
             duration_secs: track.duration_secs,
+            video_id: track.video_id.clone(),
         }
     }
 
@@ -101,6 +110,7 @@ impl Track {
             id: String::new(),
             provider: "library",
             popularity: None,
+            video_id: self.video_id.clone(),
         }
     }
 
@@ -114,6 +124,8 @@ impl Track {
             duration_uncertain: false,
             agreement,
             popularity: None,
+            video_id: self.video_id.clone(),
+            video_provider: "library",
         }
     }
 }
@@ -452,6 +464,7 @@ mod tests {
             artist: artist.to_string(),
             title: title.to_string(),
             duration_secs: Some(205.0),
+            video_id: None,
         }
     }
 
@@ -748,6 +761,7 @@ mod tests {
                 artist: "Adele".into(),
                 title: "  ".into(),
                 duration_secs: None,
+                video_id: None,
             },
             false,
         );
