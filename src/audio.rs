@@ -64,75 +64,6 @@ pub fn rms(frame: &[f32]) -> f32 {
     mean_square.sqrt()
 }
 
-/// Voice-activity detection: accumulates speech and yields complete
-/// utterances on silence gaps.
-#[derive(Debug)]
-pub struct VadBuffer {
-    frame_samples: usize,
-    threshold: f32,
-    gap_frames: usize,
-    max_frames: usize,
-    buffer: Vec<f32>,
-    silent_streak: usize,
-    in_utterance: bool,
-}
-
-impl VadBuffer {
-    /// `frame_samples` is the size of one pushed frame (e.g. 20 ms at the
-    /// pipelined sample rate). `threshold` is the frame [`rms`] below which a
-    /// frame counts as silence. `gap_frames` silence frames end an utterance.
-    /// `max_frames` forces a flush to bound utterance length.
-    pub fn new(frame_samples: usize, threshold: f32, gap_frames: usize, max_frames: usize) -> Self {
-        Self {
-            frame_samples,
-            threshold,
-            gap_frames,
-            max_frames,
-            buffer: Vec::new(),
-            silent_streak: 0,
-            in_utterance: false,
-        }
-    }
-
-    /// Feeds one frame; returns samples of a completed utterance, if any.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `frame` is not exactly `frame_samples` long.
-    pub fn push(&mut self, frame: &[f32]) -> Vec<f32> {
-        assert_eq!(
-            frame.len(),
-            self.frame_samples,
-            "VAD frame size mismatch: got {}, expected {}",
-            frame.len(),
-            self.frame_samples
-        );
-
-        if rms(frame) >= self.threshold {
-            self.buffer.extend_from_slice(frame);
-            self.in_utterance = true;
-            self.silent_streak = 0;
-            let frame_count = self.buffer.len() / self.frame_samples;
-            if frame_count >= self.max_frames {
-                return self.flush();
-            }
-        } else if self.in_utterance {
-            self.silent_streak += 1;
-            if self.silent_streak >= self.gap_frames {
-                return self.flush();
-            }
-        }
-        Vec::new()
-    }
-
-    fn flush(&mut self) -> Vec<f32> {
-        let samples = std::mem::take(&mut self.buffer);
-        self.in_utterance = false;
-        self.silent_streak = 0;
-        samples
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,23 +150,6 @@ mod tests {
         frame
     }
 
-    /// Background noise at roughly the level of a quiet room.
-    fn room_tone() -> Vec<f32> {
-        let mut frame: Vec<f32> = (0..FRAME)
-            .map(|i| {
-                // Golden-ratio sequence, so the "noise" is deterministic and a
-                // failure can be reproduced.
-                (i as f32 * 0.618_034).fract() * 2.0 - 1.0
-            })
-            .collect();
-        normalize(&mut frame, 0.003);
-        frame
-    }
-
-    fn silent_frame() -> Vec<f32> {
-        vec![0.0; FRAME]
-    }
-
     #[test]
     fn rms_of_a_pure_tone_is_its_amplitude_over_root_two() {
         let amplitude = 0.4;
@@ -277,67 +191,5 @@ mod tests {
             "mean square {mean_square} must fall under the threshold"
         );
         assert!(rms(&speech) > crate::listener::VAD_RMS_THRESHOLD);
-    }
-
-    #[test]
-    fn detects_speech_at_a_quiet_normal_speaking_level() {
-        let mut vad = VadBuffer::new(FRAME, crate::listener::VAD_RMS_THRESHOLD, 2, 100);
-        for _ in 0..5 {
-            assert!(vad.push(&speech_frame(0.05)).is_empty());
-        }
-        assert!(vad.push(&silent_frame()).is_empty());
-        let utterance = vad.push(&silent_frame());
-        assert_eq!(utterance.len(), 5 * FRAME, "quiet speech must be captured");
-    }
-
-    #[test]
-    fn ignores_room_tone() {
-        let mut vad = VadBuffer::new(FRAME, crate::listener::VAD_RMS_THRESHOLD, 2, 100);
-        for _ in 0..50 {
-            assert!(vad.push(&room_tone()).is_empty());
-        }
-    }
-
-    #[test]
-    fn flushes_utterance_on_silence_gap() {
-        let mut vad = VadBuffer::new(FRAME, 0.01, 2, 100);
-        for _ in 0..5 {
-            assert!(vad.push(&speech_frame(0.1)).is_empty());
-        }
-        assert!(vad.push(&silent_frame()).is_empty());
-        let utterance = vad.push(&silent_frame());
-        assert_eq!(utterance.len(), 5 * FRAME);
-    }
-
-    #[test]
-    fn leading_silence_is_discarded() {
-        let mut vad = VadBuffer::new(FRAME, 0.01, 2, 100);
-        for _ in 0..10 {
-            assert!(vad.push(&silent_frame()).is_empty());
-        }
-        for _ in 0..3 {
-            assert!(vad.push(&speech_frame(0.1)).is_empty());
-        }
-        assert!(vad.push(&silent_frame()).is_empty());
-        let utterance = vad.push(&silent_frame());
-        assert_eq!(utterance.len(), 3 * FRAME);
-        assert!(vad.push(&silent_frame()).is_empty());
-    }
-
-    #[test]
-    fn overflow_flushes_mid_speech() {
-        let mut vad = VadBuffer::new(FRAME, 0.01, 2, 4);
-        for _ in 0..3 {
-            assert!(vad.push(&speech_frame(0.1)).is_empty());
-        }
-        let utterance = vad.push(&speech_frame(0.1));
-        assert_eq!(utterance.len(), 4 * FRAME);
-    }
-
-    #[test]
-    #[should_panic(expected = "frame size mismatch")]
-    fn wrong_frame_size_panics() {
-        let mut vad = VadBuffer::new(FRAME, 0.01, 2, 100);
-        let _ = vad.push(&vec![0.5; 128]);
     }
 }

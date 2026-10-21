@@ -45,9 +45,9 @@ Discord voice (Opus @ 48 kHz) ──► songbird receive
         ▼
 Parser: "play <title> by <artist>" → search query
         ▼
-Catalog (Deezer): the song's real artist, title and length
+Catalog (YouTube Music): the song's real artist, title and length
         ▼
-yt-dlp search, scored against that length ──► stream, cached per song ──► songbird
+catalog video id, or yt-dlp search when it has none ──► stream, cached per song ──► songbird
         │
         ├──► if no result is convincing enough, three buttons to pick from
         ▼
@@ -202,11 +202,9 @@ Parakeet id if you only ever speak English and want the lower latency.
 | `LLM_ENDPOINT`    | no       | Ollama-compatible endpoint that rewrites a misheard transcript. Unset by default, which uses the words as heard |
 | `LLM_MODEL`       | no       | Model to ask at that endpoint (default `llama3.2`) |
 | `ALERT_CHANNEL_ID`| no       | Text channel for the now-playing dashboard and every other bot message (defaults to the server's system channel, then to the first text channel) |
-| `CATALOG_PROVIDER`| no       | Which music catalog resolves requests: `deezer` (default) or `itunes`. Both are keyless |
-| `CATALOG_MATCH_THRESHOLD` | no | How confident a catalog match must be to correct the transcript, 0–1 (default `0.62`) |
 | `MATCH_THRESHOLD` | no       | Lowest score a candidate may reach and still be played without asking, in points (default `90`) |
-| `ALLOW_UNVERIFIED_AUTOPLAY` | no | Play a video found *without* a catalog match instead of offering a choice (default `false`) |
 | `SEARCH_CANDIDATES` | no     | How many YouTube results a request is scored against, 1–50 (default `8`) |
+| `AMBIGUOUS_POLICY` | no | `ask` (default), `auto` (play the best match without asking; same-title recordings are settled by plays), or `popular` (settle a shared title by popularity) |
 
 A malformed value is a startup error rather than a silent default, so a typo in
 a threshold is reported instead of quietly reverting to the default. Each
@@ -276,20 +274,17 @@ that with more string matching against YouTube titles is guessing, because
 uploader-written titles are not a list of songs.
 
 A music catalog *is* a list of songs. Before anything is searched for, the
-request is resolved against one — `deezer` by default, `itunes` also available,
-neither needing a key — which returns the artist's own spelling of the title and
-the track's real running time. Both are fuzzy-matched against the transcript
-(lowercased, punctuation and "feat."/"remastered" noise stripped), and a match
-below `CATALOG_MATCH_THRESHOLD` is discarded in favour of the words that were
-actually heard.
+request is resolved against YouTube Music's songs search — one unauthenticated
+POST, no key or account — which returns the artist's own spelling of the title,
+the track's real running time, and the video id that carries its audio. The
+names are fuzzy-matched against the transcript (lowercased, punctuation and
+"feat."/"remastered" noise stripped), and a match that does not clear the
+matcher's threshold is discarded in favour of the words that were actually
+heard.
 
 The lookup is bounded at two seconds. It is an improvement on the raw transcript
-and must never be the reason a command goes unanswered, so a slow, failing or
-quota-exhausted catalog call falls back to searching the transcript rather than
-blocking. That covers every way a provider can fail, including the awkward one:
-Deezer reports a spent quota as **HTTP 200** with an `error` object in the body,
-so there is no status line to catch. The request continues on the words that
-were heard.
+and must never be the reason a command goes unanswered, so a slow or failing
+catalog call falls back to searching the transcript rather than blocking.
 
 A YouTube search returns whatever matched the words, and for a popular song that
 routinely includes other people's takes of it. Ranking those by view count picks
@@ -311,13 +306,15 @@ by popularity. Popularity is kept, log-scaled and capped, only to break ties
 between equally good uploads.
 
 Below `MATCH_THRESHOLD` the bot does not guess. It posts the three closest
-results in the alert channel as numbered buttons and waits.
+results in the alert channel as numbered buttons and waits. With
+`AMBIGUOUS_POLICY=auto`, a catalog match that is real but not decisive — two
+artists with the same title, say — plays the most-played recording of that
+title instead, so a spoken request can finish without a button press.
 
 When the catalog resolved nothing at all, *nothing* is played unasked — the
 threshold only decides the order the options are offered in. Without a verified
 running time the scorer has a title similarity and a view count and nothing else,
-and that is not enough to tell the studio recording from a remix of it, so
-`ALLOW_UNVERIFIED_AUTOPLAY=true` is the only way to get the old behaviour back.
+and that is not enough to tell the studio recording from a remix of it.
 
 Some titles are simply not distinctive. "Look at Me" has been recorded by
 Naughty Boy, Tems, The Neighbourhood and others, and a request that named no
@@ -364,7 +361,7 @@ resolution, the scores and the runner-up:
 
 ```
 wake model heard: "shamash play dracula"
-resolved against the catalog provider=deezer catalog=Dracula — Tame Impala
+resolved against the catalog catalog=Dracula — Tame Impala
   duration=Some(205.0) confidence=0.94 query=Tame Impala Dracula
 chose a video heard=drakula tame impala picked=Dracula channel=Tame Impala
   chosen=total 124.0 (duration +100.0, channel +30.0, relevance +18.0,
@@ -452,8 +449,11 @@ again, rather than the queue starting over. It does not interrupt the list — a
 song with others waiting still plays the next one.
 
 When the bot cannot tell which song was meant, it posts the three closest
-results in the same channel as numbered buttons and plays nothing. Pressing one
-plays that song; the others stay selectable until one is used.
+results in the same channel as numbered buttons and plays nothing. Each option
+shows the artist, the running time and its play count — YouTube Music's plays
+for a catalog song, the upload's views for an unverified result — so two
+recordings of one title can be told apart. Pressing one plays that song; the
+others stay selectable until one is used.
 
 Only members **currently in the voice channel the bot is playing in** can press
 any of these, or run `/stop`. Everyone else gets an ephemeral "join the voice
