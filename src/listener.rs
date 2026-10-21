@@ -1,14 +1,12 @@
-use crate::audio::{VadBuffer, rms};
+use crate::audio::rms;
 use serenity::async_trait;
 use songbird::EventHandler;
 use songbird::events::{Event, EventContext};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedSender;
 
-/// Sample rate (Hz) of the mono audio stream the listener consumes.
-pub const LISTEN_SAMPLE_RATE: u32 = 16_000;
-/// Samples per 20 ms frame at [`LISTEN_SAMPLE_RATE`].
+/// Samples per 20 ms frame at 16 kHz.
 pub const FRAME_SAMPLES: usize = 320;
 
 /// Frame [`rms`](crate::audio::rms) below which audio counts as silence.
@@ -20,75 +18,6 @@ pub const FRAME_SAMPLES: usize = 320;
 /// `cargo run --release --example transcribe -- recording.wav`, which prints
 /// the peak frame level against this gate.
 pub const VAD_RMS_THRESHOLD: f32 = 0.02;
-/// Silence frames that end an utterance: 25 x 20 ms = 500 ms.
-///
-/// Speaking "bot play lofi hip hop" leaves a short pause before the title, and
-/// a 300 ms gap cut the command in half, sending "play" and the search terms to
-/// two different transcriptions. 500 ms survives a mid-sentence pause while
-/// still cutting the speaker off promptly once they stop.
-pub const VAD_GAP_FRAMES: usize = 25;
-/// Hard cap on one utterance: 600 x 20 ms = 12 s.
-pub const VAD_MAX_FRAMES: usize = 600;
-
-/// Accumulates received frames into complete speech utterances.
-#[derive(Debug)]
-pub struct Listener {
-    vad: VadBuffer,
-    /// Samples of a tick that did not divide evenly into `FRAME_SAMPLES`.
-    ///
-    /// Songbird fires a tick per timer interval and packs however many 20 ms
-    /// packets arrived into it, so a tick is 320 samples only while the
-    /// connection is quiet. While somebody transmits it is regularly 960 or
-    /// 1920 samples, and any remainder has to be carried into the next tick or
-    /// the frame boundaries drift out of alignment with the audio.
-    leftover: Vec<f32>,
-}
-
-impl Listener {
-    pub fn new() -> Self {
-        Self {
-            vad: VadBuffer::new(
-                FRAME_SAMPLES,
-                VAD_RMS_THRESHOLD,
-                VAD_GAP_FRAMES,
-                VAD_MAX_FRAMES,
-            ),
-            leftover: Vec::new(),
-        }
-    }
-
-    /// Feeds one 20 ms mono frame; returns a completed utterance, if any.
-    pub fn push_frame(&mut self, samples: &[f32]) -> Option<Vec<f32>> {
-        self.push_samples(samples)
-    }
-
-    /// Feeds however many samples one tick carried, splitting them into 20 ms
-    /// frames; returns a completed utterance, if any.
-    ///
-    /// A tick can hold any whole number of 20 ms packets, so the samples are
-    /// buffered until whole frames can be handed to the detector. Only the first
-    /// utterance of a tick is returned: the detector can only end one, and the
-    /// samples after it are the start of the next.
-    pub fn push_samples(&mut self, samples: &[f32]) -> Option<Vec<f32>> {
-        self.leftover.extend_from_slice(samples);
-        let mut completed = None;
-        while self.leftover.len() >= FRAME_SAMPLES {
-            let rest = self.leftover.split_off(FRAME_SAMPLES);
-            let frame = std::mem::replace(&mut self.leftover, rest);
-            let utterance = self.vad.push(&frame);
-            if completed.is_none() && !utterance.is_empty() {
-                completed = Some(utterance);
-            }
-        }
-        completed
-    }
-}
-
-impl Default for Listener {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Mixes per-speaker i16 frames into a single normalized f32 frame.
 ///
@@ -306,22 +235,9 @@ fn frame_for_tick(mixed: Vec<f32>) -> Vec<f32> {
     }
 }
 
-/// Consumes frames until the channel closes, invoking `on_utterance` for each
-/// completed utterance. The task exits once the voice call (and its sender)
-/// is torn down.
-pub async fn run_listener(mut rx: UnboundedReceiver<Vec<f32>>, on_utterance: impl Fn(Vec<f32>)) {
-    let mut listener = Listener::new();
-    while let Some(frame) = rx.recv().await {
-        if let Some(utterance) = listener.push_samples(&frame) {
-            on_utterance(utterance);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
 
     /// A 20 ms frame at 16 kHz, quiet enough to sit below the gate.
     fn quiet_frame() -> Vec<f32> {
@@ -340,46 +256,6 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_packet_tick_is_split_into_frames_instead_of_panicking() {
-        // The failure this prevents: a tick carrying six 20 ms packets reached
-        // the detector whole, and its frame length assertion took the process
-        // down. Only a single quiet tick is the same size as one frame.
-        let mut listener = Listener::new();
-        let tick = vec![0.2f32; FRAME_SAMPLES * 6];
-        assert!(listener.push_samples(&tick).is_none());
-
-        // 30 quiet frames close the 25 frame gap opened by that tick.
-        let mut ended = None;
-        for _ in 0..VAD_GAP_FRAMES {
-            ended = listener.push_samples(&frame_for_tick(Vec::new()));
-            if ended.is_some() {
-                break;
-            }
-        }
-        let utterance = ended.expect("utterance must survive a multi-packet tick");
-        assert_eq!(utterance.len(), FRAME_SAMPLES * 6);
-    }
-
-    #[test]
-    fn a_tick_whose_length_is_not_a_multiple_of_a_frame_is_reassembled() {
-        let mut listener = Listener::new();
-        // Two frames plus half a frame, split across two ticks.
-        let odd = FRAME_SAMPLES * 2 + FRAME_SAMPLES / 2;
-        assert!(listener.push_samples(&vec![0.2f32; odd]).is_none());
-        assert!(listener.push_samples(&vec![0.2f32; odd]).is_none());
-
-        let mut ended = None;
-        for _ in 0..VAD_GAP_FRAMES {
-            ended = listener.push_samples(&frame_for_tick(Vec::new()));
-            if ended.is_some() {
-                break;
-            }
-        }
-        // The two half frames pair up, so all 5 whole frames survive.
-        assert_eq!(ended.expect("utterance").len(), FRAME_SAMPLES * 5);
-    }
-
-    #[test]
     fn a_tick_without_audio_forwards_silence_so_utterances_can_end() {
         let frame = frame_for_tick(Vec::new());
         assert_eq!(
@@ -391,24 +267,6 @@ mod tests {
             rms(&frame) < VAD_RMS_THRESHOLD,
             "the substitute must read as silence to the detector"
         );
-    }
-
-    #[test]
-    fn a_quieter_run_of_ticks_ends_an_utterance_that_audio_never_ended() {
-        // The failure this prevents: real audio arrives, Discord then goes
-        // quiet without sending silence, and no utterance is ever completed.
-        let mut listener = Listener::new();
-        for _ in 0..10 {
-            assert!(listener.push_frame(&speech_frame()).is_none());
-        }
-        for _ in 0..(VAD_GAP_FRAMES - 1) {
-            assert!(
-                listener.push_frame(&frame_for_tick(Vec::new())).is_none(),
-                "the gap must not close early"
-            );
-        }
-        let utterance = listener.push_frame(&frame_for_tick(Vec::new()));
-        assert_eq!(utterance.as_ref().map(Vec::len), Some(10 * FRAME_SAMPLES));
     }
 
     #[test]
@@ -585,48 +443,5 @@ mod tests {
         // checks the result is clamped rather than hard-set to -1.
         let almost = vec![i16::MIN + 1; 320];
         assert!(mix_frames(&[&almost])[0] > -1.0);
-    }
-
-    #[test]
-    fn isolates_utterances() {
-        let mut listener = Listener::new();
-        let loud = vec![0.5f32; 320];
-        let silent = vec![0.0f32; 320];
-        for _ in 0..5 {
-            assert!(listener.push_frame(&loud).is_none());
-        }
-        for _ in 0..(VAD_GAP_FRAMES - 1) {
-            assert!(listener.push_frame(&silent).is_none());
-        }
-        let utterance = listener.push_frame(&silent);
-        assert_eq!(utterance.as_ref().map(Vec::len), Some(5 * 320));
-    }
-
-    #[tokio::test]
-    async fn run_listener_yields_utterances() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
-        let utterances: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
-        let seen = utterances.clone();
-        let handle = tokio::spawn(async move {
-            run_listener(rx, move |utterance| {
-                seen.lock().unwrap().push(utterance.len());
-            })
-            .await;
-        });
-
-        let loud = vec![0.5f32; 320];
-        let silent = vec![0.0f32; 320];
-        for _ in 0..5 {
-            let _ = tx.send(loud.clone());
-        }
-        for _ in 0..(VAD_GAP_FRAMES + 1) {
-            let _ = tx.send(silent.clone());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        drop(tx);
-        let _ = handle.await;
-
-        let got = utterances.lock().unwrap().clone();
-        assert_eq!(got, vec![5 * 320]);
     }
 }

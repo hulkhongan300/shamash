@@ -23,7 +23,6 @@
 
 use crate::model;
 use crate::transcriber::Transcriber;
-use std::path::Path;
 use std::sync::Mutex;
 use transcribe_cpp::{Model, RunOptions, Session};
 
@@ -36,8 +35,6 @@ pub struct DirectTranscriber {
     /// A language hint, for the models that need one (Canary and Nemotron
     /// return empty text without it). `None` leaves detection to the model.
     language: Option<String>,
-    /// Kept for the startup log line; the session holds its own reference.
-    model_id: String,
 }
 
 impl DirectTranscriber {
@@ -109,13 +106,7 @@ impl DirectTranscriber {
         Ok(Self {
             session: Mutex::new(session),
             language: language.map(str::to_string),
-            model_id: model.to_string(),
         })
-    }
-
-    /// The model this transcriber was built from, for logging.
-    pub fn model_id(&self) -> &str {
-        &self.model_id
     }
 }
 
@@ -150,19 +141,6 @@ impl Transcriber for DirectTranscriber {
 
         Ok(transcript.text)
     }
-}
-
-/// The model id used when `PARAKEET_MODEL` is unset.
-pub fn default_model() -> &'static str {
-    model::DEFAULT_MODEL_ID
-}
-
-/// True when `path` looks like something [`DirectTranscriber::new`] can open.
-///
-/// Used by the startup check to explain a bad `PARAKEET_MODEL` before the bot
-/// joins a voice channel.
-pub fn model_exists(spec: &str) -> bool {
-    Path::new(spec).is_file() || model::resolve(spec).is_ok()
 }
 
 /// Checks a language hint against what a model advertises, without a model.

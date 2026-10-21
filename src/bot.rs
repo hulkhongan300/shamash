@@ -4,13 +4,16 @@ use crate::direct::DirectTranscriber;
 use crate::parakeet::HandyTranscriber;
 use crate::player::Player;
 use crate::resolve;
+use crate::search;
 use crate::state::{BigModelsKey, ConfigKey, HttpClientKey, PlayerKey, TranscriberKey};
 use crate::transcriber::Transcriber;
 use crate::voice::{VoiceService, decode_config};
 use crate::wake::BigModels;
+use serenity::all::AutocompleteChoice;
 use serenity::async_trait;
 use serenity::builder::{
-    CreateCommand, CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseMessage,
+    CreateAutocompleteResponse, CreateCommand, CreateCommandOption, CreateInteractionResponse,
+    CreateInteractionResponseMessage, EditInteractionResponse,
 };
 use serenity::model::application::{
     CommandInteraction, CommandOptionType, ComponentInteraction, Interaction, ResolvedValue,
@@ -21,6 +24,7 @@ use serenity::model::voice::VoiceState;
 use serenity::prelude::*;
 use songbird::SerenityInit;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub async fn start(config: Config) -> anyhow::Result<()> {
     // Two models, because they pay for being loaded differently. The wake model
@@ -105,9 +109,7 @@ fn log_configuration(config: &Config, big_models: &BigModels) {
         wake_words = %wake_words.join(", "),
         voice_channel = config.voice_channel_id,
         text_channel = %text_channel,
-        catalog_providers = %config.catalog_providers.join(","),
         resolve_budget_ms = config.resolve_budget.as_millis() as u64,
-        catalog_match_threshold = config.catalog_match_threshold,
         yt_dlp = %yt_dlp,
         "Shamash starting up"
     );
@@ -123,7 +125,8 @@ fn commands() -> Vec<CreateCommand> {
             .description("Search the catalog for a song and choose from the results")
             .add_option(
                 CreateCommandOption::new(CommandOptionType::String, "song", "What to search for")
-                    .required(true),
+                    .required(true)
+                    .set_autocomplete(true),
             ),
     ]
 }
@@ -231,8 +234,12 @@ impl EventHandler for Handler {
                 "stop" => self.slash_stop(&ctx, command).await,
                 _ => {}
             },
+            Interaction::Autocomplete(command) => {
+                if command.data.name.as_str() == "play" {
+                    self.slash_autocomplete_play(&ctx, command).await;
+                }
+            }
             Interaction::Component(button) => self.component(&ctx, button).await,
-            // Modal submissions and autocomplete have no dashboard buttons.
             _ => {}
         }
     }
@@ -375,6 +382,38 @@ impl Handler {
             return;
         }
 
+        // If the query is a specific video selected from autocomplete (or a direct URL),
+        // play it directly without needing another chooser.
+        if let Some(video_id) = search::url_video_id(&query) {
+            let _ = command.defer_ephemeral(&ctx.http).await;
+            match player
+                .play_direct(ctx, &config, guild_id, &query, video_id)
+                .await
+            {
+                Ok((title, starting)) => {
+                    let text = if starting {
+                        format!("Playing **{title}**")
+                    } else {
+                        format!("Queued **{title}**")
+                    };
+                    let _ = command
+                        .edit_response(&ctx.http, EditInteractionResponse::new().content(text))
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(guild_id = %guild_id, query = %query, error = %format!("{e:#}"), "could not play direct video");
+                    let _ = command
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new()
+                                .content(format!("Could not play that song: {e:#}")),
+                        )
+                        .await;
+                }
+            }
+            return;
+        }
+
         match player
             .search_and_ask(ctx, &config, guild_id, &query, command.user.id)
             .await
@@ -403,6 +442,60 @@ impl Handler {
                 )
                 .await;
             }
+        }
+    }
+
+    /// Answers slash command autocomplete queries for `/play song:<query>`,
+    /// displaying catalog suggestions in the top popup menu for arrow-key selection.
+    async fn slash_autocomplete_play(&self, ctx: &Context, command: CommandInteraction) {
+        let query = command
+            .data
+            .options
+            .iter()
+            .find(|opt| opt.name == "song")
+            .and_then(|opt| opt.value.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        if query.is_empty() {
+            let response = CreateInteractionResponse::Autocomplete(
+                CreateAutocompleteResponse::new().set_choices(Vec::new()),
+            );
+            let _ = command.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let Some((_config, player)) = ready(ctx).await else {
+            let response = CreateInteractionResponse::Autocomplete(
+                CreateAutocompleteResponse::new().set_choices(Vec::new()),
+            );
+            let _ = command.create_response(&ctx.http, response).await;
+            return;
+        };
+
+        let tracks = tokio::time::timeout(Duration::from_millis(2500), player.autocomplete(&query))
+            .await
+            .unwrap_or_default();
+
+        let choices: Vec<AutocompleteChoice> = tracks
+            .into_iter()
+            .take(25)
+            .map(|track| {
+                let name = format_autocomplete_name(&track);
+                let value = if let Some(video_id) = &track.video_id {
+                    format!("https://youtu.be/{video_id}")
+                } else {
+                    format!("{} by {}", track.title, track.artist)
+                };
+                AutocompleteChoice::new(name, value)
+            })
+            .collect();
+
+        let response = CreateInteractionResponse::Autocomplete(
+            CreateAutocompleteResponse::new().set_choices(choices),
+        );
+        if let Err(e) = command.create_response(&ctx.http, response).await {
+            tracing::debug!(error = %format!("{e:#}"), "failed to respond to autocomplete");
         }
     }
 
@@ -448,14 +541,6 @@ impl Handler {
     /// interaction that goes unanswered within three seconds and a skip may
     /// have to download nothing but still waits on the voice lock.
     async fn dashboard_button(&self, ctx: &Context, button: ComponentInteraction) {
-        // A choice button is not a playback action and would be rejected by
-        // `action_from_id`, so it is answered before the actions are read.
-        if dashboard::picked_key(&button.data.custom_id).is_some() {
-            // Left over from the previous chooser, which keyed its buttons by
-            // video id. The one chooser now numbers them instead.
-            tracing::debug!("ignoring a button from the superseded chooser");
-            return;
-        }
         let Some(action) = dashboard::action_from_id(&button.data.custom_id) else {
             // Some other component's press; not ours to answer.
             return;
@@ -514,16 +599,7 @@ impl Handler {
                 let repeat = player.toggle_repeat(ctx, &config, guild_id).await;
                 tracing::info!(guild_id = %guild_id, repeat, "toggled repeat");
             }
-            // "None of these": the listener said no, so the question goes.
-            // Handled after the player lookup because it is not a playback
-            // action and needs no dashboard.
-            dashboard::ACTION_NONE => {
-                if !player.dismiss_ask(guild_id) {
-                    return;
-                }
-                drop_question(ctx, button.channel_id, button.message.id, guild_id).await;
-            }
-            // `action_from_id` only returns the four above.
+            // `action_from_id` covers every live action above.
             _ => {}
         }
     }
@@ -604,5 +680,55 @@ async fn refuse(ctx: &Context, button: ComponentInteraction) {
     );
     if let Err(e) = button.create_response(&ctx.http, reply).await {
         tracing::warn!("could not refuse a button press: {e}");
+    }
+}
+
+/// Formats a catalog track for a Discord autocomplete choice label (max 100 characters).
+fn format_autocomplete_name(track: &resolve::CatalogTrack) -> String {
+    let mut name = format!("{} — {}", track.artist, track.title);
+    if let Some(duration) = track.duration_secs {
+        let total = duration.max(0.0) as u64;
+        let dur = format!(" ({}:{:02})", total / 60, total % 60);
+        if name.chars().count() + dur.chars().count() <= 100 {
+            name.push_str(&dur);
+        }
+    }
+    if name.chars().count() > 100 {
+        name = name.chars().take(97).collect::<String>() + "...";
+    }
+    name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autocomplete_name_includes_artist_title_and_duration() {
+        let track = resolve::CatalogTrack {
+            artist: "Queen".to_string(),
+            title: "Bohemian Rhapsody".to_string(),
+            duration_secs: Some(355.0),
+            popularity: None,
+            video_id: Some("fJ9rUzIMcZQ".to_string()),
+        };
+        assert_eq!(
+            format_autocomplete_name(&track),
+            "Queen — Bohemian Rhapsody (5:55)"
+        );
+    }
+
+    #[test]
+    fn autocomplete_name_clamps_to_100_chars() {
+        let track = resolve::CatalogTrack {
+            artist: "A".repeat(60),
+            title: "B".repeat(60),
+            duration_secs: Some(120.0),
+            popularity: None,
+            video_id: Some("123".to_string()),
+        };
+        let formatted = format_autocomplete_name(&track);
+        assert!(formatted.chars().count() <= 100);
+        assert!(formatted.ends_with("..."));
     }
 }

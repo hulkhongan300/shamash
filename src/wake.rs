@@ -38,9 +38,10 @@ pub const WAKE_WINDOW: Duration = Duration::from_millis(2000);
 /// How often the small model runs while somebody is speaking.
 ///
 /// This is the stage's whole cost, so it is the knob that decides how much CPU
-/// the always-on listener uses. Halving it halves the work and doubles how much
-/// of a quick shout can be missed between checks.
-pub const WAKE_HOP: Duration = Duration::from_millis(500);
+/// the always-on listener uses. 250 ms keeps the delay between saying the wake
+/// word and the acknowledgement short; the 110M wake model is cheap enough that
+/// checking twice as often costs little.
+pub const WAKE_HOP: Duration = Duration::from_millis(250);
 
 /// Silence frames the gate keeps checking for after speech stops: 25 x 20 ms.
 ///
@@ -201,6 +202,7 @@ impl WakeGate {
         self.remember(samples);
         if rms(samples) >= VAD_RMS_THRESHOLD {
             self.quiet = 0;
+            self.spoke = true;
         } else {
             self.quiet += frames_in(samples);
         }
@@ -215,7 +217,7 @@ impl WakeGate {
         // The model is never handed a window too short to hold a word, so the
         // first check after a burst of silence waits for real audio rather than
         // spending an inference on 20 ms of nothing.
-        if self.since_check < self.minimum {
+        if !self.spoke || self.since_check < self.minimum {
             return Step::Idle;
         }
         self.since_check = 0;
@@ -313,6 +315,7 @@ impl WakeGate {
         self.window.clear();
         self.quiet = 0;
         self.since_check = 0;
+        self.spoke = false;
     }
 }
 
@@ -418,15 +421,6 @@ impl BigModels {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Arc<dyn Transcriber>>> {
         self.loaded.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-impl std::fmt::Debug for BigModels {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BigModels")
-            .field("model", &self.model)
-            .field("loaded", &self.is_loaded())
-            .finish()
     }
 }
 

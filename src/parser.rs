@@ -25,6 +25,20 @@ const EXACT_MATCH_MAX_LEN: usize = 4;
 /// The command word that turns a phrase into a play request.
 const PLAY_VERB: &str = "play";
 
+/// Ways Whisper has actually written "play" in a live channel.
+///
+/// One edit covers "lay", "pley" and "paly", but not the two- and three-edit
+/// forms below. They are listed because a real request was refused on each:
+/// the wake gate heard "late" and the parser had nothing to treat as the verb.
+const PLAY_ALIASES: &[&str] = &["late", "plate"];
+
+/// Spoken asides Whisper appends after the request, which are not its title.
+///
+/// "play look at me, come on" arrived as "late look at me. come on"; the
+/// trailing frustration made the catalog search and the matcher both worse.
+/// A title that is only the aside ("play come on") is left alone.
+const TRAILING_ASIDES: &[&str] = &["come on"];
+
 /// Single-character mistakes tolerated in longer wake words.
 ///
 /// Speech-to-text reliably mangles a proper name — "shamash" can come back as
@@ -44,6 +58,11 @@ fn is_vowel(c: char) -> bool {
 /// enough that rejecting it makes the bot feel deaf, yet "not", "boy", "hot"
 /// and "top" all differ in a consonant and stay rejected.
 fn differs_by_one_vowel(left: &str, right: &str) -> bool {
+    // Two-letter wake words ("ut", "ot") must match exactly: otherwise the
+    // ordinary words "at" and "it" wake the bot anywhere in a sentence.
+    if left.chars().count() < 3 || right.chars().count() < 3 {
+        return false;
+    }
     let mut left = left.chars();
     let mut right = right.chars();
     let mut differences = 0;
@@ -82,6 +101,38 @@ fn edit_distance(left: &str, right: &str) -> usize {
         std::mem::swap(&mut previous, &mut current);
     }
     previous[right.len()]
+}
+
+/// Whether `word` is the play verb, allowing the damage speech-to-text does to
+/// a four-letter word: "play" comes back as "lay", "pley" or "paly".
+fn is_play_verb(word: &str) -> bool {
+    word == PLAY_VERB
+        || PLAY_ALIASES.contains(&word)
+        || (word.chars().count() >= 3 && edit_distance(word, PLAY_VERB) <= 1)
+}
+
+/// Drops a trailing aside, but only when a request precedes it and it starts
+/// on a word boundary, so "welcome on" does not become "wel".
+fn without_trailing_aside(text: &str) -> &str {
+    let mut text = text.trim_end();
+    loop {
+        let mut stripped = None;
+        for aside in TRAILING_ASIDES {
+            if let Some(prefix) = text.strip_suffix(aside)
+                && prefix.ends_with(' ')
+            {
+                let rest = prefix.trim_end();
+                if !rest.is_empty() {
+                    stripped = Some(rest);
+                    break;
+                }
+            }
+        }
+        match stripped {
+            Some(rest) => text = rest,
+            None => return text,
+        }
+    }
 }
 
 /// Why a transcript did not yield a play request.
@@ -170,15 +221,28 @@ impl CommandParser {
             .iter()
             .position(|w| self.is_wake_word(w))
             .ok_or(ParseMiss::NoWakeWord)?;
-        let play_at = if words[wake_idx] == PLAY_VERB {
-            wake_idx
-        } else {
-            words[wake_idx + 1..]
-                .iter()
-                .position(|w| *w == PLAY_VERB)
-                .map(|offset| wake_idx + 1 + offset)
-                .ok_or(ParseMiss::NoPlayVerb)?
-        };
+        // An exact "play" after the wake word wins, so "lay play despacito"
+        // keeps "play" out of the query. Only when there is none does a
+        // misheard verb count, including the wake word itself.
+        let play_at = words[wake_idx + 1..]
+            .iter()
+            .position(|w| *w == PLAY_VERB)
+            .map(|offset| wake_idx + 1 + offset)
+            .or_else(|| is_play_verb(words[wake_idx]).then_some(wake_idx))
+            .or_else(|| {
+                words[wake_idx + 1..]
+                    .iter()
+                    .position(|w| is_play_verb(w))
+                    .map(|offset| wake_idx + 1 + offset)
+            })
+            .ok_or(ParseMiss::NoPlayVerb)?;
+
+        // Only an exact "play" with nothing after it means "I am about to say
+        // the title": the pipeline arms itself to take the next utterance. A
+        // lone "late" is far more likely "I'm late" than a deliberate pause.
+        if play_at + 1 == words.len() && words[play_at] != PLAY_VERB {
+            return Err(ParseMiss::NoPlayVerb);
+        }
 
         Ok(words[play_at + 1..].join(" "))
     }
@@ -206,7 +270,7 @@ impl CommandParser {
         if self.is_wake_word(words[0]) {
             words.remove(0);
         }
-        if words.first() == Some(&PLAY_VERB) {
+        if words.first().is_some_and(|w| is_play_verb(w)) {
             words.remove(0);
         }
         build_request(&words.join(" ")).map(|request| request.query)
@@ -225,7 +289,7 @@ impl CommandParser {
 
 /// Turns the text after "play" into a request, or `None` if there is none.
 fn build_request(rest: &str) -> Option<PlayRequest> {
-    let rest = rest.trim();
+    let rest = without_trailing_aside(rest.trim());
     if rest.is_empty() {
         return None;
     }
@@ -405,6 +469,42 @@ mod tests {
             .unwrap();
         assert_eq!(req.query, "bohemian rhapsody");
         assert_eq!(req.title, None);
+    }
+
+    /// The live failure this pair of fixes came from: the wake gate fired on
+    /// "late", Whisper ended the request with "come on", and nothing played.
+    #[test]
+    fn a_late_for_play_and_a_trailing_come_on_still_parse() {
+        let parser = CommandParser::new(["bot", "play", "plate", "lay"].map(str::to_string));
+        let req = parser.parse("late look at me. come on").unwrap();
+        assert_eq!(req.query, "look at me");
+    }
+
+    /// A lone misheard verb must not arm the "next utterance is the title"
+    /// path; only an exact "play" pause does that.
+    #[test]
+    fn a_lone_misheard_play_does_not_arm_the_next_utterance() {
+        let parser = CommandParser::new(["bot", "play", "plate", "lay"].map(str::to_string));
+        assert_eq!(parser.parse_with_reason("late"), Err(ParseMiss::NoPlayVerb));
+        assert_eq!(
+            parser.parse_with_reason("i'm late"),
+            Err(ParseMiss::NoPlayVerb)
+        );
+        assert_eq!(
+            parser.parse_with_reason("play"),
+            Err(ParseMiss::EmptyRequest)
+        );
+    }
+
+    /// A title that is only the aside, or merely ends in those letters, is
+    /// never eaten: "come on" and "welcome on" are both plausible queries.
+    #[test]
+    fn a_title_that_looks_like_the_aside_is_kept() {
+        assert_eq!(parser().parse("bot play come on").unwrap().query, "come on");
+        assert_eq!(
+            parser().parse("bot play welcome on").unwrap().query,
+            "welcome on"
+        );
     }
 
     #[test]
@@ -669,19 +769,21 @@ mod tests {
         );
     }
 
-    /// Only "play" gets the bare-command shortcut. Every other wake word still
-    /// has to be followed by the verb, so adding a name to WAKE_WORDS does not
-    /// make ordinary sentences starting with that name trigger a search.
+    /// A wake word that is also a misheard "play" is both, so the common
+    /// "lay despacito" and "late look at me" transcripts work.
     #[test]
-    fn other_wake_words_still_require_the_play_verb() {
+    fn a_misheard_play_wake_word_is_also_the_verb() {
         let parser = CommandParser::new(["lay", "plate"].into_iter().map(str::to_string));
         assert_eq!(
-            parser.parse_with_reason("lay despacito"),
-            Err(ParseMiss::NoPlayVerb)
+            parser.parse_with_reason("lay despacito").unwrap().query,
+            "despacito"
+        );
+        assert_eq!(
+            parser.parse_with_reason("plate despacito").unwrap().query,
+            "despacito"
         );
         // "a silver plate" does contain the wake word, so it gets as far as
-        // wanting a verb. Either miss rejects it, which is the point: neither
-        // ordinary sentence becomes a request.
+        // wanting a verb; it has none, so it is rejected.
         assert!(parser.parse("a silver plate").is_none());
         assert!(parser.parse("i was laying the table").is_none());
         assert_eq!(
@@ -745,6 +847,8 @@ mod tests {
         assert!(!differs_by_one_vowel("hot", "bot"));
         assert!(!differs_by_one_vowel("but", "bots"));
         assert!(!differs_by_one_vowel("but", "bu"));
+        assert!(!differs_by_one_vowel("at", "ut"));
+        assert!(!differs_by_one_vowel("it", "ot"));
     }
 
     #[test]

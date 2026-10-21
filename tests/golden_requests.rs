@@ -574,12 +574,12 @@ fn golden() -> Vec<Case> {
 ///
 /// Every one of these is a case where nothing in the request distinguishes the
 /// song from its neighbours without a catalog lookup the matcher cannot do.
-/// All are rescued downstream -- by the artist-only query, MusicBrainz's fuzzy
-/// search, the LLM rewrite, or by offering the user a choice -- and none is
-/// played on a guess.
+/// All are rescued downstream -- by the artist-only query, YouTube Music's
+/// spell-correcting search, the LLM rewrite, or by offering the user a choice --
+/// and none is played on a guess.
 const EXPECTED_REFUSALS: [(&str, &str); 5] = [
     // "22" is two characters; the request said "twenty two". No string metric
-    // bridges a number and its words, and Deezer's strict filter will not find
+    // bridges a number and its words, and the catalog search will not find
     // "22" from "twenty two" either.
     ("twenty two by taylor swift", "the title is digits"),
     // The transcript said "jimi hendrix"; the catalog says "The Jimi Hendrix

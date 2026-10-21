@@ -5,8 +5,7 @@
 
 use crate::queue::Queued;
 use serenity::builder::{
-    CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter,
-    CreateMessage, EditMessage,
+    CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, CreateMessage, EditMessage,
 };
 use serenity::model::application::ButtonStyle;
 
@@ -14,10 +13,6 @@ use serenity::model::application::ButtonStyle;
 ///
 /// The guild is not encoded: a press already arrives with the guild attached.
 const PREFIX: &str = "shamash";
-
-/// Marks a custom id as a "which song did you mean" button, which names a
-/// video rather than an action.
-const PICK_PREFIX: &str = "pick";
 
 /// Buttons, in the order they are shown.
 pub const ACTION_PAUSE: &str = "pause";
@@ -53,13 +48,6 @@ const ASK_PREFIX: &str = "ask";
 /// for the next-page and dismiss buttons on a row of their own.
 pub const ASK_PAGE: usize = 9;
 
-/// The button on a chooser that means "none of these".
-///
-/// A question with no way to say no is a question that has to be answered. The
-/// listener who asked for something the bot did not offer gets a way to say so
-/// rather than leaving a question on offer forever.
-pub const ACTION_NONE: &str = "none";
-
 /// The longest a title may be before it is trimmed.
 ///
 /// Discord rejects an over-long embed rather than truncating it, which would
@@ -71,9 +59,6 @@ const MAX_DESCRIPTION: usize = 4096;
 const MAX_FIELD_NAME: usize = 256;
 /// The same limit applies to a field's value.
 const MAX_FIELD_VALUE: usize = 1024;
-/// Longest footer Discord accepts, which is lower than the description's.
-const MAX_FOOTER: usize = 2048;
-
 /// Builds the custom id for a dashboard button.
 fn button_id(action: &str) -> String {
     format!("{PREFIX}:{action}")
@@ -84,29 +69,10 @@ fn button_id(action: &str) -> String {
 pub fn action_from_id(custom_id: &str) -> Option<&str> {
     let action = custom_id.strip_prefix(&format!("{PREFIX}:"))?;
     match action {
-        ACTION_PAUSE | ACTION_RESUME | ACTION_SKIP | ACTION_STOP | ACTION_NONE | ACTION_QUEUE
-        | ACTION_BACK | ACTION_REPEAT | ACTION_NEXT | ACTION_NOTHING => Some(action),
+        ACTION_PAUSE | ACTION_RESUME | ACTION_SKIP | ACTION_STOP | ACTION_QUEUE | ACTION_BACK
+        | ACTION_REPEAT | ACTION_NEXT | ACTION_NOTHING => Some(action),
         _ => None,
     }
-}
-
-/// Builds the custom id for a "which one did you mean" button.
-///
-/// The key rides in the custom id rather than being looked up, so a press needs
-/// no state. It is opaque: a video's id, or the index of a song in the guild's
-/// current question. Either way what it means is decided by the choice store and
-/// by nothing that arrived from the client.
-pub fn pick_id(key: &str) -> String {
-    format!("{PREFIX}:{PICK_PREFIX}:{key}")
-}
-
-/// Recovers the key from a choice button's custom id. Separate from
-/// [`action_from_id`], which only reports the playback actions.
-pub fn picked_key(custom_id: &str) -> Option<&str> {
-    let action = custom_id.strip_prefix(&format!("{PREFIX}:"))?;
-    let key = action.strip_prefix(&format!("{PICK_PREFIX}:"))?;
-    // An empty key would match nothing and then do nothing.
-    (!key.is_empty()).then_some(key)
 }
 
 /// Builds the custom id for a `/play` song button.
@@ -115,10 +81,6 @@ pub fn ask_id(index: usize) -> String {
 }
 
 /// Recovers the index from a `/play` song button's custom id.
-///
-/// Separate from [`picked_key`] because a `/play` chooser is not the voice
-/// chooser: the two have different owners and different stores, and letting
-/// one id reach the other would let a press act on the wrong list.
 pub fn asked_index(custom_id: &str) -> Option<usize> {
     let action = custom_id.strip_prefix(&format!("{PREFIX}:{ASK_PREFIX}:"))?;
     action.parse().ok()
@@ -266,79 +228,9 @@ pub fn idle_dashboard() -> View {
     }
 }
 
-/// The message posted when the bot could not tell which song was meant.
-///
-/// One numbered button per candidate, since a row of titles would overflow the
-/// 80-character label limit. The titles are in the embed above them.
-pub fn choice(
-    requested: &str,
-    resolved: Option<&str>,
-    options: &[ChoiceOption<'_>],
-) -> CreateMessage {
-    let mut embed = CreateEmbed::new()
-        .title("Which one did you mean?")
-        .description(format!(
-            "I heard {}but these look closest.",
-            trim(&markdown_escape(requested), MAX_DESCRIPTION)
-        ))
-        .color(0xfa_a4_1d);
-    if let Some(resolved) = resolved {
-        embed = embed.footer(CreateEmbedFooter::new(format!(
-            "Closest match: {}",
-            trim(resolved, MAX_FOOTER)
-        )));
-    }
-    embed = embed.fields(
-        options
-            .iter()
-            .enumerate()
-            .map(|(index, option)| {
-                (
-                    format!("{}. {}", index + 1, trim(option.title, MAX_FIELD_NAME)),
-                    option.detail(),
-                    false,
-                )
-            })
-            .collect::<Vec<_>>(),
-    );
-
-    let mut buttons: Vec<CreateButton> = options
-        .iter()
-        .enumerate()
-        .map(|(index, option)| {
-            CreateButton::new(pick_id(option.key)).label((index + 1).to_string())
-        })
-        .collect();
-    buttons.push(
-        CreateButton::new(action_id(ACTION_NONE))
-            .label("None of these")
-            .style(ButtonStyle::Secondary),
-    );
-
-    CreateMessage::new()
-        .embed(embed)
-        .components(vec![CreateActionRow::Buttons(buttons)])
-}
-
 /// The custom id for a dashboard action button.
 pub fn action_id(action: &str) -> String {
     format!("{PREFIX}:{action}")
-}
-
-/// The edit that removes the buttons from a question nobody answered.
-///
-/// Used after the chooser expires: the question stays readable, but a press on
-/// a button from ten minutes ago must not start a download.
-pub fn expired(question: &str) -> EditMessage {
-    EditMessage::new()
-        .embed(
-            CreateEmbed::new()
-                .title("Which one did you mean?")
-                .description(trim(question, MAX_DESCRIPTION))
-                .footer(CreateEmbedFooter::new("This question timed out."))
-                .color(0x60_6a_76),
-        )
-        .components(Vec::new())
 }
 
 /// A one-line notice for something that did not work.
@@ -436,11 +328,8 @@ pub struct ChoiceOption<'a> {
     /// Who recorded or uploaded it, shown as the second line.
     pub channel: &'a str,
     pub duration_secs: Option<f64>,
-    /// The opaque key this button stands for, in the guild's choice store.
-    ///
-    /// Opaque on purpose: a press carries a key, and the store decides what it
-    /// means. Nothing a client sends is treated as a video id to play.
-    pub key: &'a str,
+    /// YouTube Music plays, or the upload's view count, when known.
+    pub plays: Option<u64>,
 }
 
 impl ChoiceOption<'_> {
@@ -457,11 +346,40 @@ impl ChoiceOption<'_> {
             let total = duration.max(0.0) as u64;
             detail.push_str(&format!("{}:{:02}", total / 60, total % 60));
         }
+        if let Some(plays) = self.plays {
+            if !detail.is_empty() {
+                detail.push_str(" \u{2022} ");
+            }
+            detail.push_str(&plays_label(plays));
+        }
         if detail.is_empty() {
             detail.push_str("unknown length");
         }
         detail
     }
+}
+
+/// "217M plays" from a raw count, matching how YouTube writes it.
+fn plays_label(plays: u64) -> String {
+    if plays == 1 {
+        return "1 play".to_string();
+    }
+    let (value, suffix) = if plays >= 1_000_000_000 {
+        (plays as f64 / 1_000_000_000.0, "B")
+    } else if plays >= 1_000_000 {
+        (plays as f64 / 1_000_000.0, "M")
+    } else if plays >= 1_000 {
+        (plays as f64 / 1_000.0, "K")
+    } else {
+        return format!("{plays} plays");
+    };
+    // One decimal below ten ("2.2M"), none above ("217M").
+    let number = if value < 10.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value:.0}")
+    };
+    format!("{}{suffix} plays", number.trim_end_matches(".0"))
 }
 
 /// Escapes the Discord markdown that would otherwise be read out of a title.
@@ -543,95 +461,40 @@ mod tests {
         );
     }
 
-    /// A chooser button has to survive the round trip, or a press cannot be
-    /// matched back to the video it stands for.
-    #[test]
-    fn a_choice_button_round_trips_through_its_custom_id() {
-        let id = pick_id("dQw4w9WgXcQ");
-        assert_eq!(picked_key(&id), Some("dQw4w9WgXcQ"));
-    }
-
-    /// A choice button is not a playback action, and `action_from_id` is what
-    /// the button dispatcher trusts, so it must not claim these.
-    #[test]
-    fn a_choice_button_is_not_a_playback_action() {
-        let id = pick_id("dQw4w9WgXcQ");
-        assert_eq!(action_from_id(&id), None);
-        assert_eq!(picked_key("shamash:pause"), None);
-        assert_eq!(picked_key("other:pick:abc"), None);
-        assert_eq!(picked_key("shamash:pick:"), None);
-        // A catalog question's key is an index, and the store is what says what
-        // index 0 means.
-        assert_eq!(picked_key(&pick_id("song:0")), Some("song:0"));
-    }
-
-    /// The custom id has a 100-character limit in Discord, and the video id is
-    /// the only variable part.
-    #[test]
-    fn a_choice_custom_id_fits_discords_limit() {
-        let id = pick_id(&"x".repeat(64));
-        assert!(id.len() <= 100, "too long: {}", id.len());
-    }
-
     fn option(title: &str, channel: &str, duration: Option<f64>) -> ChoiceOption<'static> {
         ChoiceOption {
             title: Box::leak(title.to_string().into_boxed_str()),
             channel: Box::leak(channel.to_string().into_boxed_str()),
             duration_secs: duration,
-            key: "vid",
+            plays: None,
         }
-    }
-
-    /// The question has to say what was heard and what is being offered,
-    /// numbered to match the buttons.
-    #[test]
-    fn the_chooser_shows_the_request_and_the_options() {
-        let options = [
-            option("Dracula", "Tame Impala", Some(206.0)),
-            option("Dracula (Live)", "Someone", Some(240.0)),
-        ];
-        let message = choice("dracula tame impala", None, &options);
-        let json = serde_json::to_string(&message).expect("choice serialises");
-        assert!(json.contains("dracula tame impala"), "{json}");
-        assert!(json.contains("Dracula"), "{json}");
-        assert!(json.contains("Tame Impala"), "{json}");
-        // Lengths, so two recordings of one title can be told apart.
-        assert!(json.contains("3:26"), "{json}");
-        assert!(json.contains("1"), "{json}");
-    }
-
-    /// The catalog match is the reason the bot is asking: it knows roughly
-    /// what was meant, and showing it makes a wrong guess obvious.
-    #[test]
-    fn the_chooser_names_the_closest_catalog_match() {
-        let message = choice(
-            "dracula",
-            Some("Dracula by Tame Impala"),
-            &[option("Dracula", "Tame Impala", Some(206.0))],
-        );
-        let json = serde_json::to_string(&message).expect("choice serialises");
-        assert!(json.contains("Dracula by Tame Impala"), "{json}");
-    }
-
-    /// The request is speech-to-text output, so it can contain markdown that
-    /// would otherwise reformat the message.
-    #[test]
-    fn a_request_containing_markdown_is_escaped() {
-        // Checked on the escaped text, because the JSON encoding adds a second
-        // layer of backslashes that has nothing to do with Discord's.
-        assert_eq!(
-            markdown_escape("play *everything* _now_"),
-            r"play \*everything\* \_now\_"
-        );
-        let message = choice("play *everything* _now_", None, &[]);
-        let json = serde_json::to_string(&message).expect("choice serialises");
-        assert!(!json.contains("play *everything*"), "unescaped: {json}");
     }
 
     /// A candidate with no reported length still has to render as a field.
     #[test]
     fn an_option_without_metadata_still_renders() {
         assert_eq!(option("Dracula", "", None).detail(), "unknown length");
+    }
+
+    /// The chooser answers "which one" with the one fact that separates two
+    /// recordings of the same title: how often each has been played.
+    #[test]
+    fn an_option_shows_its_play_count() {
+        let mut option = option("Dracula", "Tame Impala", Some(206.0));
+        option.plays = Some(217_000_000);
+        assert_eq!(
+            option.detail(),
+            "Tame Impala \u{2022} 3:26 \u{2022} 217M plays"
+        );
+    }
+
+    #[test]
+    fn play_counts_are_abbreviated_like_youtube() {
+        assert_eq!(plays_label(217_000_000), "217M plays");
+        assert_eq!(plays_label(2_200_000), "2.2M plays");
+        assert_eq!(plays_label(33_000), "33K plays");
+        assert_eq!(plays_label(999), "999 plays");
+        assert_eq!(plays_label(1), "1 play");
     }
 
     #[test]
@@ -644,7 +507,6 @@ mod tests {
             ACTION_QUEUE,
             ACTION_BACK,
             ACTION_REPEAT,
-            ACTION_NONE,
         ] {
             let id = button_id(action);
             assert_eq!(action_from_id(&id), Some(action));
@@ -842,9 +704,9 @@ mod tests {
     }
 
     /// A `/play` button has to survive the round trip, and must not be
-    /// readable as a voice chooser key: the two reach different stores.
+    /// readable as a playback action.
     #[test]
-    fn a_play_button_round_trips_and_is_not_a_voice_choice() {
+    fn a_play_button_round_trips_and_is_not_a_playback_action() {
         assert_eq!(asked_index(&ask_id(4)), Some(4));
         assert_eq!(
             asked_index(&ask_id(0)),
@@ -852,16 +714,11 @@ mod tests {
             "page two starts at zero again"
         );
         assert_eq!(
-            picked_key(&ask_id(4)),
-            None,
-            "must not reach the voice store"
-        );
-        assert_eq!(
             action_from_id(&ask_id(4)),
             None,
             "must not be a playback action"
         );
-        assert_eq!(asked_index(&pick_id("abc")), None);
+        assert_eq!(asked_index("shamash:pick:abc"), None);
         assert_eq!(asked_index("shamash:ask:"), None);
         assert_eq!(asked_index("other:ask:0"), None);
     }
