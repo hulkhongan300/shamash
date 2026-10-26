@@ -826,18 +826,12 @@ pub async fn resolve_request(
     // explain the request.
     if let Some(library) = library {
         let remembered = library.history_hits(guild_id.get());
-        let confident = matches!(
-            matcher::decide(&heard, &remembered, |hit: &resolve::Hit| {
-                (hit.artist.as_str(), hit.title.as_str())
-            }),
-            matcher::Verdict::Confident(_)
-        );
-        if confident {
+        let verdict = matcher::decide(&heard, &remembered, |hit: &resolve::Hit| {
+            (hit.artist.as_str(), hit.title.as_str())
+        });
+        if matches!(&verdict, matcher::Verdict::Confident(_)) {
             tracing::info!(said = %heard, "the play history alone resolved this request");
-            return matcher::decide(&heard, &remembered, |hit: &resolve::Hit| {
-                (hit.artist.as_str(), hit.title.as_str())
-            })
-            .into();
+            return verdict.into();
         }
         hits.extend(remembered);
     }
@@ -845,18 +839,18 @@ pub async fn resolve_request(
     let verdict = matcher::decide(&heard, &hits, |hit: &resolve::Hit| {
         (hit.artist.as_str(), hit.title.as_str())
     });
-    if let Resolved::Track { .. } = decide(&verdict)
+    // Only asked when the words as heard did not resolve. A resolved request
+    // cannot be displaced by a rewrite, so asking then would pay for a whole
+    // catalog fan-out and throw the answer away.
+    if matches!(verdict, matcher::Verdict::NoMatch)
         && let Some((rewritten, rewritten_hits)) = try_rewrite(catalog, rewrite, timing).await
     {
         let alternative = matcher::decide(&rewritten, &rewritten_hits, |hit: &resolve::Hit| {
             (hit.artist.as_str(), hit.title.as_str())
         });
         // Only a *confident* answer from the rewrite displaces the words as
-        // heard. If the heard transcript also resolved, that is evidence for
-        // it, and the rewrite is the speculative one.
-        if matches!(verdict, matcher::Verdict::NoMatch)
-            && matches!(alternative, matcher::Verdict::Confident(_))
-        {
+        // heard, and it still had to clear the same catalog verification.
+        if matches!(alternative, matcher::Verdict::Confident(_)) {
             tracing::info!(
                 heard = %heard,
                 rewritten = %rewritten,
@@ -1863,10 +1857,11 @@ mod tests {
     /// verification as the words that were heard.
     #[tokio::test]
     async fn a_rewrite_can_rescue_a_request_the_words_could_not() {
-        // The words as heard match nothing; the rewrite names the song.
+        // The words as heard name nothing the catalog knows; the rewrite names
+        // the song, and nothing but the rewrite can produce it.
         let catalog = stub_catalog(vec![catalog_track("Tame Impala", "Dracula", Some(205.0))]);
         let resolved = resolve_request(
-            &request("drakoola tame implala"),
+            &request("banana pancakes"),
             &catalog,
             Some("dracula tame impala"),
             None,

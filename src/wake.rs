@@ -76,8 +76,6 @@ pub enum Heard {
 /// A wake word, and the state the capture of the request depends on.
 #[derive(Debug, Clone)]
 pub struct WakeHit {
-    /// The window the wake word was heard in, kept for the log line only.
-    pub audio: Vec<f32>,
     /// Set by the pipeline once the larger model is loaded.
     ///
     /// Shared rather than returned, because the gate is what decides when a
@@ -269,10 +267,7 @@ impl WakeGate {
         self.spoke = false;
         let ready = Arc::new(AtomicBool::new(false));
         self.ready = Some(Arc::clone(&ready));
-        Some(Heard::Wake(WakeHit {
-            audio: self.window.iter().copied().collect(),
-            ready,
-        }))
+        Some(Heard::Wake(WakeHit { ready }))
     }
 
     /// Whether the transcript contained a configured wake word.

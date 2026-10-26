@@ -1,4 +1,4 @@
-//! What the bot has learned, on disk.
+//! What the bot *could* learn, on disk — not currently wired up.
 //!
 //! Every request costs a catalog lookup and a YouTube search, and the same
 //! misheard phrase costs the same ones every time: "billy eyelash bad guy" is
@@ -23,6 +23,11 @@
 //! Writes are atomic (a temp file, then a rename) and debounced, because a
 //! single request can finish several of them and a half-written JSON file that
 //! is read back at the next startup would throw away everything.
+//!
+//! NOTE: `Player::new` currently constructs with `library: None`. The fields
+//! and methods exist but no path in the codebase assigns a `Library` instance,
+//! so aliases and history are never persisted or read. Wiring this is a
+//! separate feature change.
 
 use crate::matcher;
 use crate::resolve::{CatalogTrack, Hit};

@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 /// `ASR_ENGINE=direct` holds the model resident rather than reloading it per
 /// utterance.
 ///
-/// `ASR_ENGINE=handy` still prefers [`SMALL_MODEL_ID`], where a 600 ms load per
-/// command really is the dominant cost.
+/// `ASR_ENGINE=handy` runs whatever `PARAKEET_MODEL` names, so point that at
+/// [`SMALL_MODEL_ID`] when using it: the load cost is paid per utterance.
 pub const DEFAULT_MODEL_ID: &str =
     "handy-computer/whisper-large-v3-turbo-gguf/whisper-large-v3-turbo-Q8_0.gguf";
 

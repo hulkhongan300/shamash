@@ -154,7 +154,6 @@ pub struct Player {
     /// Two commands handled at once would each download and then start a
     /// track, and the second would replace the first mid-flight, so the song
     /// that was asked for would be heard as the one before it.
-    /// How requests in flight and playback controls share this guild.
     coordination: Coordination,
     /// The track playing per guild, needed to pause and resume it.
     tracks: Tracks,
@@ -163,7 +162,6 @@ pub struct Player {
     dashboards: Dashboards,
     /// Resolves a spoken request to a real song before YouTube is searched.
     catalog: Arc<resolve::Catalog>,
-    /// The "which one did you mean" buttons currently on offer.
     /// The outstanding `/play` search per guild.
     asks: Asks,
     /// What the bot remembers, or `None` when it has been given no place to
@@ -1189,11 +1187,11 @@ impl Player {
 
     /// Decides what a finished song says about the request that queued it.
     ///
-    /// Kept for [`crate::library::KEPT_SECS`], the request is believed and
-    /// remembered. Skipped sooner than that, it is feedback against the phrase
-    /// that asked for it -- twice, and the phrase is forgotten. A song queued by
-    /// pressing a chooser button was already believed when the button was
-    /// pressed, so it is remembered either way.
+    /// Kept for [`crate::library::KEPT_SECS`], the request is believed; skipped
+    /// sooner, it is feedback against the phrase that asked for it. A song
+    /// queued by pressing a chooser button was already believed when the button
+    /// was pressed. The `library` field is currently `None`, so nothing is
+    /// persisted; this logic is ready if the library is wired up.
     fn learn_from_stopped(&self, guild_id: GuildId, stopped: Option<&Queued>) {
         let (Some(stopped), Some(library)) = (stopped, self.library.as_deref()) else {
             return;
