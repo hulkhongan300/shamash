@@ -108,10 +108,7 @@ fn main() -> anyhow::Result<()> {
                     let Heard::Wake(hit) = heard else {
                         unreachable!("a check only ever reports a wake word");
                     };
-                    println!(
-                        ">>> wake word heard after {checks} check(s), in {:.2} s of audio",
-                        hit.audio.len() as f32 / 16_000.0
-                    );
+                    println!(">>> wake word heard after {checks} check(s), window ready");
                     // What the bot does between its two tones: the larger model
                     // loads, then the gate is told it is ready.
                     let started = Instant::now();
