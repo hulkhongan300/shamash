@@ -31,6 +31,9 @@ leaves the host.
   `sudo pacman -S --needed vulkan-headers spirv-headers shaderc`). Without them
   the build fails; drop the `vulkan` feature from `transcribe-cpp` in
   `Cargo.toml` to run on the CPU instead.
+- `huggingface-cli` (`pip install huggingface_hub`) to fetch the models
+- The [Handy](https://github.com/cjpais/Handy) app on `PATH`, only if you set
+  `ASR_ENGINE=handy`
 - A Discord application with a bot token and voice intents enabled
 
 ## Setup
@@ -162,9 +165,11 @@ All settings are optional apart from the token and channel:
 | `PARAKEET_MODEL`    | Whisper large-v3-turbo Q8_0 | Large on-demand model                          |
 | `ASR_ENGINE`        | `direct` | `direct` (in-process transcribe.cpp) or `handy` (subprocess)      |
 | `ASR_LANGUAGE`      | auto    | One ISO-639-1 code, e.g. `en`. `pt-PT` is not valid                |
-| `MATCH_THRESHOLD`   | `90`    | Lowest upload score played without asking, 0–1000                  |
-| `SEARCH_CANDIDATES` | `8`     | YouTube results scored per request, 1–50                          |
+| `MATCH_THRESHOLD`   | `90`    | Lowest catalogued upload score played without asking, 0–1000; unverified matches are never played unasked |
+| `SEARCH_CANDIDATES` | `8`     | YouTube results scored per request, clamped to 1–50               |
 | `AMBIGUOUS_POLICY`  | `ask`   | `ask`, `auto` (play the best same-title match) or `popular`        |
+| `LLM_ENDPOINT`      | —       | Ollama-compatible URL that rewrites a misheard request; off when unset |
+| `LLM_MODEL`         | `llama3.2` | Model name sent to `LLM_ENDPOINT`                              |
 | `UNVERIFIED_CHOOSER`| `true`  | Offer unverified uploads when nothing matched                     |
 | `RESOLVE_BUDGET_MS` | `2500`  | Time budget for the catalog lookup                                |
 
@@ -181,7 +186,7 @@ Three constants in `src/wake.rs`:
 | ----------------- | ------- | ---------------------------------------------------- |
 | `WAKE_WINDOW`     | 2 s     | hear a slower wake word, at more transcription cost  |
 | `WAKE_HOP`        | 250 ms  | use less CPU, at the cost of missing a quick shout    |
-| `WAKE_TAIL_FRAMES`| 500 ms  | hear a wake word at the end of a sentence            |
+| `WAKE_TAIL_FRAMES`| 25 frames (500 ms) | hear a wake word at the end of a sentence            |
 
 Each check is one inference on the small model, so a busy channel costs about
 four a second. The VAD gate (`VAD_RMS_THRESHOLD` in `src/listener.rs`, 0.02)
@@ -202,8 +207,7 @@ also reports the loudest 20 ms frame against the VAD gate — the first thing to
 check when the bot seems deaf.
 
 `WAKE_MODEL`, `PARAKEET_MODEL` and `WAKE_WORDS` are read from the same settings
-as the bot. For CPU-only timings there is `bench_direct`, and `bench_pipeline`
-and `bench_stream` measure the request and streaming paths.
+as the bot. For transcription timings there is `bench_direct` (build without the `vulkan` feature for CPU-only numbers), and `bench_pipeline` and `bench_stream` measure the request and streaming paths.
 
 ## Development
 
