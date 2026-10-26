@@ -128,6 +128,7 @@ pub async fn fetch(
         headers: stream.headers,
         cache: dir.join(format!("{stem}.{}", stream.ext)),
         length: stream.length,
+        signed_at: stream.signed_at,
     })
 }
 
@@ -146,6 +147,8 @@ pub struct Streamable {
     /// `bytes=0-` and a plain GET both answer 403, and the length is the only
     /// way to close it. Songbird takes the same number for the same reason.
     pub length: u64,
+    /// When yt-dlp signed `url`.
+    pub signed_at: std::time::Instant,
 }
 
 impl Streamable {
@@ -160,6 +163,7 @@ impl Streamable {
             headers,
             cache,
             length,
+            signed_at,
         } = source
         else {
             return None;
@@ -173,6 +177,7 @@ impl Streamable {
                 .unwrap_or_default()
                 .to_string(),
             length: *length,
+            signed_at: *signed_at,
         })
     }
 }
@@ -262,6 +267,7 @@ fn pick_streamable(json: &serde_json::Value) -> Option<Streamable> {
                     headers: header_map(format.get("http_headers")?),
                     ext: format.get("ext")?.as_str()?.to_string(),
                     length: length_of(format)?,
+                    signed_at: std::time::Instant::now(),
                 },
             ))
         })
@@ -339,6 +345,15 @@ pub async fn resolve(
     let Source::Stream { cache, .. } = source else {
         unreachable!("a stream always carries a cache path")
     };
+
+    // A URL signed seconds ago does not need a liveness probe: YouTube signs
+    // URLs for hours, and the probe adds a round trip + TLS handshake in the
+    // gap where nothing is playing.
+    const FRESH_STREAM: Duration = Duration::from_secs(60);
+    if stream.signed_at.elapsed() < FRESH_STREAM {
+        tracing::debug!(watch_url = %watch_url, "stream is fresh, skipping probe");
+        return Ok(source.clone());
+    }
 
     if stream_usable(&stream, timing).await {
         return Ok(source.clone());
@@ -474,14 +489,18 @@ async fn fetch_to_file(stream: &Streamable, dest: &Path) -> anyhow::Result<()> {
 
 /// The http client every direct request goes through.
 ///
-/// `rustls-tls` is already on: the project depends on reqwest with it, so the
-/// media URLs get the same TLS stack as the rest of the bot rather than pulling
-/// in a second one.
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .build()
-        .unwrap_or_default()
+/// A `OnceLock` so the connection pool is shared across all calls: a client
+/// dropped at the end of each request throws the pool away and loses TLS
+/// session reuse. `rustls-tls` is already on: the project depends on reqwest
+/// with it, so the media URLs get the same TLS stack as the rest of the bot.
+fn client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .build()
+            .unwrap_or_default()
+    })
 }
 
 /// The audio at `path`, if there is any worth reading.
@@ -892,6 +911,9 @@ mod tests {
                 headers: HeaderMap::new(),
                 length: AUDIO.len() as u64,
                 cache,
+                // Old enough that the freshness skip does not apply; test verifies
+                // that the probe passes and the stream is returned.
+                signed_at: std::time::Instant::now() - Duration::from_secs(120),
             },
             "https://youtu.be/abc",
             &[],
@@ -920,11 +942,15 @@ mod tests {
         let cache = dir.join("abc.m4a");
         tokio::fs::write(&cache, AUDIO).await.expect("write");
         let timing = Timing::default();
+        // Use a past instant so the freshness skip does not apply; the test
+        // verifies that an old stream with a 403 falls back to the file.
+        let old = std::time::Instant::now() - Duration::from_secs(120);
         let stream = Streamable {
             url,
             headers: HeaderMap::new(),
             ext: "m4a".to_string(),
             length: AUDIO.len() as u64,
+            signed_at: old,
         };
 
         let resolved = resolve(
@@ -933,6 +959,7 @@ mod tests {
                 headers: stream.headers.clone(),
                 length: AUDIO.len() as u64,
                 cache: cache.clone(),
+                signed_at: old,
             },
             "https://youtu.be/abc",
             &[],
@@ -956,11 +983,13 @@ mod tests {
         let cache = dir.join("abc.m4a");
         tokio::fs::write(&cache, AUDIO).await.expect("write");
         let timing = Timing::default();
+        let old = std::time::Instant::now() - Duration::from_secs(120);
         let stream = Streamable {
             url,
             headers: HeaderMap::new(),
             ext: "m4a".to_string(),
             length: AUDIO.len() as u64,
+            signed_at: old,
         };
 
         let started = std::time::Instant::now();
@@ -980,6 +1009,7 @@ mod tests {
                 headers: stream.headers,
                 length: AUDIO.len() as u64,
                 cache: cache.clone(),
+                signed_at: old,
             },
             "https://youtu.be/abc",
             &[],

@@ -46,6 +46,10 @@ pub enum Source {
         /// The file the same audio is written to while it streams, and the one
         /// a fallback plays if the stream turns out to be unusable.
         cache: PathBuf,
+        /// When yt-dlp signed this URL. A URL younger than 60 s does not need
+        /// the liveness probe in `fetch::resolve`, which saves a round trip
+        /// and a TLS handshake in the gap where nothing is playing.
+        signed_at: std::time::Instant,
     },
 }
 
@@ -317,6 +321,7 @@ mod tests {
                 headers: HeaderMap::new(),
                 length: 1024,
                 cache: PathBuf::from(format!("/tmp/{title}.m4a")),
+                signed_at: std::time::Instant::now(),
             },
             title: title.to_string(),
             artist: "someone".to_string(),
