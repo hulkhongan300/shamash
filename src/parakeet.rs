@@ -7,23 +7,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The Handy model used when `PARAKEET_MODEL` is unset.
 ///
-/// Chosen for the shape of this engine rather than for a leaderboard score.
-/// Every utterance spawns a fresh `handy` process, so the model is reloaded
-/// each time and that load dominates a two-second command: ~110 ms for this
-/// 129 MB model against ~600 ms for the 0.6B one. `ASR_ENGINE=direct` holds
-/// its model for the process lifetime and so defaults to the strong one instead;
-/// see [`crate::model`]. The two defaults are deliberately different.
-///
-/// The larger alternatives were measured and rejected here. `canary-180m-flash`
-/// is the fastest per-second-of-audio but returns *empty text* on short
-/// utterances, because it is a multitask AED that needs an explicit language
-/// hint (`-l en`) and `--transcribe-file` exposes no way to pass one.
-/// `nemotron-3.5-asr-streaming` is a streaming model and was empty on 4 of 6
-/// real VAD utterances. Both would drop commands.
-///
-/// Override with `PARAKEET_MODEL` to try another model without editing code.
-pub use crate::model::SMALL_MODEL_ID as DEFAULT_MODEL;
-
 /// Hands each utterance to the Handy app's headless batch mode and returns the
 /// text it prints.
 ///
@@ -242,7 +225,7 @@ mod tests {
     fn a_missing_handy_binary_names_the_fix() {
         let transcriber = HandyTranscriber {
             program: "handy-that-does-not-exist".to_string(),
-            model: DEFAULT_MODEL.to_string(),
+            model: crate::model::SMALL_MODEL_ID.to_string(),
             lock: std::sync::Mutex::new(()),
         };
         let path = temp_wav_path();
@@ -258,7 +241,7 @@ mod tests {
 
     #[test]
     fn the_json_line_is_found_even_after_log_output() {
-        let transcriber = HandyTranscriber::new(DEFAULT_MODEL);
+        let transcriber = HandyTranscriber::new(crate::model::SMALL_MODEL_ID);
         let stdout = "noise\n{\"load_ms\":5,\"transcribe_ms\":[7],\"text\":\"bot play lofi\"}\n";
         let parsed: HandyOutput = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
         assert_eq!(parsed.text, "bot play lofi");
@@ -270,19 +253,22 @@ mod tests {
     /// transcribe with. Every command spawns a fresh process, so the cost that
     /// matters is load time, and a model that returns empty text fails the bot
     /// silently rather than loudly. Canary and Nemotron both did; see the
-    /// comment on `DEFAULT_MODEL`.
+    /// comment on `crate::model::SMALL_MODEL_ID`.
     #[test]
     fn the_default_model_does_not_need_a_language_hint() {
         // `handy --list-models` reports `supports_language_selection` for each
         // model, and the CLI offers no `--language` for `--transcribe-file`.
         // A model that needs one returns empty text for every utterance.
-        assert!(!DEFAULT_MODEL.contains("canary"), "needs -l <lang>");
         assert!(
-            !DEFAULT_MODEL.contains("nemotron"),
+            !crate::model::SMALL_MODEL_ID.contains("canary"),
+            "needs -l <lang>"
+        );
+        assert!(
+            !crate::model::SMALL_MODEL_ID.contains("nemotron"),
             "returns empty on short audio"
         );
         assert!(
-            DEFAULT_MODEL.contains("parakeet"),
+            crate::model::SMALL_MODEL_ID.contains("parakeet"),
             "no language hint needed"
         );
     }

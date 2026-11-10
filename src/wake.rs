@@ -44,7 +44,7 @@ pub const WAKE_WINDOW: Duration = Duration::from_millis(2000);
 ///
 /// This is the always-on stage's whole cost: one inference on the small model
 /// per hop per speaker.
-pub const WAKE_HOP: Duration = Duration::from_millis(500);
+pub const WAKE_HOP: Duration = Duration::from_millis(250);
 
 /// How long a speaker who said only the wake word stays armed for the request.
 pub const ARM_TTL: Duration = Duration::from_secs(8);

@@ -168,8 +168,6 @@ fn best_window(tokens: &[String], target: &str) -> (f32, usize, usize) {
 pub struct Score {
     /// The title, discounted for spoken words it does not explain.
     pub title: f32,
-    /// The artist.
-    pub artist: f32,
     /// What [`decide`] sorts on: 0.8 title + 0.2 artist.
     pub combined: f32,
 }
@@ -202,10 +200,15 @@ pub fn score(transcript: &str, artist: &str, title: &str) -> Score {
         content.iter().filter(|&&i| !explained[i]).count() as f32 / content.len().max(1) as f32;
 
     let title_score = (ts * (1.0 - 0.8 * unexplained)).clamp(0.0, 1.0);
+    // Only a named artist should earn the artist term. A bare title still has
+    // some edit-distance overlap with every artist name -- "biome fest" and
+    // "Celestial Fury" share enough letters to score 0.27 -- and rewarding
+    // that put a 4k-play cover above the official recording. The same 0.75
+    // bar already decides whether the artist's words count as explained.
+    let artist_score = if a_s >= 0.75 { a_s } else { 0.0 };
     Score {
         title: title_score,
-        artist: a_s,
-        combined: 0.8 * title_score + 0.2 * a_s,
+        combined: 0.8 * title_score + 0.2 * artist_score,
     }
 }
 
@@ -465,6 +468,23 @@ mod tests {
                 "{}",
                 case.said
             );
+        }
+    }
+
+    /// A bare title matches the official recording and its cover equally on
+    /// the title; accidental letter overlap with the cover's artist must not
+    /// put the cover first. The caller breaks the remaining tie by plays.
+    #[test]
+    fn a_bare_title_does_not_favour_a_cover_by_artist_overlap() {
+        let hits = [
+            ("C418", "Biome Fest"),
+            ("Celestial Fury", "Biome Fest (from \"Minecraft\")"),
+        ];
+        match decide("biome fest", &hits, key) {
+            Verdict::Ambiguous(options) => {
+                assert_eq!(*options[0], ("C418", "Biome Fest"), "{options:?}");
+            }
+            other => panic!("{other:?}"),
         }
     }
 

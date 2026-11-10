@@ -18,7 +18,6 @@ pub mod resolve;
 pub mod search;
 pub mod segment;
 pub mod state;
-pub mod suggest;
 pub mod timing;
 pub mod transcriber;
 pub mod voice;

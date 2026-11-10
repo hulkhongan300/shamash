@@ -31,10 +31,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// The default location. A relative path, so it lands beside the crate rather
-/// than in a temporary directory that is cleared between runs.
-pub const DEFAULT_LIBRARY_PATH: &str = "data/library.json";
-
 /// How many aliases are kept.
 ///
 /// ponytail: 2000 is about a few months of a daily listener. The cap exists so
@@ -88,15 +84,6 @@ pub struct Track {
 }
 
 impl Track {
-    pub fn of(track: &CatalogTrack) -> Self {
-        Self {
-            artist: track.artist.clone(),
-            title: track.title.clone(),
-            duration_secs: track.duration_secs,
-            video_id: track.video_id.clone(),
-        }
-    }
-
     pub fn label(&self) -> String {
         format!("{} — {}", self.artist, self.title)
     }
@@ -107,8 +94,6 @@ impl Track {
             artist: self.artist.clone(),
             title: self.title.clone(),
             duration_secs: self.duration_secs,
-            id: String::new(),
-            provider: "library",
             popularity: None,
             video_id: self.video_id.clone(),
         }
@@ -116,16 +101,14 @@ impl Track {
 
     /// As a catalog hit, so remembered songs are judged by the same matcher as
     /// catalog ones.
-    pub fn as_hit(&self, agreement: usize) -> Hit {
+    pub fn as_hit(&self) -> Hit {
         Hit {
             artist: self.artist.clone(),
             title: self.title.clone(),
             durations: self.duration_secs.into_iter().collect(),
             duration_uncertain: false,
-            agreement,
             popularity: None,
             video_id: self.video_id.clone(),
-            video_provider: "library",
         }
     }
 }
@@ -268,7 +251,7 @@ impl Library {
             .history
             .iter()
             .filter(|row| row.guild == guild)
-            .map(|row| row.track.as_hit(1))
+            .map(|row| row.track.as_hit())
             .collect()
     }
 

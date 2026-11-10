@@ -1,6 +1,5 @@
 use anyhow::Context as _;
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 /// Wake words used when `WAKE_WORDS` is unset.
 ///
@@ -10,58 +9,17 @@ use std::path::PathBuf;
 /// lead-in now keeps. Add them back in `WAKE_WORDS` if your voice needs them.
 pub const DEFAULT_WAKE_WORDS: &[&str] = &["bot", "shamash"];
 
-/// Identifies the bot to Deezer, which rejects requests without one.
+/// Identifies the bot to the services it calls.
 pub const HTTP_USER_AGENT: &str = concat!("shamash/", env!("CARGO_PKG_VERSION"));
 
-/// The catalogs to resolve requests against when `CATALOG_PROVIDERS` is unset.
-///
-/// Two by default, and they are not redundant: Deezer answers artist-only
-/// queries that rescue a misheard title, and iTunes catches a Deezer quota. The
-/// MusicBrainz fuzzy search is deliberately *not* in the default list -- it is
-/// rate-limited to one request a second and is only worth the wait when the
-/// faster providers found nothing.
-pub const DEFAULT_CATALOG_PROVIDERS: &str = "deezer,itunes";
-
-/// Catalogs this build can resolve against.
-///
-/// All need no API key, which is why they are here at all; the provider trait
-/// in [`crate::resolve`] exists so a keyed or local catalog can be added without
-/// touching the selection code. [`crate::resolve::Catalog::provider`] is the
-/// only place these names are matched.
-pub const SUPPORTED_CATALOG_PROVIDERS: &[&str] = &["deezer", "itunes", "musicbrainz"];
-
-/// How long the whole catalog fan-out may take, in milliseconds.
+/// How long the whole catalog lookup may take, in milliseconds.
 ///
 /// One budget for every query, not one per query: this sits in front of the
-/// YouTube search, and the point of asking several providers at once is that
-/// the slowest of them does not set the wait. Two and a half seconds is
-/// generous for a handful of keyless HTTP GETs and still leaves the search and
-/// the download to follow.
-///
-/// ponytail: one global budget. Per-provider budgets would only matter once one
-/// provider is meaningfully slower than the rest.
+/// YouTube search, and the point of asking several queries at once is that the
+/// slowest of them does not set the wait. Two and a half seconds is generous
+/// for a handful of keyless HTTP POSTs and still leaves the search and the
+/// download to follow.
 pub const DEFAULT_RESOLVE_BUDGET_MS: u64 = 2_500;
-
-/// How confident a catalog match must be before its names override the
-/// transcript.
-///
-/// Now on the matcher's 0-1 scale, where the title must clear 0.65 on its own
-/// and the combination must clear 0.72. The old default of 0.62 was on the
-/// pre-catalog scorer's scale, where a shared word was worth 0.72 on its own, so
-/// it cannot be compared with this one.
-pub const DEFAULT_CATALOG_MATCH_THRESHOLD: f32 = crate::matcher::ACCEPT;
-
-/// Whether a video found *without* a catalog match may be played on its own.
-///
-/// Default `false`, and it should stay that way. Without a catalog there is no
-/// verified running time, which removes the only signal that tells the studio
-/// recording from a remix of it; the scorer then has nothing but a title
-/// similarity and a view count, and `UNRESOLVED_MATCH_THRESHOLD` was low enough
-/// that an unrelated title sharing one word cleared it. Offering the results as
-/// a choice costs the listener one button press and never plays a wrong song
-/// unannounced; this setting only exists for someone who would rather have the
-/// wrong song than the extra click.
-pub const DEFAULT_ALLOW_UNVERIFIED_AUTOPLAY: bool = false;
 
 /// Whether unverified results are offered as a choice when nothing matched.
 ///
@@ -74,7 +32,7 @@ pub const DEFAULT_UNVERIFIED_CHOOSER: bool = true;
 /// Reads a boolean from the environment, falling back to `default`.
 ///
 /// A malformed value is an error rather than a silent default, for the same
-/// reason [`env_f32`] refuses one: a typo in `ALLOW_UNVERIFIED_AUTOPLAY` that
+/// reason [`env_f32`] refuses one: a typo in `UNVERIFIED_CHOOSER` that
 /// quietly became `false` would be invisible, and one that quietly became
 /// `true` would turn the bot back into playing whatever YouTube ranked first.
 pub fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
@@ -209,28 +167,12 @@ pub struct Config {
     pub asr_language: Option<String>,
     pub wake_words: HashSet<String>,
     pub alert_channel_id: Option<u64>,
-    /// Which music catalogs resolve spoken requests, in the order they are asked.
-    pub catalog_providers: Vec<String>,
-    /// Where the song library is written, or `None` to have no memory.
-    pub library_path: Option<PathBuf>,
-    /// Contact details for MusicBrainz, or `None` to leave that provider off.
-    ///
-    /// MusicBrainz's terms require a `User-Agent` that identifies the
-    /// application and gives someone a way to be contacted, and it asks for
-    /// exactly one request a second. A bot that cannot identify itself is not
-    /// welcome there, so this being unset disables the provider rather than
-    /// sending an anonymous request.
-    pub musicbrainz_contact: Option<String>,
     /// How long the whole catalog fan-out may take.
     pub resolve_budget: std::time::Duration,
-    /// How confident a catalog match must be to override the transcript.
-    pub catalog_match_threshold: f32,
     /// How many YouTube results a request is scored against.
     pub search_candidates: usize,
     /// The lowest score a candidate may reach and still be played unasked.
     pub match_threshold: f64,
-    /// Whether a video found without a catalog match may be played unasked.
-    pub allow_unverified_autoplay: bool,
     /// Whether unverified results are offered as a choice when nothing matched.
     pub unverified_chooser: bool,
     /// The small model that listens for the wake word at all times.
@@ -255,12 +197,6 @@ impl Config {
             Ok(value) => AsrEngine::parse(&value)?,
             Err(_) => AsrEngine::Direct,
         };
-        // Only the models that cannot detect a language for themselves need
-        // this; Canary and Nemotron return empty text without it.
-        let asr_language = std::env::var("ASR_LANGUAGE")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
         let request_model = non_empty("REQUEST_MODEL")
             .or_else(|| non_empty("PARAKEET_MODEL"))
             .unwrap_or_else(|| crate::model::DEFAULT_MODEL_ID.to_string());
@@ -273,40 +209,23 @@ impl Config {
             Some(prompt) => Some(prompt),
             None => Some(crate::model::REQUEST_PROMPT.to_string()),
         };
-        // Checked now so a typo stops the bot at startup, not at the first
-        // ambiguous request.
-        parse_ambiguous_policy(std::env::var("AMBIGUOUS_POLICY").ok().as_deref())?;
+        // Only the models that cannot detect a language for themselves need
+        // this; Canary and Nemotron return empty text without it.
+        let asr_language = std::env::var("ASR_LANGUAGE")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let alert_channel_id = parse_optional_id(std::env::var("ALERT_CHANNEL_ID").ok())?;
         let wake_words = std::env::var("WAKE_WORDS")
             .map(|s| split_csv(&s))
             .unwrap_or_else(|_| DEFAULT_WAKE_WORDS.iter().map(|w| w.to_string()).collect())
             .into_iter()
             .collect();
-        let providers_var = std::env::var("CATALOG_PROVIDERS").ok();
-        let legacy_var = std::env::var("CATALOG_PROVIDER").ok();
-        if uses_legacy_catalog_provider(providers_var.as_deref(), legacy_var.as_deref()) {
-            tracing::warn!(
-                "CATALOG_PROVIDER is deprecated; set CATALOG_PROVIDERS (a comma-separated list) instead"
-            );
-        }
-        let catalog_providers =
-            catalog_provider_names(providers_var.as_deref(), legacy_var.as_deref())?;
         Ok(Self {
-            catalog_providers,
-            library_path: library_path(non_empty("LIBRARY_PATH").as_deref()),
-            musicbrainz_contact: std::env::var("MUSICBRAINZ_CONTACT")
-                .ok()
-                .map(|c| c.trim().to_string())
-                .filter(|c| !c.is_empty()),
             resolve_budget: std::time::Duration::from_millis(env_usize(
                 "RESOLVE_BUDGET_MS",
                 DEFAULT_RESOLVE_BUDGET_MS as usize,
             )? as u64),
-            catalog_match_threshold: env_f32(
-                "CATALOG_MATCH_THRESHOLD",
-                DEFAULT_CATALOG_MATCH_THRESHOLD,
-                0.5..=0.95,
-            )?,
             discord_token,
             voice_channel_id,
             asr_engine,
@@ -322,10 +241,6 @@ impl Config {
                 DEFAULT_MATCH_THRESHOLD as f32,
                 0.0..=1000.0,
             )? as f64,
-            allow_unverified_autoplay: env_bool(
-                "ALLOW_UNVERIFIED_AUTOPLAY",
-                DEFAULT_ALLOW_UNVERIFIED_AUTOPLAY,
-            )?,
             unverified_chooser: env_bool("UNVERIFIED_CHOOSER", DEFAULT_UNVERIFIED_CHOOSER)?,
             wake_model: std::env::var("WAKE_MODEL")
                 .ok()
@@ -345,98 +260,33 @@ impl Config {
     }
 }
 
-/// Validates `CATALOG_PROVIDERS`, treating unset as the default.
-///
-/// `legacy` is `CATALOG_PROVIDER`, the single-provider setting this replaced.
-/// It is still accepted, as one item in the list, so an existing `.env` keeps
-/// working -- the caller logs the deprecation.
-///
-/// Split out from [`Config::from_env`] so the accepted names are testable
-/// without also having to supply a Discord token and a voice channel id.
-pub fn catalog_provider_names(
-    value: Option<&str>,
-    legacy: Option<&str>,
-) -> anyhow::Result<Vec<String>> {
-    let raw = match (value, legacy) {
-        (Some(list), _) if !list.trim().is_empty() => list.to_string(),
-        (_, Some(single)) => single.to_string(),
-        _ => DEFAULT_CATALOG_PROVIDERS.to_string(),
-    };
-
-    let mut names: Vec<String> = Vec::new();
-    for entry in split_csv(&raw) {
-        anyhow::ensure!(
-            SUPPORTED_CATALOG_PROVIDERS.contains(&entry.as_str()),
-            "unknown catalog provider '{entry}' in CATALOG_PROVIDERS; supported: {}",
-            SUPPORTED_CATALOG_PROVIDERS.join(", ")
-        );
-        // A repeat costs a duplicate fan-out for nothing.
-        if !names.contains(&entry) {
-            names.push(entry);
-        }
-    }
-    anyhow::ensure!(
-        !names.is_empty(),
-        "CATALOG_PROVIDERS must name at least one provider"
-    );
-    Ok(names)
-}
-
 /// How several artists recording one title are settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AmbiguousPolicy {
+    /// Play the best-scoring candidate without asking.
+    Auto,
     /// Offer the choices.
     Ask,
     /// Play whichever is far more popular.
     Popular,
 }
 
+impl AmbiguousPolicy {
+    fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("auto") => Self::Auto,
+            Some(value) if value.eq_ignore_ascii_case("popular") => Self::Popular,
+            // A typo falls back to asking, which is the safe direction: the
+            // wrong reading of this setting is a wrong song rather than an
+            // extra click.
+            _ => Self::Ask,
+        }
+    }
+}
+
 /// Reads `AMBIGUOUS_POLICY`, treating unset as `ask`.
-///
-/// [`Config::from_env`] has already refused a value that is neither, so the
-/// fallback here is never reached by a typo.
 pub fn ambiguous_policy() -> AmbiguousPolicy {
-    parse_ambiguous_policy(std::env::var("AMBIGUOUS_POLICY").ok().as_deref())
-        .unwrap_or(AmbiguousPolicy::Ask)
-}
-
-fn parse_ambiguous_policy(value: Option<&str>) -> anyhow::Result<AmbiguousPolicy> {
-    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        None | Some("") | Some("ask") => Ok(AmbiguousPolicy::Ask),
-        Some("popular") => Ok(AmbiguousPolicy::Popular),
-        Some(other) => anyhow::bail!("AMBIGUOUS_POLICY must be ask or popular, got {other:?}"),
-    }
-}
-
-/// Reads a required variable, naming it when it is missing.
-fn required(name: &str) -> anyhow::Result<String> {
-    non_empty(name).with_context(|| format!("{name} is not set; add it to .env"))
-}
-
-/// A variable's trimmed value, with blank treated as unset.
-fn non_empty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
-/// Where the song library lives: `LIBRARY_PATH`, the default when unset, or
-/// nowhere when it is `off`.
-fn library_path(value: Option<&str>) -> Option<PathBuf> {
-    match value {
-        None => Some(PathBuf::from(crate::library::DEFAULT_LIBRARY_PATH)),
-        Some(v) if ["off", "none", "false", "0"].contains(&v.to_ascii_lowercase().as_str()) => None,
-        Some(path) => Some(PathBuf::from(path)),
-    }
-}
-
-/// Whether `CATALOG_PROVIDER` is set, which is how startup decides to warn.
-pub fn uses_legacy_catalog_provider(providers: Option<&str>, legacy: Option<&str>) -> bool {
-    match providers {
-        Some(list) if !list.trim().is_empty() => false,
-        _ => legacy.is_some_and(|single| !single.trim().is_empty()),
-    }
+    AmbiguousPolicy::parse(std::env::var("AMBIGUOUS_POLICY").ok().as_deref())
 }
 
 /// Parses an optional channel id, treating blank as unset.
@@ -452,6 +302,19 @@ fn parse_optional_id(value: Option<String>) -> anyhow::Result<Option<u64>> {
         .map_err(Into::into)
 }
 
+/// Reads a required variable, naming it when it is missing.
+fn required(name: &str) -> anyhow::Result<String> {
+    non_empty(name).with_context(|| format!("{name} is not set; add it to .env"))
+}
+
+/// A variable's trimmed value, with blank treated as unset.
+fn non_empty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 fn split_csv(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -463,32 +326,6 @@ fn split_csv(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_ambiguous_policy_refuses_a_typo() {
-        assert_eq!(parse_ambiguous_policy(None).unwrap(), AmbiguousPolicy::Ask);
-        assert_eq!(
-            parse_ambiguous_policy(Some(" Popular ")).unwrap(),
-            AmbiguousPolicy::Popular
-        );
-        let err = parse_ambiguous_policy(Some("auto"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("AMBIGUOUS_POLICY"), "{err}");
-    }
-
-    #[test]
-    fn the_library_is_on_by_default_and_can_be_turned_off() {
-        assert_eq!(
-            library_path(None),
-            Some(PathBuf::from(crate::library::DEFAULT_LIBRARY_PATH))
-        );
-        assert_eq!(library_path(Some("off")), None);
-        assert_eq!(
-            library_path(Some("/tmp/x.json")),
-            Some(PathBuf::from("/tmp/x.json"))
-        );
-    }
 
     #[test]
     fn parses_csv_wake_words() {
@@ -521,84 +358,7 @@ mod tests {
         assert!(parse_optional_id(Some("not-a-channel".to_string())).is_err());
     }
 
-    /// An unknown catalog must be named in the error, or a typo looks like the
-    /// bot ignoring the setting.
-    #[test]
-    fn an_unknown_catalog_provider_is_rejected_by_name() {
-        let err = catalog_provider_names(Some("spotify"), None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("spotify"), "unhelpful error: {err}");
-        assert!(
-            err.contains("deezer"),
-            "should list what is supported: {err}"
-        );
-    }
-
-    #[test]
-    fn the_catalog_providers_default_and_are_case_insensitive() {
-        assert_eq!(
-            catalog_provider_names(None, None).unwrap(),
-            ["deezer", "itunes"]
-        );
-        assert_eq!(
-            catalog_provider_names(Some("  "), None).unwrap(),
-            ["deezer", "itunes"]
-        );
-        assert_eq!(
-            catalog_provider_names(Some(" Itunes , Deezer "), None).unwrap(),
-            ["itunes", "deezer"],
-            "the order asked for is the order asked in"
-        );
-    }
-
-    /// `CATALOG_PROVIDER` is still accepted as a one-item list, so an existing
-    /// `.env` keeps working, and the caller is told to move on.
-    #[test]
-    fn the_single_provider_setting_still_works_and_is_flagged() {
-        assert_eq!(
-            catalog_provider_names(None, Some(" Deezer ")).unwrap(),
-            ["deezer"]
-        );
-        assert!(
-            uses_legacy_catalog_provider(None, Some("deezer")),
-            "startup should warn about the old name"
-        );
-        assert!(
-            !uses_legacy_catalog_provider(Some("deezer"), Some("deezer")),
-            "but not when the new one is set too"
-        );
-        assert!(!uses_legacy_catalog_provider(Some("deezer"), None));
-    }
-
-    /// A repeat costs a duplicate fan-out for nothing.
-    #[test]
-    fn a_repeated_provider_is_asked_once() {
-        assert_eq!(
-            catalog_provider_names(Some("deezer,deezer"), None).unwrap(),
-            ["deezer"]
-        );
-    }
-
-    /// An empty list would leave the bot with no catalog at all, and that is a
-    /// mistake worth refusing at startup rather than at the first request.
-    #[test]
-    fn an_empty_provider_list_is_refused() {
-        assert!(
-            catalog_provider_names(Some(" , , "), None)
-                .expect_err("nothing usable")
-                .to_string()
-                .contains("at least one")
-        );
-    }
-
-    /// Unverified autoplay is off unless the operator says otherwise, because the
-    /// whole point is not to play a song no catalog confirmed. Pinned at compile
-    /// time so it cannot be flipped by accident.
-    const _: () = assert!(!DEFAULT_ALLOW_UNVERIFIED_AUTOPLAY);
-
-    /// A typo must not become a silent `false` here: this flag decides whether
-    /// the bot plays something it could not verify.
+    /// A typo must not become a silent `false` here.
     #[test]
     fn a_malformed_boolean_is_an_error_rather_than_a_default() {
         for (raw, expected) in [
@@ -611,18 +371,12 @@ mod tests {
             ("No", false),
             ("off", false),
         ] {
-            assert_eq!(
-                parse_bool("ALLOW_UNVERIFIED_AUTOPLAY", raw).unwrap(),
-                expected
-            );
+            assert_eq!(parse_bool("UNVERIFIED_CHOOSER", raw).unwrap(), expected);
         }
-        let err = parse_bool("ALLOW_UNVERIFIED_AUTOPLAY", "ture")
+        let err = parse_bool("UNVERIFIED_CHOOSER", "ture")
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("ALLOW_UNVERIFIED_AUTOPLAY"),
-            "unhelpful: {err}"
-        );
+        assert!(err.contains("UNVERIFIED_CHOOSER"), "unhelpful: {err}");
         assert!(err.contains("true or false"), "unhelpful: {err}");
     }
 
@@ -643,6 +397,18 @@ mod tests {
     fn the_removed_whisper_engine_says_where_to_go() {
         let err = AsrEngine::parse("whisper").unwrap_err().to_string();
         assert!(err.contains("ASR_ENGINE=direct"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn the_ambiguity_policy_is_case_insensitive_and_asks_on_a_typo() {
+        assert_eq!(AmbiguousPolicy::parse(Some("auto")), AmbiguousPolicy::Auto);
+        assert_eq!(
+            AmbiguousPolicy::parse(Some(" POPULAR ")),
+            AmbiguousPolicy::Popular
+        );
+        assert_eq!(AmbiguousPolicy::parse(Some("ask")), AmbiguousPolicy::Ask);
+        assert_eq!(AmbiguousPolicy::parse(Some("atou")), AmbiguousPolicy::Ask);
+        assert_eq!(AmbiguousPolicy::parse(None), AmbiguousPolicy::Ask);
     }
 
     #[test]

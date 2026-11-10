@@ -4,15 +4,18 @@ use crate::direct::DirectTranscriber;
 use crate::parakeet::HandyTranscriber;
 use crate::player::Player;
 use crate::resolve;
+use crate::search;
 use crate::state::{
     BigModelsKey, ConfigKey, HttpClientKey, ListenLock, ListenLockKey, PlayerKey, TranscriberKey,
 };
 use crate::transcriber::Transcriber;
 use crate::voice::{VoiceService, decode_config};
 use crate::wake::BigModels;
+use serenity::all::AutocompleteChoice;
 use serenity::async_trait;
 use serenity::builder::{
-    CreateCommand, CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseMessage,
+    CreateAutocompleteResponse, CreateCommand, CreateCommandOption, CreateInteractionResponse,
+    CreateInteractionResponseMessage, EditInteractionResponse,
 };
 use serenity::model::application::{
     CommandInteraction, CommandOptionType, ComponentInteraction, Interaction, ResolvedValue,
@@ -23,6 +26,7 @@ use serenity::model::voice::VoiceState;
 use serenity::prelude::*;
 use songbird::SerenityInit;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub async fn start(config: Config) -> anyhow::Result<()> {
     // Two models, because they pay for being loaded differently. The wake model
@@ -109,22 +113,13 @@ fn log_configuration(config: &Config, big_models: &BigModels) {
         wake_words = %wake_words.join(", "),
         voice_channel = config.voice_channel_id,
         text_channel = %text_channel,
-        catalog_providers = %config.catalog_providers.join(","),
         resolve_budget_ms = config.resolve_budget.as_millis() as u64,
-        catalog_match_threshold = config.catalog_match_threshold,
         yt_dlp = %yt_dlp,
         "Shamash starting up"
     );
 }
 
 pub struct Handler;
-
-/// The song library, unless `LIBRARY_PATH=off`.
-fn library(config: &Config) -> Option<Arc<crate::library::Library>> {
-    let path = config.library_path.as_deref()?;
-    tracing::info!(path = %path.display(), "remembering requests in the library");
-    Some(Arc::new(crate::library::Library::load(Some(path))))
-}
 
 /// The slash commands, in one place so both registrations cannot disagree.
 fn commands() -> Vec<CreateCommand> {
@@ -134,15 +129,11 @@ fn commands() -> Vec<CreateCommand> {
             .description("Stop listening for voice commands (music keeps playing)"),
         CreateCommand::new("unlock").description("Start listening for voice commands again"),
         CreateCommand::new("play")
-            .description("Play a song: pick one as you type, paste a YouTube link, or search")
+            .description("Search the catalog for a song and choose from the results")
             .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "song",
-                    "Start typing to see songs, or paste a link",
-                )
-                .required(true)
-                .set_autocomplete(true),
+                CreateCommandOption::new(CommandOptionType::String, "song", "What to search for")
+                    .required(true)
+                    .set_autocomplete(true),
             ),
     ]
 }
@@ -179,9 +170,10 @@ impl EventHandler for Handler {
         };
         match resolve::Catalog::from_config(&config) {
             Ok(catalog) => {
-                ctx.data.write().await.insert::<PlayerKey>(Arc::new(
-                    Player::new(manager, Arc::new(catalog)).with_library(library(&config)),
-                ));
+                ctx.data
+                    .write()
+                    .await
+                    .insert::<PlayerKey>(Arc::new(Player::new(manager, Arc::new(catalog))));
             }
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "could not reach the song catalog, playback is disabled")
@@ -251,11 +243,12 @@ impl EventHandler for Handler {
                 "unlock" => self.slash_lock(&ctx, command, false).await,
                 _ => {}
             },
-            Interaction::Autocomplete(typing) if typing.data.name == "play" => {
-                self.suggest(&ctx, typing).await
+            Interaction::Autocomplete(command) => {
+                if command.data.name.as_str() == "play" {
+                    self.slash_autocomplete_play(&ctx, command).await;
+                }
             }
             Interaction::Component(button) => self.component(&ctx, button).await,
-            // Modal submissions and autocomplete have no dashboard buttons.
             _ => {}
         }
     }
@@ -328,12 +321,11 @@ impl Handler {
         // A chooser raised by speech belongs to the voice channel, so it keeps the
         // channel's rule rather than a named person. `/play` is the other way
         // round and is checked by `ask_belongs_to` below.
-        let message_id = button.message.id;
-        let spoken = player.ask_is_spoken(message_id);
+        let spoken = player.ask_is_spoken(guild_id);
         let may_answer = if spoken {
             may_control(ctx, guild_id, button.user.id).await
         } else {
-            player.ask_belongs_to(message_id, button.user.id)
+            player.ask_belongs_to(guild_id, button.user.id)
         };
         if !may_answer {
             tracing::info!(
@@ -348,10 +340,7 @@ impl Handler {
 
         match asked {
             Asked::Song(index) => {
-                if let Err(e) = player
-                    .play_asked(ctx, &config, guild_id, message_id, index)
-                    .await
-                {
+                if let Err(e) = player.play_asked(ctx, &config, guild_id, index).await {
                     tracing::warn!(guild_id = %guild_id, index, error = %format!("{e:#}"), "could not play that song");
                     refuse(ctx, button).await;
                 } else {
@@ -359,46 +348,18 @@ impl Handler {
                 }
             }
             Asked::Next => {
-                if !player.next_page(ctx, message_id).await {
+                if !player.next_page(ctx, guild_id).await {
                     refuse(ctx, button).await;
                 }
             }
             Asked::Dismiss => {
-                player.dismiss_ask(message_id);
+                player.dismiss_ask(guild_id);
                 drop_question(ctx, button.channel_id, button.message.id, guild_id).await;
             }
         }
     }
     /// Handles `/play <song>`: searches the catalog and posts the results as a
     /// paged chooser for the asker to pick from.
-    /// `/play` autocomplete: the songs matching what has been typed so far.
-    ///
-    /// Always answered, with an empty list if need be: Discord shows an error
-    /// in the box for a request it gets no answer to.
-    async fn suggest(&self, ctx: &Context, typing: CommandInteraction) {
-        let typed = typing
-            .data
-            .autocomplete()
-            .map(|focused| focused.value.to_string())
-            .unwrap_or_default();
-        let player = ctx.data.read().await.get::<PlayerKey>().cloned();
-        let choices = match player {
-            Some(player) => player.suggestions.choices(&typed).await,
-            None => Vec::new(),
-        };
-        let response = choices.into_iter().fold(
-            serenity::builder::CreateAutocompleteResponse::new(),
-            |response, choice| response.add_string_choice(choice.name, choice.value),
-        );
-        if let Err(e) = typing
-            .create_response(&ctx.http, CreateInteractionResponse::Autocomplete(response))
-            .await
-        {
-            // Superseded by the next keystroke more often than not.
-            tracing::debug!(error = %format!("{e:#}"), "could not answer autocomplete");
-        }
-    }
-
     async fn slash_play(
         &self,
         ctx: &Context,
@@ -430,36 +391,49 @@ impl Handler {
             return;
         }
 
+        // If the query is a specific video selected from autocomplete (or a direct URL),
+        // play it directly without needing another chooser.
+        if let Some(video_id) = search::url_video_id(&query) {
+            let _ = command.defer_ephemeral(&ctx.http).await;
+            match player
+                .play_direct(ctx, &config, guild_id, &query, video_id)
+                .await
+            {
+                Ok((title, starting)) => {
+                    let text = if starting {
+                        format!("Playing **{title}**")
+                    } else {
+                        format!("Queued **{title}**")
+                    };
+                    let _ = command
+                        .edit_response(&ctx.http, EditInteractionResponse::new().content(text))
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(guild_id = %guild_id, query = %query, error = %format!("{e:#}"), "could not play direct video");
+                    let _ = command
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new()
+                                .content(format!("Could not play that song: {e:#}")),
+                        )
+                        .await;
+                }
+            }
+            return;
+        }
+
         // Acknowledged before the search, not after it. Discord drops an
         // interaction that is not answered within three seconds, and the
-        // catalog alone can take most of that when its rate limits are shared
-        // with spoken requests; posting the chooser then pushed the reply past
-        // the deadline, and the person who typed /play saw nothing at all.
-        // Deferred, it shows "thinking…" at once and the answer has 15 minutes.
+        // catalog's rate limit is shared with spoken requests and autocomplete,
+        // so the search plus posting the chooser could run past it and the
+        // person who typed /play saw nothing at all. Deferred, it shows
+        // "thinking…" at once and the answer has 15 minutes.
         if let Err(e) = command.defer_ephemeral(&ctx.http).await {
             tracing::warn!(error = %format!("{e:#}"), "could not acknowledge /play");
             return;
         }
         let started = std::time::Instant::now();
-        let query = match crate::suggest::wanted(&query) {
-            crate::suggest::Wanted::Video(video_id) => {
-                let played = player.play_video(ctx, &config, guild_id, &video_id).await;
-                tracing::info!(
-                    guild_id = %guild_id,
-                    video_id = %video_id,
-                    ok = played.is_ok(),
-                    took_ms = started.elapsed().as_millis() as u64,
-                    "/play picked"
-                );
-                let text = match played {
-                    Ok(label) => format!("Queued **{label}**."),
-                    Err(e) => format!("I couldn't play that one: {e:#}"),
-                };
-                finish(ctx, &command, &text).await;
-                return;
-            }
-            crate::suggest::Wanted::Search(query) => query,
-        };
         let searched = player
             .search_and_ask(ctx, &config, guild_id, &query, command.user.id)
             .await;
@@ -498,39 +472,57 @@ impl Handler {
         }
     }
 
-    /// Handles `/stop`, which leaves the voice channel as well as stopping.
-    async fn slash_stop(
-        &self,
-        ctx: &Context,
-        command: serenity::model::application::CommandInteraction,
-    ) {
-        if command.data.name != "stop" {
+    /// Answers slash command autocomplete queries for `/play song:<query>`,
+    /// displaying catalog suggestions in the top popup menu for arrow-key selection.
+    async fn slash_autocomplete_play(&self, ctx: &Context, command: CommandInteraction) {
+        let query = command
+            .data
+            .options
+            .iter()
+            .find(|opt| opt.name == "song")
+            .and_then(|opt| opt.value.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        if query.is_empty() {
+            let response = CreateInteractionResponse::Autocomplete(
+                CreateAutocompleteResponse::new().set_choices(Vec::new()),
+            );
+            let _ = command.create_response(&ctx.http, response).await;
             return;
         }
 
-        let response = match command.guild_id {
-            Some(guild_id) if may_control(ctx, guild_id, command.user.id).await => {
-                match VoiceService::from_ctx(ctx).await {
-                    Ok(service) => {
-                        let was_connected = service.manager.get(guild_id).is_some();
-                        match service.stop(guild_id).await {
-                            Ok(()) if was_connected => "Left the voice channel.".to_string(),
-                            Ok(()) => "I wasn't in a voice channel.".to_string(),
-                            Err(e) => format!("Failed to leave: {e}"),
-                        }
-                    }
-                    Err(e) => format!("Internal error: {e:#}"),
-                }
-            }
-            Some(_) => NOT_IN_VOICE.to_string(),
-            None => "This command must be used in a server.".to_string(),
+        let Some((_config, player)) = ready(ctx).await else {
+            let response = CreateInteractionResponse::Autocomplete(
+                CreateAutocompleteResponse::new().set_choices(Vec::new()),
+            );
+            let _ = command.create_response(&ctx.http, response).await;
+            return;
         };
 
-        let reply = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content(response),
+        let tracks = tokio::time::timeout(Duration::from_millis(2500), player.autocomplete(&query))
+            .await
+            .unwrap_or_default();
+
+        let choices: Vec<AutocompleteChoice> = tracks
+            .into_iter()
+            .take(25)
+            .map(|track| {
+                let name = format_autocomplete_name(&track);
+                let value = if let Some(video_id) = &track.video_id {
+                    format!("https://youtu.be/{video_id}")
+                } else {
+                    format!("{} by {}", track.title, track.artist)
+                };
+                AutocompleteChoice::new(name, value)
+            })
+            .collect();
+
+        let response = CreateInteractionResponse::Autocomplete(
+            CreateAutocompleteResponse::new().set_choices(choices),
         );
-        if let Err(e) = command.create_response(&ctx.http, reply).await {
-            tracing::warn!("failed to respond to /stop: {e}");
+        if let Err(e) = command.create_response(&ctx.http, response).await {
+            tracing::debug!(error = %format!("{e:#}"), "failed to respond to autocomplete");
         }
     }
 
@@ -584,20 +576,48 @@ impl Handler {
         }
     }
 
+    /// Handles `/stop`, which leaves the voice channel as well as stopping.
+    async fn slash_stop(
+        &self,
+        ctx: &Context,
+        command: serenity::model::application::CommandInteraction,
+    ) {
+        if command.data.name != "stop" {
+            return;
+        }
+
+        let response = match command.guild_id {
+            Some(guild_id) if may_control(ctx, guild_id, command.user.id).await => {
+                match VoiceService::from_ctx(ctx).await {
+                    Ok(service) => {
+                        let was_connected = service.manager.get(guild_id).is_some();
+                        match service.stop(guild_id).await {
+                            Ok(()) if was_connected => "Left the voice channel.".to_string(),
+                            Ok(()) => "I wasn't in a voice channel.".to_string(),
+                            Err(e) => format!("Failed to leave: {e}"),
+                        }
+                    }
+                    Err(e) => format!("Internal error: {e:#}"),
+                }
+            }
+            Some(_) => NOT_IN_VOICE.to_string(),
+            None => "This command must be used in a server.".to_string(),
+        };
+
+        let reply = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content(response),
+        );
+        if let Err(e) = command.create_response(&ctx.http, reply).await {
+            tracing::warn!("failed to respond to /stop: {e}");
+        }
+    }
+
     /// Handles a press of one of the dashboard's buttons.
     ///
     /// The press is acknowledged straight away, because Discord fails an
     /// interaction that goes unanswered within three seconds and a skip may
     /// have to download nothing but still waits on the voice lock.
     async fn dashboard_button(&self, ctx: &Context, button: ComponentInteraction) {
-        // A choice button is not a playback action and would be rejected by
-        // `action_from_id`, so it is answered before the actions are read.
-        if dashboard::picked_key(&button.data.custom_id).is_some() {
-            // Left over from the previous chooser, which keyed its buttons by
-            // video id. The one chooser now numbers them instead.
-            tracing::debug!("ignoring a button from the superseded chooser");
-            return;
-        }
         let Some(action) = dashboard::action_from_id(&button.data.custom_id) else {
             // Some other component's press; not ours to answer.
             return;
@@ -656,16 +676,7 @@ impl Handler {
                 let repeat = player.toggle_repeat(ctx, &config, guild_id).await;
                 tracing::info!(guild_id = %guild_id, repeat, "toggled repeat");
             }
-            // "None of these": the listener said no, so the question goes.
-            // Handled after the player lookup because it is not a playback
-            // action and needs no dashboard.
-            dashboard::ACTION_NONE => {
-                if !player.dismiss_ask(button.message.id) {
-                    return;
-                }
-                drop_question(ctx, button.channel_id, button.message.id, guild_id).await;
-            }
-            // `action_from_id` only returns the four above.
+            // `action_from_id` covers every live action above.
             _ => {}
         }
     }
@@ -722,6 +733,14 @@ fn typed_song(command: &CommandInteraction) -> Option<String> {
     (!query.is_empty()).then_some(query)
 }
 
+/// Replaces the "thinking…" of a deferred command with its answer.
+async fn finish(ctx: &Context, command: &CommandInteraction, text: &str) {
+    let edit = EditInteractionResponse::new().content(text);
+    if let Err(e) = command.edit_response(&ctx.http, edit).await {
+        tracing::warn!(error = %format!("{e:#}"), "could not answer a deferred command");
+    }
+}
+
 /// Answers a slash command privately.
 async fn reply(ctx: &Context, command: CommandInteraction, text: &str) {
     let response = CreateInteractionResponse::Message(
@@ -738,14 +757,6 @@ async fn reply(ctx: &Context, command: CommandInteraction, text: &str) {
 ///
 /// Ephemeral rather than a public reply, so pressing Skip from the wrong
 /// channel does not announce itself to the room.
-/// Replaces the "thinking…" of a deferred command with its answer.
-async fn finish(ctx: &Context, command: &CommandInteraction, text: &str) {
-    let edit = serenity::builder::EditInteractionResponse::new().content(text);
-    if let Err(e) = command.edit_response(&ctx.http, edit).await {
-        tracing::warn!(error = %format!("{e:#}"), "could not answer a deferred command");
-    }
-}
-
 async fn refuse(ctx: &Context, button: ComponentInteraction) {
     let reply = CreateInteractionResponse::Message(
         CreateInteractionResponseMessage::new()
@@ -754,5 +765,55 @@ async fn refuse(ctx: &Context, button: ComponentInteraction) {
     );
     if let Err(e) = button.create_response(&ctx.http, reply).await {
         tracing::warn!("could not refuse a button press: {e}");
+    }
+}
+
+/// Formats a catalog track for a Discord autocomplete choice label (max 100 characters).
+fn format_autocomplete_name(track: &resolve::CatalogTrack) -> String {
+    let mut name = format!("{} — {}", track.artist, track.title);
+    if let Some(duration) = track.duration_secs {
+        let total = duration.max(0.0) as u64;
+        let dur = format!(" ({}:{:02})", total / 60, total % 60);
+        if name.chars().count() + dur.chars().count() <= 100 {
+            name.push_str(&dur);
+        }
+    }
+    if name.chars().count() > 100 {
+        name = name.chars().take(97).collect::<String>() + "...";
+    }
+    name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autocomplete_name_includes_artist_title_and_duration() {
+        let track = resolve::CatalogTrack {
+            artist: "Queen".to_string(),
+            title: "Bohemian Rhapsody".to_string(),
+            duration_secs: Some(355.0),
+            popularity: None,
+            video_id: Some("fJ9rUzIMcZQ".to_string()),
+        };
+        assert_eq!(
+            format_autocomplete_name(&track),
+            "Queen — Bohemian Rhapsody (5:55)"
+        );
+    }
+
+    #[test]
+    fn autocomplete_name_clamps_to_100_chars() {
+        let track = resolve::CatalogTrack {
+            artist: "A".repeat(60),
+            title: "B".repeat(60),
+            duration_secs: Some(120.0),
+            popularity: None,
+            video_id: Some("123".to_string()),
+        };
+        let formatted = format_autocomplete_name(&track);
+        assert!(formatted.chars().count() <= 100);
+        assert!(formatted.ends_with("..."));
     }
 }

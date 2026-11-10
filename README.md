@@ -25,13 +25,12 @@ leaves the host.
   microseconds per frame. The small wake model runs only while someone is
   talking, and the large model only on an utterance that had the wake word in
   it.
-- **Finds the right upload.** A request is resolved against music catalogs
-  (Deezer, iTunes), which supply the real title, artist and running time.
-  YouTube and YouTube Music results are then scored against those, so the
-  artist's own upload beats a remix, a lyric video or someone else's re-upload.
-  If it is not sure, it asks instead of guessing.
-- **`/play` with live suggestions.** Start typing and matching songs appear,
-  as YouTube Music lists them. Pick one and that exact song is queued.
+- **Finds the right upload.** A request is resolved against YouTube Music's
+  song catalog, which supplies the real title, artist, running time and the
+  video the song is on. So the artist's own upload beats a remix, a lyric video
+  or someone else's re-upload. If it is not sure, it asks instead of guessing.
+- **`/play` with live suggestions.** Start typing and matching songs from
+  YouTube Music appear. Pick one and that exact song is queued.
 - **`/lock` and `/unlock`.** Turn listening off without removing the bot.
 - **Autonomous.** Joins when someone enters the configured channel, including
   at startup, and leaves when it is empty.
@@ -142,16 +141,15 @@ Every command needs you to be in the bot's voice channel.
 Start typing after `/play` and the matching songs appear over the message box:
 
 ```
-Moonlight 🅴 – XXXTENTACION  [2:16]
-Jocelyn Flores 🅴 – XXXTENTACION  [2:00]
-Falling Down (Bonus Track) 🅴 – Lil Peep & XXXTENTACION  [3:17]
+Tame Impala — Dracula (3:26)
+Tame Impala — Dracula (feat. JENNIE) (3:30)
+Iuly Neamtu — Dracula (Frappula) (2:17)
 ```
 
 - **Pick a suggestion** and that exact song is queued. Each suggestion carries
-  the video id of the song's own audio upload, so there is nothing left to
-  search for. 🅴 marks YouTube Music's explicit badge.
-- **Paste a link** (`youtube.com/watch`, `youtu.be`, `music.youtube.com`,
-  shorts) and that video is queued.
+  the video id YouTube Music lists for the song, so there is nothing left to
+  search for.
+- **Paste a YouTube link** and that video is queued.
 - **Press Enter on your own text** without picking a suggestion, and the bot
   searches the catalog and replies with a numbered list, nine to a page:
 
@@ -171,13 +169,15 @@ Falling Down (Bonus Track) 🅴 – Lil Peep & XXXTENTACION  [3:17]
   again or reshuffles the list. That chooser is private to whoever typed the
   command.
 
-Suggestions are cached per query, so typing back over a word does not search
-again. If YouTube Music is slow or down, the suggestion box stays empty and
-pressing Enter still works.
+If YouTube Music is slow or down, the suggestion box stays empty and pressing
+Enter still works.
 
 `/play` answers at once with "thinking…" and fills the reply in when the search
 is done. Discord drops a command that is not answered within three seconds, and
 a search can take most of that.
+
+A chooser, from `/play` or from speech, is taken down after 30 seconds without
+an answer, and a newer one replaces it.
 
 ### `/lock` and `/unlock`
 
@@ -249,16 +249,11 @@ the bot at startup instead of silently falling back to a default.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `CATALOG_PROVIDERS` | `deezer,itunes` | Catalogs to resolve requests against, comma-separated: `deezer`, `itunes`, `musicbrainz` |
-| `MUSICBRAINZ_CONTACT` | unset | A contact address for MusicBrainz, which its terms require. MusicBrainz stays off without it |
 | `RESOLVE_BUDGET_MS` | `2500` | How long the catalog lookup may take in total |
-| `CATALOG_MATCH_THRESHOLD` | `0.72` | How closely a catalog match must agree with what was heard to replace it, from 0.5 to 0.95 |
-| `AMBIGUOUS_POLICY` | `ask` | When several artists recorded the title asked for: `ask` offers the choices, `popular` plays the far more popular one |
+| `AMBIGUOUS_POLICY` | `ask` | When several artists recorded the title asked for: `ask` offers the choices, `auto` plays the most-played one, `popular` plays one only if it is far more popular |
 | `SEARCH_CANDIDATES` | `8` | How many YouTube results a request is scored against, 1 to 50 |
 | `MATCH_THRESHOLD` | `90` | The lowest score an upload may have and still play without asking |
 | `UNVERIFIED_CHOOSER` | `true` | When no catalog knows the song, offer the YouTube results as a choice. With `false`, the bot only plays the miss tone |
-| `ALLOW_UNVERIFIED_AUTOPLAY` | `false` | Play a result with no catalog match without asking. Not recommended |
-| `LIBRARY_PATH` | `data/library.json` | Where requests that turned out right are remembered, so the same words find the same song faster. `off` disables it |
 | `LLM_ENDPOINT` | unset | An Ollama-compatible endpoint that rewrites misheard transcripts. See [The rewrite stage](#the-rewrite-stage) |
 | `LLM_MODEL` | `llama3.2` | The model to use at that endpoint |
 
@@ -269,7 +264,7 @@ The models are loaded differently, which is the whole reason there are two:
 | | `WAKE_MODEL` | `REQUEST_MODEL` |
 | --- | --- | --- |
 | Loaded | at startup, always resident | on the first wake word, then resident |
-| Runs | every 500 ms while someone is talking | once per utterance with the wake word in it |
+| Runs | every 250 ms while someone is talking | once per utterance with the wake word in it |
 | Job | hear one short word | turn the whole utterance into text |
 | Default | `parakeet-tdt_ctc-110m` | `whisper-large-v3-turbo` |
 
@@ -341,7 +336,7 @@ These constants in the code decide how listening behaves:
 | Constant | Default | Raise it to |
 | --- | --- | --- |
 | `wake::WAKE_WINDOW` | 2 s | hear a slower wake word, at the cost of more audio per check |
-| `wake::WAKE_HOP` | 500 ms | use less GPU on a busy channel, at the cost of a later first tone |
+| `wake::WAKE_HOP` | 250 ms | use less GPU on a busy channel, at the cost of a later first tone |
 | `wake::ARM_TTL` | 8 s | give people longer to say the request after a bare wake word |
 | `segment::HANGOVER_FRAMES` | 640 ms | survive longer pauses inside a request, at the cost of a slower answer |
 | `player::DUCK_VOLUME` | 20% | lower the music less while someone talks to the bot |
@@ -359,7 +354,7 @@ Discord voice (Opus @ 48 kHz) ──► songbird receive, decoded to 16 kHz mono
 │  keeps every frame between, plus 300 ms of lead-in       │
 │                                                          │
 │  WAKE MODEL (small, resident): last 2 s of the utterance │
-│  checked every 500 ms while the speaker is talking       │
+│  checked every 250 ms while the speaker is talking       │
 └──────────────────────────────────────────────────────────┘
         │ wake word heard (mid-sentence is fine)
         ▼
@@ -378,9 +373,9 @@ Discord voice (Opus @ 48 kHz) ──► songbird receive, decoded to 16 kHz mono
         ▼
 Parser: "bot, [play] <title> by <artist>" → request
         ▼
-Catalogs (Deezer, iTunes): the song's real artist, title and length
+YouTube Music catalog: the song's real artist, title, length and video
         ▼
-YouTube + YouTube Music search, scored against that length
+the song's own video, or YouTube uploads scored against that length
         │
         ├──► not confident: a chooser in the text channel
         ▼
@@ -397,7 +392,7 @@ model intact. A loudness gate would drop exactly those, and quiet speakers
 entirely.
 
 While someone talks, the small wake model checks the last two seconds every
-500 ms. Once it hears the wake word, the whole utterance goes to the large
+250 ms. Once it hears the wake word, the whole utterance goes to the large
 model when the speaker stops, so the request is transcribed in one piece, wake
 word included.
 
@@ -405,14 +400,21 @@ word included.
 
 Speech-to-text mishears names, and a YouTube search on misheard words returns
 whatever matched those letters. A music catalog, though, is a list of real
-songs. Before anything is searched for, the request is looked up in the
-catalogs, which return the artist's own spelling of the title and the track's
-running time. A catalog match that does not agree closely enough with what was
-heard (`CATALOG_MATCH_THRESHOLD`) is discarded in favour of the transcript.
+songs. Before anything is searched for, the request is looked up in YouTube
+Music's song search, which returns the artist's own spelling of the title, the
+track's running time, its play count, and the video the song is on. A match
+that does not agree closely enough with what was heard is discarded in favour
+of the transcript.
 
-The lookup has a 2.5 s budget. A slow or failing catalog never blocks a
-request: the bot carries on with the words it heard. That includes Deezer's
-spent quota, which it reports as HTTP 200 with an `error` in the body.
+The search goes out as several queries at once: the free text, the artist's
+name when it was heard right and the title was not, and the title alone when no
+artist was named. The lookup has a 2.5 s budget (`RESOLVE_BUDGET_MS`). A slow
+or failing catalog never blocks a request: the bot carries on with the words
+it heard.
+
+"Dracula (feat. JENNIE)" and "Dracula" are different recordings with the same
+name. When both are listed, the plain title is taken as the song, so a request
+for Dracula does not play the feature.
 
 " by " is part of more song titles than you would think (*Stand By Me*, *By The
 Way*), so the bot keeps every way of splitting the request and tries each in
@@ -420,9 +422,9 @@ turn. "stand by me by ben e king" is first tried as *Ben E. King — Stand By Me
 
 Some titles are not distinctive. "Look at Me" has been recorded by Naughty Boy,
 Tems, The Neighbourhood and others, and a request that names no artist gives
-the catalog nothing to choose by. The bot then offers the choices
-(`AMBIGUOUS_POLICY=ask`) instead of aiming the search at an artist nobody
-asked for.
+the catalog nothing to choose by. By default the bot offers the choices instead of aiming the search at an
+artist nobody asked for. `AMBIGUOUS_POLICY=auto` plays the most-played one
+instead.
 
 ### Choosing the upload
 
@@ -436,21 +438,17 @@ Dracula*:
 | JENNIE Remix (Lyrics) | 211 s | 50.8 M |
 | **Dracula**, artist's channel | **206 s** | 2.8 M |
 
-The catalog says the song runs 205 s, so the top two are not that song. Results
-are therefore scored mainly on running time, then channel, title and type of
-media. Views count only a little, to break ties.
+The catalog says the song runs 206 s, so the top two are not that song. When
+the catalog knows the song's own video, that video is played directly. A video
+search also tends to miss it: for *Tame Impala Dracula*, the artist's own audio
+upload was ninth, behind a stranger's re-upload of the same audio.
 
-A video search also tends to miss the upload that matters most. For *Tame
-Impala Dracula*, the artist's own audio upload was ninth, behind a stranger's
-re-upload of the same audio. So YouTube Music's song search runs alongside the
-video search, and the audio uploads it returns compete with the videos.
+Otherwise YouTube results are scored mainly on running time, then channel,
+title and type of media. Views count only a little, to break ties.
 
-Below `MATCH_THRESHOLD` the bot asks instead of playing. When no catalog knew
-the song, nothing plays unless someone presses a choice: without a verified
+Below `MATCH_THRESHOLD` the bot asks instead of playing. When the catalog did
+not know the song, nothing plays unless someone presses a choice: without a verified
 running time, the scorer cannot tell the studio recording from a remix of it.
-
-Requests that played and were not skipped are remembered in `LIBRARY_PATH`, so
-the same words find the same song faster next time.
 
 ### Playback and caching
 
@@ -486,8 +484,8 @@ check, the catalog match, and the scores of the winner and the runner-up:
 
 ```
 wake model heard: "shamash play dracula"
-resolved against the catalog provider=deezer catalog=Dracula — Tame Impala
-  duration=Some(205.0) confidence=0.94 query=Tame Impala Dracula
+resolved against the catalog provider=ytmusic catalog=Dracula — Tame Impala
+  duration=Some(206.0) confidence=0.94 query=Tame Impala Dracula
 chose a video heard=drakula tame impala picked=Dracula channel=Tame Impala
   chosen=total 124.0 (duration +100.0, channel +30.0, relevance +18.0,
   media +0.0, views +6.0) runner_up=Dracula (Lyrics) (101.4)

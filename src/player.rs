@@ -166,9 +166,8 @@ pub struct Player {
     /// The "which one did you mean" buttons currently on offer.
     /// The outstanding `/play` search per guild.
     asks: Asks,
+    /// Who has the music lowered while they talk to the bot.
     ducks: Ducks,
-    /// `/play` autocomplete, and what each suggestion stands for.
-    pub suggestions: Arc<crate::suggest::Suggestions>,
     /// What the bot remembers, or `None` when it has been given no place to
     /// remember in.
     pub library: Option<Arc<crate::library::Library>>,
@@ -178,6 +177,8 @@ pub struct Player {
     started_at: StartedAt,
     /// Downloads the audio for a chosen video.
     fetch: Arc<dyn AudioFetcher>,
+    /// Cache of tracks offered in autocomplete choices.
+    autocomplete_cache: AutocompleteCache,
 }
 
 /// Turns a search result into a queued song.
@@ -243,6 +244,12 @@ impl AudioFetcher for YtDlpFetch {
 /// Long enough for the person who spoke to look over and read what went wrong;
 /// short enough that the channel is not a wall of past failures.
 const NOTICE_TTL: Duration = Duration::from_secs(30);
+
+/// How long a chooser stays up before the bot clears it away.
+///
+/// Long enough to read the list and press something; short enough that an
+/// unanswered question does not sit in the channel as a stale set of buttons.
+const ASK_TTL: Duration = Duration::from_secs(30);
 
 /// A pending question, and what each of its buttons would play.
 ///
@@ -338,67 +345,58 @@ impl Offer {
                 title: candidate.title(),
                 channel: candidate.channel(),
                 duration_secs: candidate.duration,
-                key: "",
+                plays: candidate.view_count,
             },
             Offer::Song { track, .. } => dashboard::ChoiceOption {
                 title: &track.title,
                 channel: &track.artist,
                 duration_secs: track.duration_secs,
-                key: "",
+                plays: track.popularity.map(u64::from),
             },
         }
     }
 }
 
-/// The questions on offer, keyed by the message that carries each.
+/// The outstanding question per guild.
 ///
-/// Keyed by message rather than by guild, so a spoken question and someone's
-/// `/play` results can both be on screen and each button answers its own.
-/// Asking again replaces only the same owner's earlier question: a question
-/// nobody answered must not outlive the one that superseded it.
+/// One per guild, and asking again replaces the previous one: a question nobody
+/// answered must not outlive the question it was for.
 #[derive(Debug, Clone, Default)]
-struct Asks(Arc<Mutex<Vec<(MessageId, GuildId, Ask)>>>);
+struct Asks(Arc<Mutex<HashMap<GuildId, Ask>>>);
 
 impl Asks {
-    /// Stores a posted question, dropping the same owner's older one in the
-    /// same guild. Returns the message of the question it replaced, if any.
-    fn insert(
-        &self,
-        guild_id: GuildId,
-        message_id: MessageId,
-        ask: Ask,
-    ) -> Option<(ChannelId, MessageId)> {
-        let mut all = self.lock();
-        let replaced = all
-            .iter()
-            .position(|(_, guild, old)| *guild == guild_id && old.owner == ask.owner)
-            .map(|at| all.remove(at))
-            .and_then(|(_, _, old)| old.posted);
-        all.push((message_id, guild_id, ask));
-        replaced
+    fn set(&self, guild_id: GuildId, ask: Ask) {
+        self.lock().insert(guild_id, ask);
     }
 
-    fn get(&self, message_id: MessageId) -> Option<Ask> {
-        self.lock()
-            .iter()
-            .find(|(id, _, _)| *id == message_id)
-            .map(|(_, _, ask)| ask.clone())
+    /// Puts the new question in place and hands back the one it replaced.
+    fn replace(&self, guild_id: GuildId, ask: Ask) -> Option<Ask> {
+        self.lock().insert(guild_id, ask)
     }
 
-    fn update(&self, message_id: MessageId, ask: Ask) {
-        if let Some(slot) = self.lock().iter_mut().find(|(id, _, _)| *id == message_id) {
-            slot.2 = ask;
+    fn clear(&self, guild_id: GuildId) -> bool {
+        self.lock().remove(&guild_id).is_some()
+    }
+
+    /// Clears the entry only if it is still the message the timer was set for.
+    ///
+    /// A page turn rewrites the same message, so it keeps expiring on the
+    /// original clock; a newer chooser has its own message and must not have
+    /// its entry removed by the old one's timer.
+    fn clear_if(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId) -> bool {
+        let mut asks = self.lock();
+        if asks
+            .get(&guild_id)
+            .is_some_and(|ask| ask.posted == Some((channel_id, message_id)))
+        {
+            asks.remove(&guild_id);
+            true
+        } else {
+            false
         }
     }
 
-    fn remove(&self, message_id: MessageId) -> bool {
-        let mut all = self.lock();
-        let before = all.len();
-        all.retain(|(id, _, _)| *id != message_id);
-        all.len() != before
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(MessageId, GuildId, Ask)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<GuildId, Ask>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -441,6 +439,27 @@ impl Ducks {
 
 /// Music volume while somebody is talking to the bot.
 pub const DUCK_VOLUME: f32 = 0.2;
+
+#[derive(Debug, Clone, Default)]
+struct AutocompleteCache(Arc<Mutex<HashMap<String, resolve::CatalogTrack>>>);
+
+impl AutocompleteCache {
+    fn insert(&self, video_id: String, track: resolve::CatalogTrack) {
+        let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if map.len() > 500 {
+            map.clear();
+        }
+        map.insert(video_id, track);
+    }
+
+    fn get(&self, video_id: &str) -> Option<resolve::CatalogTrack> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(video_id)
+            .cloned()
+    }
+}
 
 /// One lock per guild, so a command in one guild cannot hold up another.
 #[derive(Debug, Clone, Default)]
@@ -528,7 +547,6 @@ struct Pending {
 struct PendingLearn(Arc<Mutex<HashMap<String, Pending>>>);
 
 impl PendingLearn {
-    #[allow(dead_code)]
     fn set(&self, url: String, pending: Pending) {
         self.0
             .lock()
@@ -752,18 +770,12 @@ impl Player {
             catalog,
             asks: Asks::default(),
             ducks: Ducks::default(),
-            suggestions: Arc::default(),
             library: None,
             pending: PendingLearn::default(),
             started_at: StartedAt::default(),
             fetch: Arc::new(YtDlpFetch),
+            autocomplete_cache: AutocompleteCache::default(),
         }
-    }
-
-    /// Gives the player a library to remember requests in.
-    pub fn with_library(mut self, library: Option<Arc<crate::library::Library>>) -> Self {
-        self.library = library;
-        self
     }
 
     /// Brings the music back to full volume whoever lowered it, as when
@@ -842,11 +854,6 @@ impl Player {
             // Nothing was verified. Say so, and offer unverified results only if
             // the operator asked for them -- clearly labelled, and never played
             // on their own.
-            Ok(Outcome::Unknown)
-                if config.allow_unverified_autoplay
-                    && self
-                        .autoplay_unverified(ctx, config, guild_id, request, timing)
-                        .await => {}
             Ok(Outcome::Unknown) => {
                 let failure = Failure::new(
                     Problem::NoMatch,
@@ -979,7 +986,7 @@ impl Player {
             timing,
         )
         .await;
-        if matches!(resolved, search::Resolved::Unknown { .. }) {
+        if matches!(resolved, search::Resolved::Unknown) {
             return Ok(Outcome::Unknown);
         }
         if let search::Resolved::Ask(tracks) = resolved {
@@ -1021,21 +1028,22 @@ impl Player {
 
         // The request is being committed; record it for the learning that
         // happens when the song finishes (or is skipped).
-        if let Some(track) = resolved.as_track() {
-            self.pending.set(
-                best.candidate.url.clone(),
-                Pending {
-                    said: request.query.clone(),
-                    track: crate::library::Track {
-                        artist: track.artist.clone(),
-                        title: track.title.clone(),
-                        duration_secs: track.duration_secs,
-                        video_id: best.candidate.video_id().map(str::to_string),
-                    },
-                    from_chooser: false,
+        self.pending.set(
+            best.candidate.url.clone(),
+            Pending {
+                said: request.query.clone(),
+                track: crate::library::Track {
+                    artist: resolved.as_track().unwrap().artist.clone(),
+                    title: resolved.as_track().unwrap().title.clone(),
+                    duration_secs: resolved.as_track().unwrap().duration_secs,
+                    // The upload that was chosen, not the catalog's: it is the
+                    // one that played, so a phrase heard again can go straight
+                    // to it.
+                    video_id: best.candidate.video_id().map(str::to_string),
                 },
-            );
-        }
+                from_chooser: false,
+            },
+        );
         let song = self
             .fetch
             .fetch(guild_id, &best.candidate, &queue.in_use(), timing)
@@ -1094,63 +1102,6 @@ impl Player {
             .collect();
         self.offer_choices(ctx, config, guild_id, &request.query, offers)
             .await;
-    }
-
-    /// `ALLOW_UNVERIFIED_AUTOPLAY`: plays the best upload of a request the
-    /// catalog could not confirm, if that upload alone scores confidently.
-    /// Returns whether it played, so the caller can fall back to asking.
-    async fn autoplay_unverified(
-        &self,
-        ctx: &SerenityContext,
-        config: &Config,
-        guild_id: GuildId,
-        request: &PlayRequest,
-        timing: &Timing,
-    ) -> bool {
-        let choice = match search::find_unverified(
-            request,
-            &search::YtDlpSearch,
-            config.search_candidates,
-            config.match_threshold,
-            timing,
-        )
-        .await
-        {
-            Ok(choice) if choice.confident => choice,
-            _ => return false,
-        };
-        let Some(best) = choice.best() else {
-            return false;
-        };
-        let queue = self.queues.get(guild_id);
-        let (_serialised, started_at) = self.coordination.begin(guild_id).await;
-        let song = match self
-            .fetch
-            .fetch(guild_id, &best.candidate, &queue.in_use(), timing)
-            .await
-        {
-            Ok(song) => song,
-            Err(e) => {
-                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not fetch the unverified upload");
-                return false;
-            }
-        };
-        tracing::info!(guild_id = %guild_id, title = %song.title, "playing an upload the catalog could not confirm");
-        match self
-            .outcome(guild_id, &queue, song, started_at, timing)
-            .await
-        {
-            Outcome::Played { starting: true } => {
-                drop(_serialised);
-                self.start_next(ctx, config, guild_id, timing).await;
-                true
-            }
-            Outcome::Played { starting: false } => {
-                self.draw_dashboard(ctx, config, guild_id).await;
-                true
-            }
-            _ => false,
-        }
     }
 
     /// Offers raw YouTube results for a request nothing matched.
@@ -1517,7 +1468,10 @@ impl Player {
             query: query.to_string(),
             title: None,
             artist: None,
-            splits: Vec::new(),
+            splits: crate::parser::readings(query)
+                .into_iter()
+                .filter_map(|(title, artist)| Some((title?, artist?)))
+                .collect(),
         };
         let tracks: Vec<resolve::CatalogTrack> = timing
             .stage(
@@ -1531,6 +1485,7 @@ impl Player {
 
         let total = tracks.len();
         if total == 0 {
+            self.asks.clear(guild_id);
             anyhow::bail!("the catalog has nothing for \"{query}\"");
         }
 
@@ -1552,10 +1507,7 @@ impl Player {
         Ok(total)
     }
 
-    /// Posts a chooser and puts it on offer under the message it landed in.
-    ///
-    /// The same owner's previous chooser is taken down, so its buttons cannot
-    /// be pressed for a question that has been superseded.
+    /// Posts a chooser, clears any previous question, and arms the expiry timer.
     async fn post_ask(
         &self,
         ctx: &SerenityContext,
@@ -1571,37 +1523,64 @@ impl Player {
             .await
             .map_err(|e| anyhow::anyhow!("could not post the search: {e}"))?;
         ask.posted = Some((channel_id, sent.id));
-        if let Some((old_channel, old_message)) = self.asks.insert(guild_id, sent.id, ask) {
-            // In the background: the caller may be inside Discord's three
-            // second window for answering a command, and tidying up an old
-            // message is not worth spending it on.
+        let previous = self.asks.replace(guild_id, ask);
+        if let Some((old_channel, old_message)) = previous.and_then(|a| a.posted) {
             let http = ctx.http.clone();
             tokio::spawn(async move {
                 if let Err(e) = http.delete_message(old_channel, old_message, None).await {
-                    tracing::debug!(guild_id = %guild_id, error = %format!("{e:#}"), "could not take the superseded chooser down");
+                    tracing::debug!(
+                        channel_id = %old_channel,
+                        error = %format!("{e:#}"),
+                        "could not clear the previous question"
+                    );
                 }
             });
         }
+        self.expire_ask(ctx, guild_id, channel_id, sent.id);
         Ok(())
+    }
+
+    fn expire_ask(
+        &self,
+        ctx: &SerenityContext,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        message_id: MessageId,
+    ) {
+        let asks = self.asks.clone();
+        let http = ctx.http.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(ASK_TTL).await;
+            if !asks.clear_if(guild_id, channel_id, message_id) {
+                return;
+            }
+            if let Err(e) = http.delete_message(channel_id, message_id, None).await {
+                tracing::debug!(
+                    channel_id = %channel_id,
+                    error = %format!("{e:#}"),
+                    "could not clear the expired question"
+                );
+            }
+        });
     }
 
     /// Turns to the next page of a `/play` search, redrawing the same message.
     ///
     /// Returns whether it moved, so the caller only answers when it did.
-    pub async fn next_page(&self, ctx: &SerenityContext, message_id: MessageId) -> bool {
+    pub async fn next_page(&self, ctx: &SerenityContext, guild_id: GuildId) -> bool {
         // Bumped on a copy and stored once, only if the redraw landed. Reading
         // the page, rendering from it and writing it back in three steps let a
         // second press render one page behind, and left the stored page wrong
         // when the edit failed.
-        let Some(mut ask) = self.asks.get(message_id) else {
+        let Some(mut ask) = self.ask_for(guild_id) else {
             return false;
         };
         if !ask.has_next() {
             return false;
         }
         ask.page += 1;
-        if self.redraw_ask(ctx, &ask).await {
-            self.asks.update(message_id, ask);
+        if self.redraw_ask(ctx, guild_id, ask.view()).await {
+            self.asks.set(guild_id, ask);
             true
         } else {
             false
@@ -1614,19 +1593,17 @@ impl Player {
         ctx: &SerenityContext,
         config: &Config,
         guild_id: GuildId,
-        message_id: MessageId,
         index: usize,
     ) -> anyhow::Result<()> {
         let ask = self
-            .asks
-            .get(message_id)
+            .ask_for(guild_id)
             .context("that search is no longer on offer; run /play again")?;
         let offer = ask
             .offers
             .get(index)
             .cloned()
             .with_context(|| "that song is not in the search")?;
-        self.asks.remove(message_id);
+        self.asks.clear(guild_id);
         self.play_offer(ctx, config, guild_id, offer).await
     }
 
@@ -1634,9 +1611,8 @@ impl Player {
     ///
     /// The caller needs this to know whose rule applies: a spoken one is answered
     /// by the voice channel, a typed one by the person who typed it.
-    pub fn ask_is_spoken(&self, message_id: MessageId) -> bool {
-        self.asks
-            .get(message_id)
+    pub fn ask_is_spoken(&self, guild_id: GuildId) -> bool {
+        self.ask_for(guild_id)
             .is_some_and(|ask| matches!(ask.owner, Owner::Voice))
     }
 
@@ -1681,11 +1657,11 @@ impl Player {
     ) -> anyhow::Result<()> {
         // Pressing a button is a request of its own, with its own summary line.
         let timing = Timing::default();
-        let played = self
+        let _ = self
             .play_offer_inner(ctx, config, guild_id, offer, &timing)
-            .await;
+            .await?;
         timing.log("/play offer");
-        played
+        Ok(())
     }
 
     async fn play_offer_inner(
@@ -1695,19 +1671,14 @@ impl Player {
         guild_id: GuildId,
         offer: Offer,
         timing: &Timing,
-    ) -> anyhow::Result<()> {
-        // The user has already chosen the song by pressing this button, so the
-        // best upload of it is taken even when the upload's own score is modest.
-        // The hard part -- deciding which song it is -- was answered by the
-        // catalog and by them.
+    ) -> anyhow::Result<(String, bool)> {
+        // The user has already chosen the song by pressing this button or
+        // selecting from autocomplete, so the best upload of it is taken even
+        // when the upload's own score is modest. The hard part -- deciding
+        // which song it is -- was answered by the catalog and by them.
         let candidate = match offer {
             Offer::Video(candidate) => candidate,
             Offer::Song { track, requested } => {
-                // The catalog's running time, not an empty set. Length is the
-                // scorer's heaviest input, and dropping it left the chooser
-                // ranking on relevance and views alone -- which is how a
-                // different song with the same name can win a search the asker
-                // had already narrowed down by choosing it.
                 let resolved = search::Resolved::Track {
                     durations: track.duration_secs.into_iter().collect(),
                     track,
@@ -1717,8 +1688,6 @@ impl Player {
                     &requested,
                     &search::YtDlpSearch,
                     config.search_candidates,
-                    // The user chose; the threshold is not what is in question
-                    // any more.
                     0.0,
                     timing,
                 )
@@ -1746,6 +1715,7 @@ impl Player {
             )
             .await
             .context("could not download that song")?;
+        let label = format!("{} — {}", song.artist, song.title);
         let outcome = self
             .outcome(
                 guild_id,
@@ -1756,37 +1726,86 @@ impl Player {
             )
             .await;
 
-        if matches!(outcome, Outcome::Played { starting: true }) {
+        let starting = matches!(outcome, Outcome::Played { starting: true });
+        if starting {
             self.start_next(ctx, config, guild_id, timing).await;
         } else {
             self.draw_dashboard(ctx, config, guild_id).await;
         }
-        Ok(())
+        Ok((label, starting))
     }
 
-    /// Plays one particular video: a picked `/play` suggestion, or a pasted
-    /// link. Returns what it queued, for the reply.
-    pub async fn play_video(
+    /// Autocomplete candidates for a slash command query.
+    pub async fn autocomplete(&self, query: &str) -> Vec<resolve::CatalogTrack> {
+        let request = PlayRequest {
+            query: query.to_string(),
+            title: None,
+            artist: None,
+            splits: crate::parser::readings(query)
+                .into_iter()
+                .filter_map(|(title, artist)| Some((title?, artist?)))
+                .collect(),
+        };
+        let target = resolve::Target::from_request(&request);
+        let hits = self.catalog.hits(&target).await;
+        let mut tracks = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for hit in hits {
+            let track = hit.to_track();
+            if let Some(video_id) = &track.video_id
+                && seen.insert(video_id.clone())
+            {
+                self.autocomplete_cache
+                    .insert(video_id.clone(), track.clone());
+                tracks.push(track);
+            }
+        }
+        tracks
+    }
+
+    /// Plays or queues a specific YouTube track chosen via autocomplete or direct URL.
+    pub async fn play_direct(
         &self,
         ctx: &SerenityContext,
         config: &Config,
         guild_id: GuildId,
+        query: &str,
         video_id: &str,
-    ) -> anyhow::Result<String> {
-        let track = match self.suggestions.track(video_id) {
-            Some(track) => track,
-            None => crate::suggest::describe(video_id).await,
+    ) -> anyhow::Result<(String, bool)> {
+        self.manager
+            .get(guild_id)
+            .context("bot is not in a voice channel")?;
+
+        self.asks.clear(guild_id);
+
+        let offer = if let Some(track) = self.autocomplete_cache.get(video_id) {
+            Offer::Song {
+                track,
+                requested: query.to_string(),
+            }
+        } else {
+            let candidate = search::Candidate {
+                title: None,
+                url: format!("https://www.youtube.com/watch?v={video_id}"),
+                view_count: None,
+                duration: None,
+                channel: None,
+                id: Some(video_id.to_string()),
+            };
+            Offer::Video(candidate)
         };
-        let label = track.label();
-        let candidate = search::Candidate::for_track(&track, video_id);
-        self.play_offer(ctx, config, guild_id, Offer::Video(candidate))
-            .await?;
-        Ok(label)
+
+        let timing = Timing::default();
+        let res = self
+            .play_offer_inner(ctx, config, guild_id, offer, &timing)
+            .await;
+        timing.log("/play direct");
+        res
     }
 
     /// Throws a `/play` search away, for "None of these".
-    pub fn dismiss_ask(&self, message_id: MessageId) -> bool {
-        self.asks.remove(message_id)
+    pub fn dismiss_ask(&self, guild_id: GuildId) -> bool {
+        self.asks.clear(guild_id)
     }
 
     /// Whether `user` may answer the question this guild is holding.
@@ -1795,27 +1814,37 @@ impl Player {
     /// spoken one belongs to the voice channel, which the caller has already
     /// checked; it returns true here rather than asking again, because the bot
     /// cannot tell who spoke and has nobody to compare against.
-    pub fn ask_belongs_to(&self, message_id: MessageId, user: UserId) -> bool {
-        match self.asks.get(message_id).map(|ask| ask.owner) {
+    pub fn ask_belongs_to(&self, guild_id: GuildId, user: UserId) -> bool {
+        match self.ask_for(guild_id).map(|ask| ask.owner) {
             Some(Owner::User(asker)) => asker == user,
             Some(Owner::Voice) => true,
             None => false,
         }
     }
 
+    /// The guild's outstanding search, if it has one.
+    fn ask_for(&self, guild_id: GuildId) -> Option<Ask> {
+        self.asks.lock().get(&guild_id).cloned()
+    }
+
     /// Edits the outstanding search's message in place, the way the dashboard
     /// is edited, rather than posting a second one.
-    async fn redraw_ask(&self, ctx: &SerenityContext, ask: &Ask) -> bool {
-        let Some((channel_id, message_id)) = ask.posted else {
+    async fn redraw_ask(
+        &self,
+        ctx: &SerenityContext,
+        guild_id: GuildId,
+        message: dashboard::View,
+    ) -> bool {
+        let Some((channel_id, message_id)) = self.ask_for(guild_id).and_then(|a| a.posted) else {
             return false;
         };
         match channel_id
-            .edit_message(&ctx.http, message_id, ask.view().into_edit())
+            .edit_message(&ctx.http, message_id, message.clone().into_edit())
             .await
         {
             Ok(_) => true,
             Err(e) => {
-                tracing::warn!(channel_id = %channel_id, error = %format!("{e:#}"), "could not turn the search page");
+                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not turn the search page");
                 false
             }
         }
@@ -2499,7 +2528,6 @@ mod tests {
             duration: Some(206.0),
             channel: Some("Tame Impala".to_string()),
             id: None,
-            audio_track: false,
         }
     }
 
@@ -2698,8 +2726,6 @@ mod tests {
                 artist: artist.to_string(),
                 title: title.to_string(),
                 duration_secs: Some(206.0),
-                id: String::new(),
-                provider: "catalog",
                 popularity: None,
                 video_id: None,
             },
@@ -2755,8 +2781,8 @@ mod tests {
     }
 
     /// The ownership rule on its own, so it can be tested without a player.
-    fn asks_answers(asks: &Asks, message_id: MessageId, user: UserId) -> bool {
-        match asks.get(message_id).map(|ask| ask.owner) {
+    fn asks_answers(asks: &Asks, guild_id: GuildId, user: UserId) -> bool {
+        match asks.lock().get(&guild_id).map(|ask| ask.owner) {
             Some(Owner::User(asker)) => asker == user,
             Some(Owner::Voice) => true,
             None => false,
@@ -2789,36 +2815,63 @@ mod tests {
         let asks = Asks::default();
         let asker = UserId::new(42);
         let other = UserId::new(43);
-        let typed = MessageId::new(1);
-        let spoken = MessageId::new(2);
-        assert!(!asks_answers(&asks, typed, asker), "nothing to answer");
+        assert!(!asks_answers(&asks, guild, asker), "nothing to answer");
 
-        asks.insert(guild, typed, ask_with(5, Owner::User(asker)));
-        assert!(asks_answers(&asks, typed, asker));
-        assert!(!asks_answers(&asks, typed, other), "someone else must not");
+        asks.set(guild, ask_with(5, Owner::User(asker)));
+        assert!(asks_answers(&asks, guild, asker));
+        assert!(!asks_answers(&asks, guild, other), "someone else must not");
 
         // A spoken one has nobody to compare against: the bot cannot tell who
         // spoke it, so the channel's own check is the only one there is.
-        asks.insert(guild, spoken, ask_with(5, Owner::Voice));
-        assert!(asks_answers(&asks, spoken, other));
-        assert!(
-            asks.get(typed).is_some(),
-            "a spoken question must not take someone's /play results away"
+        asks.set(guild, ask_with(5, Owner::Voice));
+        assert!(asks_answers(&asks, guild, other));
+    }
+
+    /// A question that expired on its timer must not clear a newer question
+    /// that has replaced it, and replacing hands back the old question so its
+    /// message can be cleared.
+    #[test]
+    fn an_expired_question_does_not_clear_a_newer_one() {
+        let guild = GuildId::new(3);
+        let asks = Asks::default();
+        let mut old = ask_with(2, Owner::Voice);
+        old.posted = Some((ChannelId::new(1), MessageId::new(10)));
+        let mut newer = ask_with(4, Owner::Voice);
+        newer.posted = Some((ChannelId::new(1), MessageId::new(11)));
+
+        let previous = asks.replace(guild, old);
+        assert!(previous.is_none());
+
+        let replaced = asks.replace(guild, newer);
+        assert_eq!(
+            replaced.and_then(|a| a.posted),
+            Some((ChannelId::new(1), MessageId::new(10)))
         );
+
+        // The old timer fires; it must not clear the newer question.
+        assert!(!asks.clear_if(guild, ChannelId::new(1), MessageId::new(10)));
+        assert!(asks.lock().get(&guild).is_some());
+
+        // The newer timer fires; it clears the question.
+        assert!(asks.clear_if(guild, ChannelId::new(1), MessageId::new(11)));
+        assert!(asks.lock().get(&guild).is_none());
     }
 
     #[test]
-    fn asking_again_replaces_only_the_same_owners_question() {
-        let guild = GuildId::new(3);
-        let asks = Asks::default();
-        let mut first = ask_with(2, Owner::Voice);
-        first.posted = Some((ChannelId::new(9), MessageId::new(1)));
-        asks.insert(guild, MessageId::new(1), first);
-        let replaced = asks.insert(guild, MessageId::new(2), ask_with(2, Owner::Voice));
-        assert_eq!(replaced, Some((ChannelId::new(9), MessageId::new(1))));
-        assert!(asks.get(MessageId::new(1)).is_none());
-        assert!(asks.remove(MessageId::new(2)));
-        assert!(!asks.remove(MessageId::new(2)));
+    fn autocomplete_cache_stores_and_retrieves_tracks() {
+        let cache = AutocompleteCache::default();
+        let track = resolve::CatalogTrack {
+            artist: "Tame Impala".to_string(),
+            title: "Dracula".to_string(),
+            duration_secs: Some(206.0),
+            popularity: Some(100),
+            video_id: Some("cuMuMnCRfqk".to_string()),
+        };
+        cache.insert("cuMuMnCRfqk".to_string(), track.clone());
+        let retrieved = cache.get("cuMuMnCRfqk").expect("must retrieve track");
+        assert_eq!(retrieved.artist, "Tame Impala");
+        assert_eq!(retrieved.title, "Dracula");
+        assert!(cache.get("nonexistent").is_none());
     }
 
     #[test]

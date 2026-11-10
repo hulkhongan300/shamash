@@ -180,12 +180,6 @@ pub struct Candidate {
     /// id is recoverable from `url`.
     #[serde(default)]
     pub id: Option<String>,
-    /// Found by YouTube Music's song search rather than the video search: the
-    /// audio track an artist or label publishes for the song, which is the
-    /// recording itself. Scored as audio whatever its title says, because its
-    /// title is usually just the song's name.
-    #[serde(skip)]
-    pub audio_track: bool,
 }
 
 impl Candidate {
@@ -223,7 +217,6 @@ impl Candidate {
             duration: track.duration_secs,
             channel: Some(track.artist.clone()),
             id: Some(video_id.to_string()),
-            audio_track: track.provider == "ytmusic",
         }
     }
 
@@ -279,9 +272,6 @@ impl Candidate {
     /// - 1 an ordinary upload, which may be either
     /// - 0 an official MV, visualizer, or dance video, which is video first
     fn media_rank(&self) -> u8 {
-        if self.audio_track {
-            return 3;
-        }
         let title = self.title_lowercase();
         if VIDEO_MARKERS.iter().any(|m| title.contains(m)) {
             return 0;
@@ -421,8 +411,7 @@ impl Target {
 /// signal is gone and the score cannot be trusted to identify a song at all:
 /// `relevance` alone is 18.0 for any upload title sharing one word with the
 /// transcript, which is why this bar used to admit almost anything. An
-/// unverified best result is therefore never played on its own unless
-/// [`crate::config::Config::allow_unverified_autoplay`] says otherwise.
+/// unverified best result is therefore never played on its own.
 const UNRESOLVED_MATCH_THRESHOLD: f64 = 20.0;
 
 /// A candidate's score, broken down so it can be logged and tuned.
@@ -685,88 +674,13 @@ pub trait VideoSearch: Send + Sync {
     async fn candidates(&self, query: &str, count: usize) -> anyhow::Result<Vec<Candidate>>;
 }
 
-/// The real search: YouTube through yt-dlp, and YouTube Music's song search
-/// alongside it.
-///
-/// The two answer different questions. The video search returns *uploads*, and
-/// for a popular song its first page is the official video, lyric videos and
-/// re-uploads; the artist's own audio upload of the song is often not on it at
-/// all ("Tame Impala Dracula" puts it ninth, behind a stranger's re-upload of
-/// the same audio). YouTube Music's song search returns exactly those audio
-/// uploads. Both lists are ranked together by the same scorer, so the catalog
-/// still decides which *song* it is and the scorer which upload of it; YouTube
-/// Music only makes sure the right upload is in the running.
+/// The real search, through yt-dlp.
 pub struct YtDlpSearch;
-
-/// How long the YouTube Music half may take. It runs alongside the yt-dlp
-/// search, which takes about a second, so this only bounds a stall.
-const YTMUSIC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// YouTube Music's songs for `query`, as candidates.
-///
-/// Every failure is an empty list: this widens the search and must never be the
-/// reason one fails.
-async fn ytmusic_candidates(query: &str) -> Vec<Candidate> {
-    static CLIENT: std::sync::OnceLock<Option<resolve::YtMusic>> = std::sync::OnceLock::new();
-    let Some(ytmusic) = CLIENT.get_or_init(|| resolve::YtMusic::new().ok()) else {
-        return Vec::new();
-    };
-    let loose = resolve::CatalogQuery::Loose(query.to_string());
-    let search = resolve::CatalogProvider::search(ytmusic, &loose);
-    match tokio::time::timeout(YTMUSIC_TIMEOUT, search).await {
-        Ok(Ok(tracks)) => tracks
-            .iter()
-            .filter_map(|track| {
-                let id = track.video_id.as_deref()?;
-                Some(Candidate::for_track(track, id))
-            })
-            .collect(),
-        Ok(Err(e)) => {
-            tracing::debug!(query, error = ?e, "YouTube Music search failed; using the video search alone");
-            Vec::new()
-        }
-        Err(_) => {
-            tracing::debug!(
-                query,
-                "YouTube Music search timed out; using the video search alone"
-            );
-            Vec::new()
-        }
-    }
-}
-
-/// Both result lists as one, without repeating a video either of them found.
-/// A video both found keeps YouTube Music's entry, which knows it is audio, and
-/// the video search's view count, which YouTube Music does not report.
-fn merge_candidates(songs: Vec<Candidate>, videos: Vec<Candidate>) -> Vec<Candidate> {
-    let mut merged = songs;
-    for video in videos {
-        let id = video.video_id().map(str::to_string);
-        match merged
-            .iter_mut()
-            .find(|song| id.is_some() && song.video_id() == id.as_deref())
-        {
-            Some(song) => song.view_count = song.view_count.or(video.view_count),
-            None => merged.push(video),
-        }
-    }
-    merged
-}
 
 #[async_trait::async_trait]
 impl VideoSearch for YtDlpSearch {
     async fn candidates(&self, query: &str, count: usize) -> anyhow::Result<Vec<Candidate>> {
-        let (songs, videos) =
-            tokio::join!(ytmusic_candidates(query), youtube_candidates(query, count));
-        match videos {
-            Ok(videos) => Ok(merge_candidates(songs, videos)),
-            // The video search failing is not the end if the song search worked.
-            Err(e) if !songs.is_empty() => {
-                tracing::warn!(error = %format!("{e:#}"), "the YouTube video search failed; using YouTube Music's songs alone");
-                Ok(songs)
-            }
-            Err(e) => Err(e),
-        }
+        youtube_candidates(query, count).await
     }
 }
 
@@ -790,23 +704,8 @@ pub enum Resolved {
     /// enough to choose between them. Ask, in songs rather than in videos.
     Ask(Vec<CatalogTrack>),
     /// Nothing believable. The caller plays a miss tone and says so.
-    Unknown {
-        /// What was heard, echoed back so the listener can say it better.
-        heard: String,
-    },
+    Unknown,
 }
-
-impl std::fmt::Display for Resolved {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Track { track, .. } => write!(f, "{}", track.label()),
-            Self::Ask(tracks) => write!(f, "{} songs to choose from", tracks.len()),
-            Self::Unknown { .. } => f.write_str("nothing"),
-        }
-    }
-}
-
-impl Resolved {}
 
 impl From<matcher::Verdict<'_, resolve::Hit>> for Resolved {
     /// A verdict with no popularity policy applied. Used for the library's own
@@ -814,9 +713,7 @@ impl From<matcher::Verdict<'_, resolve::Hit>> for Resolved {
     /// settle by popularity.
     fn from(verdict: matcher::Verdict<'_, resolve::Hit>) -> Self {
         match verdict {
-            matcher::Verdict::NoMatch => Self::Unknown {
-                heard: String::new(),
-            },
+            matcher::Verdict::NoMatch => Self::Unknown,
             matcher::Verdict::Confident(hit) => Self::Track {
                 track: hit.to_track(),
                 durations: hit.durations.clone(),
@@ -836,6 +733,27 @@ impl Resolved {
             _ => None,
         }
     }
+}
+
+/// The most-played recording among the options sharing the winner's title.
+///
+/// `auto` still settles only the question `decide` called ambiguous: one
+/// title, several artists. Popularity may break that tie; it never makes a
+/// different song win, and with no counts it leaves the matcher's order alone.
+fn most_played_same_title<'a>(options: &[&'a resolve::Hit]) -> Option<&'a resolve::Hit> {
+    let top = *options.first()?;
+    let title = matcher::normalize(&top.title);
+    let mut best = top;
+    for hit in options
+        .iter()
+        .copied()
+        .filter(|hit| matcher::normalize(&hit.title) == title)
+    {
+        if hit.popularity.unwrap_or(0) > best.popularity.unwrap_or(0) {
+            best = hit;
+        }
+    }
+    Some(best)
 }
 
 /// What the bot is going to ask, when it is going to ask.
@@ -980,11 +898,7 @@ async fn try_rewrite(
 /// Turns a matcher verdict into what the bot will do.
 fn decide(verdict: &matcher::Verdict<'_, resolve::Hit>) -> Resolved {
     match verdict {
-        matcher::Verdict::NoMatch => Resolved::Unknown {
-            // The caller has the request in hand and echoes its own text back;
-            // carrying it here as well would be a second copy to keep in step.
-            heard: String::new(),
-        },
+        matcher::Verdict::NoMatch => Resolved::Unknown,
         matcher::Verdict::Confident(hit) => Resolved::Track {
             track: hit.to_track(),
             durations: hit.durations.clone(),
@@ -1005,6 +919,22 @@ fn decide(verdict: &matcher::Verdict<'_, resolve::Hit>) -> Resolved {
                     Resolved::Track {
                         track: top.to_track(),
                         durations: top.durations.clone(),
+                    }
+                }
+                Some(top)
+                    if crate::config::ambiguous_policy()
+                        == crate::config::AmbiguousPolicy::Auto =>
+                {
+                    let picked = most_played_same_title(options).unwrap_or(top);
+                    tracing::info!(
+                        artist = %picked.artist,
+                        title = %picked.title,
+                        plays = ?picked.popularity,
+                        "AMBIGUOUS_POLICY=auto played the same title with the most plays"
+                    );
+                    Resolved::Track {
+                        track: picked.to_track(),
+                        durations: picked.durations.clone(),
                     }
                 }
                 _ => Resolved::Ask(tracks),
@@ -1032,6 +962,20 @@ pub async fn find_video(
     let Resolved::Track { track, durations } = resolved else {
         anyhow::bail!("find_video needs a resolved song, not a question or nothing");
     };
+    // The provider already named the upload. Searching again could only pick a
+    // different one, so the catalog's video is played as-is.
+    if let Some(video_id) = track.video_id.as_deref().filter(|id| !id.is_empty()) {
+        return Ok(Choice {
+            ranked: vec![ScoredCandidate {
+                candidate: Candidate::for_track(track, video_id),
+                parts: ScoreParts::default(),
+            }],
+            confident: true,
+            threshold,
+            resolved: Some(track.clone()),
+            requested: requested.to_string(),
+        });
+    }
     let target = Target::from_track(track, durations.clone(), requested);
     let query = target.search_query();
     let candidates = timing
@@ -1116,7 +1060,7 @@ fn log_choice(choice: &Choice, query: &str) {
 /// Handles the bare id that `--flat-playlist` search emits, the `watch?v=`
 /// form, and the `youtu.be/` and `/shorts/` paths, so a thumbnail can be built
 /// whichever shape a given yt-dlp version produces.
-fn url_video_id(url: &str) -> Option<&str> {
+pub fn url_video_id(url: &str) -> Option<&str> {
     const PREFIXES: [&str; 4] = [
         "https://www.youtube.com/watch?v=",
         "https://youtube.com/watch?v=",
@@ -1155,7 +1099,6 @@ mod tests {
             duration,
             channel: Some("someone".to_string()),
             id: None,
-            audio_track: false,
         }
     }
 
@@ -1213,8 +1156,6 @@ mod tests {
             artist: "BTS".to_string(),
             title: "Hooligan".to_string(),
             duration_secs: Some(182.0),
-            id: "1".to_string(),
-            provider: "catalog",
             video_id: None,
             popularity: None,
         };
@@ -1776,15 +1717,13 @@ mod tests {
             artist: artist.to_string(),
             title: title.to_string(),
             duration_secs: duration,
-            id: "1".to_string(),
-            provider: "stub",
             video_id: None,
             popularity: None,
         }
     }
 
     fn stub_catalog(hits: Vec<resolve::CatalogTrack>) -> resolve::Catalog {
-        resolve::Catalog::with_budget(vec![Box::new(Stub { hits })], 0.72, 2_500)
+        resolve::Catalog::with_budget(vec![Box::new(Stub { hits })], 2_500)
     }
 
     /// Records the queries it is asked for and answers with a fixed list.
@@ -1873,7 +1812,7 @@ mod tests {
     /// matching, and the caller reports it rather than playing something.
     #[tokio::test]
     async fn a_catalog_that_finds_nothing_is_unknown_not_an_error() {
-        let catalog = resolve::Catalog::with_budget(vec![Box::new(Empty)], 0.72, 2_500);
+        let catalog = resolve::Catalog::with_budget(vec![Box::new(Empty)], 2_500);
         assert!(matches!(
             resolve_request(
                 &request("drakula tame impala"),
@@ -1884,13 +1823,13 @@ mod tests {
                 &crate::timing::Timing::default()
             )
             .await,
-            Resolved::Unknown { .. }
+            Resolved::Unknown
         ));
     }
 
     /// A provider that fails outright must not stop the request. Before the
-    /// fan-out, `?` on a provider error aborted everything: one Deezer quota
-    /// body in a HTTP 200 and the listener heard nothing at all.
+    /// fan-out, `?` on a provider error aborted everything: one unreadable
+    /// response and the listener heard nothing at all.
     #[tokio::test]
     async fn a_failing_provider_leaves_the_request_alone() {
         struct Broken;
@@ -1906,7 +1845,7 @@ mod tests {
                 Err(resolve::ProviderError::Unavailable)
             }
         }
-        let catalog = resolve::Catalog::with_budget(vec![Box::new(Broken)], 0.72, 2_500);
+        let catalog = resolve::Catalog::with_budget(vec![Box::new(Broken)], 2_500);
         let resolved = resolve_request(
             &request("drakula tame impala"),
             &catalog,
@@ -1916,7 +1855,7 @@ mod tests {
             &crate::timing::Timing::default(),
         )
         .await;
-        assert!(matches!(resolved, Resolved::Unknown { .. }));
+        assert!(matches!(resolved, Resolved::Unknown));
     }
 
     /// The rewriting stage is a second *candidate*, not a replacement: it can
@@ -2018,6 +1957,36 @@ mod tests {
         assert_eq!(
             choice.resolved.map(|t| t.label()),
             Some("Tame Impala — Dracula".to_string())
+        );
+    }
+
+    /// A provider that names the upload skips the search entirely. Searching
+    /// would rank a second opinion and could play a different video.
+    #[tokio::test]
+    async fn a_catalogued_video_is_played_without_searching_again() {
+        let mut track = catalog_track("XXXTENTACION", "Look At Me!", Some(127.0));
+        track.video_id = Some("I0FKqmoK56I".to_string());
+        let resolved = Resolved::Track {
+            track,
+            durations: vec![127.0],
+        };
+        let searcher =
+            FakeSearch::with(vec![candidate("Look At Me!", Some(9_000_000), Some(127.0))]);
+        let choice = find_video(
+            &resolved,
+            "xxxtentacion look at me",
+            &searcher,
+            8,
+            DEFAULT_MATCH_THRESHOLD,
+            &crate::timing::Timing::default(),
+        )
+        .await
+        .expect("a result");
+        assert!(searcher.seen.lock().unwrap().is_empty());
+        assert!(choice.confident);
+        assert_eq!(
+            choice.best().and_then(|scored| scored.candidate.video_id()),
+            Some("I0FKqmoK56I")
         );
     }
 
@@ -2190,6 +2159,47 @@ mod tests {
     }
 
     // ---- the popularity policy -------------------------------------------
+    fn hit(artist: &str, title: &str, popularity: Option<u32>) -> resolve::Hit {
+        resolve::Hit {
+            artist: artist.to_string(),
+            title: title.to_string(),
+            durations: Vec::new(),
+            duration_uncertain: false,
+            popularity,
+            video_id: None,
+        }
+    }
+
+    /// The live "biome fest" failure: four rows normalize to the same title,
+    /// the cover was first in the matcher's list, and auto played 4k plays
+    /// instead of the official 4.5M. Popularity settles only that same-title
+    /// tie; a different song's huge count cannot win.
+    #[test]
+    fn auto_picks_the_most_played_recording_of_the_same_title() {
+        let hits = [
+            hit(
+                "Celestial Fury",
+                "Biome Fest (from \"Minecraft\")",
+                Some(4_100),
+            ),
+            hit("C418", "Biome Fest", Some(4_500_000)),
+            hit("Sheet Music Boss", "Biome Fest", Some(91_000)),
+            hit("C418", "Dreiton", Some(999_999_999)),
+        ];
+        let options: Vec<&resolve::Hit> = hits.iter().collect();
+        let picked = most_played_same_title(&options).expect("an option");
+        assert_eq!(picked.artist, "C418");
+        assert_eq!(picked.title, "Biome Fest");
+    }
+
+    /// With no counts at all, auto keeps the matcher's first option.
+    #[test]
+    fn auto_without_plays_keeps_the_matcher_order() {
+        let hits = [hit("A", "Shared", None), hit("B", "Shared", None)];
+        let options: Vec<&resolve::Hit> = hits.iter().collect();
+        assert_eq!(most_played_same_title(&options).unwrap().artist, "A");
+    }
+
     /// `AMBIGUOUS_POLICY=popular` is a documented escape hatch, and it is
     /// deliberately timid: the popular one has to be *three times* the other.
     #[test]
@@ -2235,136 +2245,19 @@ mod tests {
         ));
     }
 
-    /// The request that exposed this: "Dracula by Tame Impala" played a
-    /// stranger's re-upload, because the artist's own audio upload was not on
-    /// the video search's first page. These are the real results: the first
-    /// eight from the video search, and what YouTube Music's song search
-    /// returned for the same query.
-    #[test]
-    fn the_artists_audio_upload_beats_a_reupload_of_it() {
-        let target = Target::from_track(
-            &catalog_track("Tame Impala", "Dracula", Some(205.0)),
-            vec![205.0],
-            "dracula by tame impala",
-        );
-        let video = |id: &str, title: &str, channel: &str, secs: f64, views: u64| Candidate {
-            title: Some(title.to_string()),
-            url: format!("https://www.youtube.com/watch?v={id}"),
-            view_count: Some(views),
-            duration: Some(secs),
-            channel: Some(channel.to_string()),
-            id: Some(id.to_string()),
-            audio_track: false,
-        };
-        let videos = vec![
-            video(
-                "xnP7qKxwzjg",
-                "Tame Impala - Dracula (Official Video)",
-                "Tame Impala",
-                234.0,
-                87_003_079,
-            ),
-            video(
-                "HWyzKmXquJk",
-                "Tame Impala - Dracula (Lyrics)",
-                "TrendingTracks",
-                206.0,
-                28_614_367,
-            ),
-            video(
-                "HpIVBMowfDM",
-                "Tame Impala - 'Dracula' (live for Like A Version)",
-                "triple j",
-                220.0,
-                552_010,
-            ),
-            video(
-                "OPW1wCwus9w",
-                "Tame Impala - Dracula (Lyrics)",
-                "7clouds",
-                206.0,
-                3_816_010,
-            ),
-            video(
-                "jwVMgGs50vE",
-                "Tame Impala - Dracula",
-                "David Dean Burkhart",
-                206.0,
-                1_099_179,
-            ),
-        ];
-        let song = |id: &str, title: &str, artist: &str, secs: f64| {
-            let mut track = catalog_track(artist, title, Some(secs));
-            track.provider = "ytmusic";
-            Candidate::for_track(&track, id)
-        };
-        let songs = vec![
-            song(
-                "6KjVYeQ9SRw",
-                "Dracula (feat. JENNIE)",
-                "Tame Impala",
-                210.0,
-            ),
-            song("5nCOjdHeYjM", "Dracula", "Tame Impala", 206.0),
-            song("cuMuMnCRfqk", "Dracula", "Tame Impala", 206.0),
-            song("obYIyfBwVxk", "Dracula", "Rain Paris", 206.0),
-        ];
-
-        // Without the song search, the re-upload wins: the bug as reported.
-        let before = pick(&videos, &target, DEFAULT_MATCH_THRESHOLD);
-        assert_eq!(
-            before.best().unwrap().candidate.video_id(),
-            Some("jwVMgGs50vE")
-        );
-
-        let after = pick(
-            &merge_candidates(songs, videos),
-            &target,
-            DEFAULT_MATCH_THRESHOLD,
-        );
-        let best = after.best().unwrap();
-        assert_eq!(best.candidate.channel(), "Tame Impala", "{:?}", best.parts);
-        assert!(
-            ["5nCOjdHeYjM", "cuMuMnCRfqk"].contains(&best.candidate.video_id().unwrap()),
-            "picked {:?}",
-            best.candidate
-        );
-        assert!(after.confident, "{:?}", best.parts);
-    }
-
-    #[test]
-    fn a_video_both_searches_found_is_listed_once() {
-        let mut track = catalog_track("Tame Impala", "Dracula", Some(206.0));
-        track.provider = "ytmusic";
-        let song = Candidate::for_track(&track, "cuMuMnCRfqk");
-        let mut video = candidate("Dracula", Some(78_000_000), Some(206.0));
-        video.url = "https://www.youtube.com/watch?v=cuMuMnCRfqk".to_string();
-        let other = candidate("Something else", Some(5), Some(206.0));
-
-        let merged = merge_candidates(vec![song], vec![video, other]);
-        assert_eq!(merged.len(), 2);
-        assert!(merged[0].audio_track, "the song search's entry is kept");
-        assert_eq!(
-            merged[0].view_count,
-            Some(78_000_000),
-            "with the video's views"
-        );
-    }
-
     // ---- live --------------------------------------------------------------
 
     /// The whole path, against the real catalog and the real YouTube.
     ///
     /// Ignored by default because it needs network access, the yt-dlp binary
-    /// and the Deezer API: `cargo test -- --ignored search`.
+    /// and the YouTube Music API: `cargo test -- --ignored search`.
     #[tokio::test]
-    #[ignore = "needs network, yt-dlp and the Deezer API"]
+    #[ignore = "needs network, yt-dlp and the YouTube Music API"]
     async fn the_whole_path_picks_the_requested_recording() {
         // Built directly rather than through `Config`, which would also want a
         // Discord token and a voice channel id that a test has no use for.
         let catalog = resolve::Catalog::with_budget(
-            vec![Box::new(resolve::Deezer::new().expect("HTTP client"))],
-            crate::config::DEFAULT_CATALOG_MATCH_THRESHOLD,
+            vec![Box::new(resolve::YtMusic::new().expect("HTTP client"))],
             2_500,
         );
         for (heard, expected) in [
@@ -2428,8 +2321,6 @@ mod tests {
                 artist: "Tame Impala".to_string(),
                 title: "Dracula".to_string(),
                 duration_secs: Some(205.0),
-                id: "1".to_string(),
-                provider: "catalog",
                 popularity: None,
                 video_id: None,
             },
@@ -2440,22 +2331,14 @@ mod tests {
             vec![205.0],
             "dracula tame impala",
         );
-        let entries = YtDlpSearch
-            .candidates(&target.search_query(), 8)
-            .await
-            .unwrap();
+        let entries = youtube_candidates(&target.search_query(), 8).await.unwrap();
         println!("searched: {}", target.search_query());
         let choice = pick(&entries, &target, DEFAULT_MATCH_THRESHOLD);
         for scored in &choice.ranked {
             println!("{:7.1} {}", scored.score(), scored.parts.explain());
         }
         let best = choice.best().unwrap();
-        assert_eq!(
-            best.candidate.channel(),
-            "Tame Impala",
-            "a re-upload of the right length is not the artist's own: {:?}",
-            best.candidate
-        );
+        assert_eq!(best.candidate.duration, Some(206.0));
         assert!(
             choice.confident,
             "the requested recording should have been recognised: {:?}",
