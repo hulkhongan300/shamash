@@ -65,8 +65,24 @@ const BEST_FORMAT: &str = "bestaudio";
 const KEEP_FILES: usize = 8;
 
 /// Directory holding one guild's downloaded audio.
+///
+/// Under the user's cache directory (`$XDG_CACHE_HOME`, else `~/.cache`) rather
+/// than `/tmp`, which many systems clear on every boot, so a song asked for
+/// again after a restart is still instant. Falls back to the temp directory
+/// when there is no home to put it in.
 pub fn cache_dir(guild_id: u64) -> PathBuf {
-    std::env::temp_dir().join(format!("shamash-{guild_id}"))
+    cache_root().join(format!("shamash-{guild_id}"))
+}
+
+fn cache_root() -> PathBuf {
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    if let Some(xdg) = var("XDG_CACHE_HOME") {
+        return PathBuf::from(xdg).join("shamash");
+    }
+    if let Some(home) = var("HOME") {
+        return PathBuf::from(home).join(".cache").join("shamash");
+    }
+    std::env::temp_dir()
 }
 
 /// Tries to delete a file, logging rather than failing when it cannot.

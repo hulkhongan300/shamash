@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     let started = std::time::Instant::now();
-    let transcriber = DirectTranscriber::new(&model, language.as_deref())?;
+    let transcriber = DirectTranscriber::new(&model, language.as_deref(), None)?;
     println!("load:  {:?}", started.elapsed());
 
     for run in 1..=3 {

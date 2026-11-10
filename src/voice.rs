@@ -1,10 +1,10 @@
 use crate::config::Config;
-use crate::listener::VoiceTickHandler;
+use crate::listener::{Speakers, SpeakingHandler, VoiceTickHandler};
 use crate::parser::CommandParser;
 use crate::pipeline::ListenerPipeline;
 use crate::player::Player;
-use crate::state::{BigModelsKey, ConfigKey, PlayerKey, TranscriberKey};
-use crate::wake::{WakeGate, run_wake_gate};
+use crate::state::{BigModelsKey, ConfigKey, ListenLockKey, PlayerKey, TranscriberKey};
+use crate::wake::{Armed, WakeGate, run_wake_gate};
 use anyhow::Context;
 use serenity::model::id::{ChannelId, GuildId, UserId};
 use serenity::prelude::Context as SerenityContext;
@@ -29,7 +29,7 @@ const JOIN_ATTEMPTS: usize = 3;
 const JOIN_RETRY_DELAY: Duration = Duration::from_secs(3);
 
 /// Builds the songbird driver config that decodes incoming voice to mono
-/// 16 kHz PCM, the format Whisper expects.
+/// 16 kHz PCM, the format the voice detector and the models expect.
 pub fn decode_config() -> songbird::Config {
     songbird::Config::default().decode_mode(DecodeMode::Decode(DecodeConfig::new(
         Channels::Mono,
@@ -75,6 +75,25 @@ impl VoiceService {
         guild_id: GuildId,
         channel: ChannelId,
     ) -> anyhow::Result<()> {
+        // Everything the listener needs is gathered before joining. Joining
+        // first and failing here used to leave the bot in the channel, deaf,
+        // and a retry then joined again on top of it.
+        let (wake_model, big_models, lock) = {
+            let data = ctx.data.read().await;
+            (
+                data.get::<TranscriberKey>()
+                    .cloned()
+                    .context("wake word model not present in type map")?,
+                data.get::<BigModelsKey>()
+                    .cloned()
+                    .context("larger model not present in type map")?,
+                data.get::<ListenLockKey>()
+                    .cloned()
+                    .context("listen lock not present in type map")?,
+            )
+        };
+        let player = self.player(ctx).await?;
+
         let call = self
             .manager
             .join(guild_id, channel)
@@ -82,9 +101,17 @@ impl VoiceService {
             .map_err(|e| anyhow::anyhow!("failed to join voice channel {channel}: {e}"))?;
 
         let (tx, rx) = mpsc::unbounded_channel();
+        let speakers = Speakers::default();
         {
             let mut handler = call.lock().await;
+            // A rejoin reuses the call, and its handlers with it. Without this
+            // every rejoin added another receiver of the same audio.
+            handler.remove_all_global_events();
             handler.add_global_event(CoreEvent::VoiceTick.into(), VoiceTickHandler::new(tx));
+            handler.add_global_event(
+                CoreEvent::SpeakingStateUpdate.into(),
+                SpeakingHandler(speakers.clone()),
+            );
         }
 
         // songbird's join() returns as soon as the gateway request is sent, so
@@ -117,52 +144,31 @@ impl VoiceService {
             );
         }
 
-        let wake_model = {
-            let data = ctx.data.read().await;
-            data.get::<TranscriberKey>()
-                .cloned()
-                .context("wake word model not present in type map")?
-        };
-        let big_models = {
-            let data = ctx.data.read().await;
-            data.get::<BigModelsKey>()
-                .cloned()
-                .context("larger model not present in type map")?
-        };
         let parser = CommandParser::new(self.config.wake_words.clone());
-        let gate = WakeGate::new(wake_model, parser.clone());
+        let armed = Armed::default();
+        let gate = WakeGate::new(wake_model, parser.clone(), armed.clone());
         let pipeline = Arc::new(ListenerPipeline::new(
-            big_models,
-            parser,
-            self.player(ctx).await?,
+            big_models, parser, player, armed, speakers,
         ));
+        let inbox = pipeline.start(ctx.clone(), self.config.clone(), guild_id);
 
-        let ctx = ctx.clone();
-        let config = self.config.clone();
-        let mut wake_words: Vec<&str> = config.wake_words.iter().map(String::as_str).collect();
+        let mut wake_words: Vec<&str> = self.config.wake_words.iter().map(String::as_str).collect();
         wake_words.sort_unstable();
         tracing::info!(
             guild_id = %guild_id,
             channel = %channel,
             wake_words = %wake_words.join(", "),
+            locked = lock.is_locked(guild_id),
             "listening for a wake word"
         );
-        // The callback is awaited inside the gate loop rather than spawned, so a
-        // request cannot be acted on while the model for its wake word is still
-        // loading. Audio arriving in that window waits in the channel.
-        tokio::spawn(run_wake_gate(gate, rx, {
-            let pipeline = pipeline.clone();
-            let ctx = ctx.clone();
-            let config = config.clone();
+        tokio::spawn(run_wake_gate(
+            gate,
+            rx,
+            move || lock.is_locked(guild_id),
             move |heard| {
-                let pipeline = Arc::clone(&pipeline);
-                let ctx = ctx.clone();
-                let config = config.clone();
-                async move {
-                    pipeline.handle(&ctx, &config, guild_id, heard).await;
-                }
-            }
-        }));
+                let _ = inbox.send(heard);
+            },
+        ));
         Ok(())
     }
 

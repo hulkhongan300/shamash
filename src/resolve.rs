@@ -910,6 +910,15 @@ impl Catalog {
 const MAX_QUERIES_PER_PROVIDER: usize = 4;
 
 /// Merges provider results into one list, de-duplicated on the song.
+/// A title with nothing set aside in brackets and no featured artist.
+fn is_plain_title(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    !lower.contains(['(', '['])
+        && !lower.contains(" feat.")
+        && !lower.contains(" feat ")
+        && !lower.contains(" ft.")
+}
+
 fn merge(found: Vec<CatalogTrack>) -> Vec<Hit> {
     let mut hits: Vec<Hit> = Vec::new();
     let mut index: HashMap<(String, String), usize> = HashMap::new();
@@ -937,6 +946,23 @@ fn merge(found: Vec<CatalogTrack>) -> Vec<Hit> {
         };
 
         let hit = &mut hits[slot];
+        // "Dracula (feat. JENNIE)" and "Dracula" normalize alike, but they are
+        // different recordings. The plain one is the song that was asked for,
+        // so it takes over a hit the decorated one opened, and a decorated row
+        // adds nothing to a plain hit: not its video, and not its length.
+        match (is_plain_title(&hit.title), is_plain_title(&track.title)) {
+            (false, true) => {
+                hit.title = track.title.clone();
+                hit.durations = track.duration_secs.into_iter().collect();
+                hit.popularity = track.popularity.or(hit.popularity);
+                if let Some(id) = track.video_id.filter(|id| !id.is_empty()) {
+                    hit.video_id = Some(id);
+                }
+                continue;
+            }
+            (true, false) => continue,
+            _ => {}
+        }
         // Rows for the same song still contribute their own running time.
         if let Some(seconds) = track.duration_secs
             && !hit
@@ -971,6 +997,34 @@ fn merge(found: Vec<CatalogTrack>) -> Vec<Hit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trimmed copy of a real songs-search response for "dracula tame
+    /// impala". The shelf holding the rows is an array, which an earlier
+    /// parser did not descend into, so it found no songs at all and the
+    /// official upload never reached the ranking.
+    #[test]
+    fn songs_are_read_from_a_real_youtube_music_response() {
+        let body: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ytmusic_songs_dracula.json"))
+                .unwrap();
+        let songs = parse_songs(&body);
+        assert!(!songs.is_empty(), "no songs parsed");
+
+        // YouTube Music lists the JENNIE feature first. It must not become the
+        // song: that is how a request for Dracula played the remix.
+        let hits = merge(songs.clone());
+        let best = &hits[0];
+        assert_eq!(best.title, "Dracula", "{hits:?}");
+        assert_eq!(best.video_id.as_deref(), Some("5nCOjdHeYjM"), "{hits:?}");
+        assert_eq!(best.duration_secs(), Some(206.0), "{hits:?}");
+        let dracula = songs
+            .iter()
+            .find(|s| s.title == "Dracula")
+            .unwrap_or_else(|| panic!("no plain Dracula in {songs:?}"));
+        assert!(dracula.artist.contains("Tame Impala"), "{}", dracula.artist);
+        assert!(dracula.video_id.is_some());
+        assert!(dracula.duration_secs.is_some());
+    }
 
     fn track(artist: &str, title: &str, duration: Option<f64>) -> CatalogTrack {
         CatalogTrack {

@@ -23,8 +23,9 @@
 
 use crate::model;
 use crate::transcriber::Transcriber;
+use std::path::Path;
 use std::sync::Mutex;
-use transcribe_cpp::{Model, RunOptions, Session};
+use transcribe_cpp::{Feature, Model, RunExtension, RunOptions, Session, WhisperRunOptions};
 
 /// Transcribes with a permanently loaded model.
 pub struct DirectTranscriber {
@@ -35,6 +36,13 @@ pub struct DirectTranscriber {
     /// A language hint, for the models that need one (Canary and Nemotron
     /// return empty text without it). `None` leaves detection to the model.
     language: Option<String>,
+    /// A decoding prompt, for the models that take one (Whisper). Biasing the
+    /// decoder towards "bot, play <title> by <artist>" is what makes it spell
+    /// song and artist names as names instead of as the nearest common words.
+    /// `None` for models that do not accept a prompt.
+    prompt: Option<String>,
+    /// Kept for the startup log line; the session holds its own reference.
+    model_id: String,
 }
 
 impl DirectTranscriber {
@@ -42,8 +50,9 @@ impl DirectTranscriber {
     /// once at startup rather than per utterance.
     ///
     /// `model` is either a path or a Handy catalogue id; see
-    /// [`crate::model::resolve`].
-    pub fn new(model: &str, language: Option<&str>) -> anyhow::Result<Self> {
+    /// [`crate::model::resolve`]. `prompt` is ignored by models that cannot
+    /// take one, so it is safe to pass for any model.
+    pub fn new(model: &str, language: Option<&str>, prompt: Option<&str>) -> anyhow::Result<Self> {
         // Both of these are process-global and the library asks for them once,
         // before the first model load. `Once` keeps a second engine from
         // re-scanning the backend directory.
@@ -101,12 +110,26 @@ impl DirectTranscriber {
             "loaded ASR model"
         );
 
+        let prompt = prompt
+            .filter(|_| loaded.supports(Feature::InitialPrompt))
+            .map(str::to_string);
+        if let Some(prompt) = &prompt {
+            tracing::info!(prompt = %prompt, "decoding with a prompt");
+        }
+
         let session = loaded.session()?;
 
         Ok(Self {
             session: Mutex::new(session),
             language: language.map(str::to_string),
+            prompt,
+            model_id: model.to_string(),
         })
+    }
+
+    /// The model this transcriber was built from, for logging.
+    pub fn model_id(&self) -> &str {
+        &self.model_id
     }
 }
 
@@ -122,6 +145,12 @@ impl Transcriber for DirectTranscriber {
 
         let options = RunOptions {
             language: self.language.clone(),
+            family: self.prompt.as_ref().map(|prompt| {
+                RunExtension::Whisper(WhisperRunOptions {
+                    initial_prompt: Some(prompt.clone()),
+                    ..WhisperRunOptions::default()
+                })
+            }),
             ..RunOptions::default()
         };
 
@@ -141,6 +170,14 @@ impl Transcriber for DirectTranscriber {
 
         Ok(transcript.text)
     }
+}
+
+/// True when `path` looks like something [`DirectTranscriber::new`] can open.
+///
+/// Used by the startup check to explain a bad `REQUEST_MODEL` before the bot
+/// joins a voice channel.
+pub fn model_exists(spec: &str) -> bool {
+    Path::new(spec).is_file() || model::resolve(spec).is_ok()
 }
 
 /// Checks a language hint against what a model advertises, without a model.

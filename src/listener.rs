@@ -1,63 +1,100 @@
+//! Receiving voice from Discord.
+//!
+//! Every speaker arrives as their own stream (an RTP SSRC), and they are kept
+//! apart rather than mixed: a model given two people talking at once, or one
+//! person and someone else's music bleeding into their microphone, hears
+//! neither of them well. [`crate::wake`] runs one gate per stream.
+
 use crate::audio::rms;
+use crate::wake::{Ssrc, Tick};
 use serenity::async_trait;
+use serenity::model::id::UserId;
 use songbird::EventHandler;
 use songbird::events::{Event, EventContext};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// Samples per 20 ms frame at 16 kHz.
+/// Sample rate (Hz) of the mono audio songbird is configured to decode to.
+pub const LISTEN_SAMPLE_RATE: u32 = 16_000;
+/// Samples per 20 ms frame at [`LISTEN_SAMPLE_RATE`]: one Discord packet.
 pub const FRAME_SAMPLES: usize = 320;
 
-/// Frame [`rms`](crate::audio::rms) below which audio counts as silence.
-///
-/// 0.02 is -34 dBFS. Ordinary conversation sits near -20 dBFS and a quiet
-/// voice or low microphone gain near -30 dBFS, so this keeps roughly 4 to 14 dB
-/// of headroom above speech while staying well clear of room tone, which is
-/// typically -45 dBFS or lower. Measure your own voice with
-/// `cargo run --release --example transcribe -- recording.wav`, which prints
-/// the peak frame level against this gate.
-pub const VAD_RMS_THRESHOLD: f32 = 0.02;
+/// A frame RMS below which the diagnostic report calls audio too quiet to be
+/// ordinary speech: -40 dBFS. Only a hint for `VOICE_DIAG`; the voice detector
+/// does not use a level at all.
+pub const QUIET_SPEECH_RMS: f32 = 0.01;
 
-/// Mixes per-speaker i16 frames into a single normalized f32 frame.
-///
-/// Frames are normally all the same length — they are 20 ms at the configured
-/// decode rate — but nothing guarantees it: a decode can yield a short final
-/// packet, and a longer one would have indexed past the end of `out` and
-/// panicked in a release build. Only the samples every frame has are mixed, so
-/// a ragged set of frames produces a short frame rather than a crash.
-///
-/// The sum is clamped to [-1, 1]. Two people speaking at once must not sum to
-/// a sample the decoder would read as louder than full scale, which clips and
-/// sounds like a crack rather than like two voices.
-pub fn mix_frames(frames: &[&[i16]]) -> Vec<f32> {
-    let len = frames.iter().map(|frame| frame.len()).min().unwrap_or(0);
-    if len == 0 {
-        return Vec::new();
-    }
-    if let Some(shortest) = frames.iter().find(|frame| frame.len() != len) {
-        tracing::warn!(
-            expected = len,
-            found = shortest.len(),
-            "speaker frames differ in length; mixing only what all of them have"
-        );
+/// Which Discord user each voice stream belongs to, learnt from songbird's
+/// speaking-state events. Used to say who asked.
+#[derive(Debug, Clone, Default)]
+pub struct Speakers(Arc<Mutex<HashMap<Ssrc, UserId>>>);
+
+impl Speakers {
+    pub fn user(&self, ssrc: Ssrc) -> Option<UserId> {
+        self.lock().get(&ssrc).copied()
     }
 
-    let mut out = vec![0.0f32; len];
-    for frame in frames {
-        for (mixed, sample) in out.iter_mut().zip(*frame) {
-            *mixed += *sample as f32 / 32768.0;
-        }
+    fn set(&self, ssrc: Ssrc, user: UserId) {
+        self.lock().insert(ssrc, user);
     }
-    out.iter_mut()
-        .for_each(|mixed| *mixed = mixed.clamp(-1.0, 1.0));
-    out
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Ssrc, UserId>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
-/// Songbird event handler forwarding decoded voice frames to a listener task.
+/// Records which user owns which voice stream.
+pub struct SpeakingHandler(pub Speakers);
+
+#[async_trait]
+impl EventHandler for SpeakingHandler {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if let EventContext::SpeakingStateUpdate(speaking) = ctx
+            && let Some(user) = speaking.user_id
+            && user.0 != 0
+        {
+            self.0.set(speaking.ssrc, UserId::new(user.0));
+        }
+        // `None` keeps the handler registered; see `VoiceTickHandler::act`.
+        None
+    }
+}
+
+/// Converts one speaker's decoded i16 frame to f32 in [-1, 1].
+pub fn to_f32(frame: &[i16]) -> Vec<f32> {
+    frame.iter().map(|s| f32::from(*s) / 32768.0).collect()
+}
+
+/// Splits one songbird tick into each speaker's audio.
+///
+/// A speaker the call knows about who sent nothing this tick gets a frame of
+/// silence. Discord only sends audio while somebody transmits, so silence
+/// never arrives on its own, and without it an utterance could never end.
+pub fn split_tick(
+    speaking: impl IntoIterator<Item = (Ssrc, Option<Vec<i16>>)>,
+    silent: impl IntoIterator<Item = Ssrc>,
+) -> Tick {
+    let mut tick: Tick = speaking
+        .into_iter()
+        .map(|(ssrc, decoded)| match decoded {
+            Some(pcm) if !pcm.is_empty() => (ssrc, to_f32(&pcm)),
+            _ => (ssrc, vec![0.0; FRAME_SAMPLES]),
+        })
+        .collect();
+    tick.extend(
+        silent
+            .into_iter()
+            .map(|ssrc| (ssrc, vec![0.0; FRAME_SAMPLES])),
+    );
+    tick
+}
+
+/// Songbird event handler forwarding each tick's per-speaker audio.
 #[derive(Debug)]
 pub struct VoiceTickHandler {
-    tx: UnboundedSender<Vec<f32>>,
+    tx: UnboundedSender<Tick>,
     diag: Mutex<Option<TickDiag>>,
 }
 
@@ -67,20 +104,18 @@ struct TickDiag {
     since: Instant,
     ticks: u64,
     frames: u64,
+    speakers: usize,
     peak: f32,
-    frame_len: usize,
-    /// Whether the first-tick announcement has already been made. Reporting
-    /// resets the counters, so this cannot be inferred from `ticks` being zero.
     announced: bool,
 }
 
 impl VoiceTickHandler {
-    pub fn new(tx: UnboundedSender<Vec<f32>>) -> Self {
+    pub fn new(tx: UnboundedSender<Tick>) -> Self {
         let diag = std::env::var("VOICE_DIAG")
             .ok()
             .filter(|v| !v.is_empty() && v != "0")
             .map(|_| {
-                println!("voice diag: handler installed, expecting voice ticks");
+                tracing::info!("voice diag: handler installed, expecting voice ticks");
                 TickDiag::new(Instant::now())
             });
         Self {
@@ -89,22 +124,17 @@ impl VoiceTickHandler {
         }
     }
 
-    /// Records one voice tick and prints a periodic report when `VOICE_DIAG` is
-    /// set.
-    fn record(&self, mixed: &[f32]) {
-        let Ok(mut diag) = self.diag.lock() else {
-            return;
-        };
+    fn record(&self, tick: &Tick, voiced: usize) {
+        let mut diag = self.diag.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(diag) = diag.as_mut() else {
             return;
         };
         if diag.announce_first_tick() {
-            println!("voice diag: first voice tick received");
+            tracing::info!("voice diag: first voice tick received");
         }
-        let now = Instant::now();
-        diag.observe(mixed);
-        if let Some(report) = diag.report(now, DIAG_INTERVAL) {
-            println!("{report}");
+        diag.observe(tick, voiced);
+        if let Some(report) = diag.report(Instant::now(), DIAG_INTERVAL) {
+            tracing::info!("{report}");
         }
     }
 }
@@ -118,37 +148,34 @@ impl TickDiag {
             since,
             ticks: 0,
             frames: 0,
+            speakers: 0,
             peak: 0.0,
-            frame_len: 0,
             announced: false,
         }
     }
 
-    /// Folds one tick into the counters. An empty frame is a tick that carried
-    /// no audio.
     /// Whether this is the first tick seen, so the arrival can be announced.
-    /// Reporting resets the counters, so the flag has to be its own field.
     fn announce_first_tick(&mut self) -> bool {
         let first = !self.announced;
         self.announced = true;
         first
     }
 
-    fn observe(&mut self, frame: &[f32]) {
+    /// Folds one tick into the counters. `voiced` is how many of its speakers
+    /// actually sent audio, rather than being given silence.
+    fn observe(&mut self, tick: &Tick, voiced: usize) {
         self.ticks += 1;
-        if !frame.is_empty() {
-            self.frames += 1;
-            self.frame_len = frame.len();
-            self.peak = self.peak.max(rms(frame));
+        self.frames += voiced as u64;
+        self.speakers = self.speakers.max(tick.len());
+        for (_, audio) in tick {
+            self.peak = self.peak.max(rms(audio));
         }
     }
 
     /// Returns a report once `interval` has passed, and resets the counters.
     ///
-    /// The report is driven by ticks, not by audio, and that is the whole
-    /// point: a report that only appears when audio arrives cannot distinguish
-    /// a bot that receives nothing from one that receives silence, and those
-    /// are exactly the two cases worth telling apart.
+    /// Driven by ticks rather than audio, so a bot that receives nothing can be
+    /// told apart from one that receives silence.
     fn report(&mut self, now: Instant, interval: Duration) -> Option<String> {
         let elapsed = now.saturating_duration_since(self.since);
         if elapsed < interval {
@@ -156,12 +183,11 @@ impl TickDiag {
         }
         let seconds = elapsed.as_secs_f32().max(f32::EPSILON);
         let mut report = format!(
-            "voice diag: {} ticks and {} audio frames in {seconds:.0}s ({:.0} frames/s), \
-             {}/frame, peak rms {:.4} ({:.1} dBFS) vs gate {VAD_RMS_THRESHOLD:.4}",
+            "voice diag: {} ticks and {} audio frames in {seconds:.0}s from up to {} speaker(s), \
+             peak rms {:.4} ({:.1} dBFS)",
             self.ticks,
             self.frames,
-            self.frames as f32 / seconds,
-            self.frame_len,
+            self.speakers,
             self.peak,
             to_dbfs(self.peak),
         );
@@ -176,14 +202,11 @@ impl TickDiag {
                  in which case nothing can be decoded. Speaking once the bot has been in the \
                  channel a while, or rejoining the channel, usually settles it.",
             );
-        } else if self.peak < VAD_RMS_THRESHOLD {
+        } else if self.peak < QUIET_SPEECH_RMS {
             report.push_str(
-                "\n  audio is arriving below the gate: raise the microphone gain or lower \
-                 VAD_RMS_THRESHOLD",
+                "\n  audio is arriving but very quietly: raise the microphone gain in Discord",
             );
         }
-        // Counters restart, but the handler is still the same one, so the
-        // first-tick announcement must not be made a second time.
         let announced = self.announced;
         *self = Self::new(now);
         self.announced = announced;
@@ -192,7 +215,7 @@ impl TickDiag {
 }
 
 /// Full-scale decibel level of a linear amplitude.
-fn to_dbfs(amplitude: f32) -> f32 {
+pub fn to_dbfs(amplitude: f32) -> f32 {
     20.0 * amplitude.max(1e-9).log10()
 }
 
@@ -200,14 +223,21 @@ fn to_dbfs(amplitude: f32) -> f32 {
 impl EventHandler for VoiceTickHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::VoiceTick(tick) = ctx {
-            let frames: Vec<&[i16]> = tick
+            let voiced = tick
                 .speaking
                 .values()
-                .filter_map(|data| data.decoded_voice.as_deref())
-                .collect();
-            let mixed = mix_frames(&frames);
-            self.record(&mixed);
-            let _ = self.tx.send(frame_for_tick(mixed));
+                .filter(|data| data.decoded_voice.as_ref().is_some_and(|v| !v.is_empty()))
+                .count();
+            let split = split_tick(
+                tick.speaking
+                    .iter()
+                    .map(|(ssrc, data)| (*ssrc, data.decoded_voice.clone())),
+                tick.silent.iter().copied(),
+            );
+            self.record(&split, voiced);
+            if !split.is_empty() {
+                let _ = self.tx.send(split);
+            }
         }
         // Must stay `None`. Returning the same event type we were invoked with
         // looks like a no-op but deletes the handler: songbird removes it from
@@ -220,53 +250,44 @@ impl EventHandler for VoiceTickHandler {
     }
 }
 
-/// The frame to hand to the voice detector for one tick.
-///
-/// Discord only sends audio while somebody is transmitting, so silence never
-/// arrives on its own. The detector ends an utterance on a run of quiet
-/// frames, and without them it never ends one: it waits for the 12 s length
-/// cap instead, which needs unbroken speech and so regularly never arrives. A
-/// tick with no audio therefore becomes an explicit silent frame.
-fn frame_for_tick(mixed: Vec<f32>) -> Vec<f32> {
-    if mixed.is_empty() {
-        vec![0.0; FRAME_SAMPLES]
-    } else {
-        mixed
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A 20 ms frame at 16 kHz, quiet enough to sit below the gate.
-    fn quiet_frame() -> Vec<f32> {
-        vec![0.01; FRAME_SAMPLES]
+    #[test]
+    fn speakers_are_kept_apart_rather_than_mixed() {
+        let tick = split_tick(
+            [
+                (1, Some(vec![1000i16; 320])),
+                (2, Some(vec![-2000i16; 320])),
+            ],
+            [],
+        );
+        assert_eq!(tick.len(), 2);
+        let one = tick.iter().find(|(s, _)| *s == 1).unwrap();
+        let two = tick.iter().find(|(s, _)| *s == 2).unwrap();
+        assert!((one.1[0] - 1000.0 / 32768.0).abs() < 1e-6);
+        assert!((two.1[0] + 2000.0 / 32768.0).abs() < 1e-6);
     }
 
-    /// A 20 ms frame at 16 kHz at a normal speaking level.
-    fn speech_frame() -> Vec<f32> {
-        vec![0.2; FRAME_SAMPLES]
+    /// The failure this prevents: a speaker stops transmitting, Discord sends
+    /// nothing at all, and their utterance never ends.
+    #[test]
+    fn a_silent_speaker_is_given_silence() {
+        let tick = split_tick([], [9]);
+        assert_eq!(tick, vec![(9, vec![0.0; FRAME_SAMPLES])]);
     }
 
     #[test]
-    fn a_tick_with_audio_forwards_that_audio() {
-        let audio = vec![0.25f32; FRAME_SAMPLES];
-        assert_eq!(frame_for_tick(audio.clone()), audio);
+    fn a_lost_packet_is_silence_not_nothing() {
+        let tick = split_tick([(4, None), (5, Some(Vec::new()))], []);
+        assert!(tick.iter().all(|(_, a)| a.len() == FRAME_SAMPLES));
     }
 
     #[test]
-    fn a_tick_without_audio_forwards_silence_so_utterances_can_end() {
-        let frame = frame_for_tick(Vec::new());
-        assert_eq!(
-            frame.len(),
-            FRAME_SAMPLES,
-            "the detector needs a full frame"
-        );
-        assert!(
-            rms(&frame) < VAD_RMS_THRESHOLD,
-            "the substitute must read as silence to the detector"
-        );
+    fn full_scale_converts_to_full_scale() {
+        assert_eq!(to_f32(&[i16::MIN])[0], -1.0);
+        assert!(to_f32(&[i16::MAX])[0] < 1.0);
     }
 
     #[test]
@@ -274,174 +295,46 @@ mod tests {
         let mut diag = TickDiag::new(Instant::now());
         assert!(diag.announce_first_tick());
         assert!(!diag.announce_first_tick());
-
-        // A report resets the counters, which must not repeat the announcement.
         let _ = diag.report(Instant::now() + DIAG_INTERVAL, DIAG_INTERVAL);
         assert!(!diag.announce_first_tick());
     }
 
     #[test]
-    fn diag_counts_a_tick_that_carries_no_audio() {
-        let mut diag = TickDiag::new(Instant::now());
-        for _ in 0..50 {
-            diag.observe(&[]);
-        }
-        assert_eq!(diag.ticks, 50);
-        assert_eq!(diag.frames, 0, "an empty frame is a tick, not audio");
-    }
+    fn diag_names_the_ways_audio_can_be_missing() {
+        let start = Instant::now();
 
-    #[test]
-    fn diag_records_frame_length_and_peak() {
-        let mut diag = TickDiag::new(Instant::now());
-        diag.observe(&speech_frame());
-        assert_eq!(diag.frames, 1);
-        assert_eq!(diag.frame_len, FRAME_SAMPLES);
-        assert!((diag.peak - 0.2).abs() < 1e-3);
+        let mut diag = TickDiag::new(start);
+        let report = diag.report(start + DIAG_INTERVAL, DIAG_INTERVAL).unwrap();
+        assert!(report.contains("no voice ticks at all"), "{report}");
+
+        let mut diag = TickDiag::new(start);
+        diag.observe(&split_tick([], [1]), 0);
+        let report = diag.report(start + DIAG_INTERVAL, DIAG_INTERVAL).unwrap();
+        assert!(report.contains("carry no audio"), "{report}");
+
+        let mut diag = TickDiag::new(start);
+        diag.observe(&split_tick([(1, Some(vec![30i16; 320]))], []), 1);
+        let report = diag.report(start + DIAG_INTERVAL, DIAG_INTERVAL).unwrap();
+        assert!(report.contains("very quietly"), "{report}");
+
+        let mut diag = TickDiag::new(start);
+        diag.observe(&split_tick([(1, Some(vec![6000i16; 320]))], []), 1);
+        let report = diag.report(start + DIAG_INTERVAL, DIAG_INTERVAL).unwrap();
+        assert!(
+            !report.contains("quietly") && !report.contains("no audio"),
+            "{report}"
+        );
     }
 
     #[test]
     fn diag_stays_quiet_until_the_interval_passes() {
         let start = Instant::now();
         let mut diag = TickDiag::new(start);
-        diag.observe(&speech_frame());
         assert!(
             diag.report(start + Duration::from_secs(4), DIAG_INTERVAL)
-                .is_none(),
-            "must not report before the interval"
+                .is_none()
         );
-        let report = diag
-            .report(start + DIAG_INTERVAL, DIAG_INTERVAL)
-            .expect("reports once the interval passes");
-        assert!(report.contains("1 ticks and 1 audio frames"), "{report}");
-    }
-
-    #[test]
-    fn diag_names_the_three_ways_audio_can_be_missing() {
-        let start = Instant::now();
-
-        // No ticks at all: nothing is driving the handler.
-        let mut diag = TickDiag::new(start);
-        let report = diag.report(start + DIAG_INTERVAL, DIAG_INTERVAL).unwrap();
-        assert!(report.contains("no voice ticks at all"), "{report}");
-
-        // Ticks but no frames: the decoder is producing nothing.
-        let mut diag = TickDiag::new(start);
-        for _ in 0..50 {
-            diag.observe(&[]);
-        }
-        let report = diag.report(start + DIAG_INTERVAL, DIAG_INTERVAL).unwrap();
-        assert!(
-            report.contains("ticks are arriving but carry no audio"),
-            "{report}"
-        );
-
-        // Frames below the gate: audio is there, the gate is too high.
-        let mut diag = TickDiag::new(start);
-        for _ in 0..50 {
-            diag.observe(&quiet_frame());
-        }
-        let report = diag.report(start + DIAG_INTERVAL, DIAG_INTERVAL).unwrap();
-        assert!(report.contains("below the gate"), "{report}");
-
-        // Frames above the gate: working.
-        let mut diag = TickDiag::new(start);
-        for _ in 0..50 {
-            diag.observe(&speech_frame());
-        }
-        let report = diag.report(start + DIAG_INTERVAL, DIAG_INTERVAL).unwrap();
-        assert!(!report.contains("below the gate"), "{report}");
-        assert!(!report.contains("no voice ticks"), "{report}");
-        assert!(!report.contains("carry no audio"), "{report}");
-    }
-
-    #[test]
-    fn diag_resets_counters_after_reporting() {
-        let start = Instant::now();
-        let mut diag = TickDiag::new(start);
-        diag.observe(&speech_frame());
-        diag.report(start + DIAG_INTERVAL, DIAG_INTERVAL).unwrap();
-        assert_eq!(diag.ticks, 0);
-        assert_eq!(diag.frames, 0);
-        assert_eq!(diag.peak, 0.0);
-    }
-
-    #[test]
-    fn mixes_multiple_speakers() {
-        let left = vec![1000i16; 320];
-        let right = vec![3000i16; 320];
-        let mixed = mix_frames(&[&left, &right]);
-        assert_eq!(mixed.len(), 320);
-        let expected = (1000.0 + 3000.0) / 32768.0;
-        assert!((mixed[0] - expected).abs() < 1e-6);
-    }
-
-    #[test]
-    fn mixes_empty_frame_set() {
-        assert!(mix_frames(&[]).is_empty());
-    }
-
-    /// A longer speaker frame used to index past the end of the output and
-    /// panic in a release build — the length check was a `debug_assert`, which
-    /// only runs in a debug build. A ragged tick is now a shorter frame.
-    #[test]
-    fn a_longer_speaker_frame_does_not_panic_or_overrun() {
-        let short = vec![1000i16; 320];
-        let long = vec![2000i16; 640];
-        let mixed = mix_frames(&[&short, &long]);
-        assert_eq!(mixed.len(), 320, "only what every frame has is mixed");
-        assert!((mixed[0] - (1000.0 + 2000.0) / 32768.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn a_shorter_speaker_frame_is_the_limit() {
-        let short = vec![1000i16; 160];
-        let long = vec![2000i16; 320];
-        let mixed = mix_frames(&[&short, &long]);
-        assert_eq!(mixed.len(), 160);
-    }
-
-    /// A frame of nothing at all cannot contribute, so a decoder hiccup that
-    /// yields an empty buffer does not throw the whole tick away.
-    #[test]
-    fn an_empty_frame_still_lets_the_others_through() {
-        let full = vec![1000i16; 320];
-        let empty: Vec<i16> = Vec::new();
-        assert!(mix_frames(&[&full, &empty]).is_empty());
-        assert_eq!(mix_frames(&[&empty, &full]).len(), 0);
-    }
-
-    /// The result is documented as normalized, and two loud speakers really do
-    /// sum past full scale. Unclamped, the decoder reads that as a hard clip and
-    /// it sounds like a crack rather than like two voices.
-    #[test]
-    fn the_mixed_frame_is_clamped_to_full_scale() {
-        let loud = vec![i16::MAX; 320];
-        let also_loud = vec![i16::MAX; 320];
-        let mixed = mix_frames(&[&loud, &also_loud]);
-        assert!(
-            mixed.iter().all(|s| (-1.0..=1.0).contains(s)),
-            "{:?} is outside full scale",
-            &mixed[..4]
-        );
-        assert_eq!(mixed[0], 1.0);
-    }
-
-    #[test]
-    fn clipping_does_not_distort_quiet_audio() {
-        let quiet = vec![100i16; 320];
-        let mixed = mix_frames(&[&quiet]);
-        assert!((mixed[0] - 100.0 / 32768.0).abs() < 1e-6);
-    }
-
-    /// A negative peak clamps to the bottom rather than the top, which an
-    /// `abs()`-based clamp would get wrong.
-    #[test]
-    fn a_negative_overload_clamps_to_minus_one() {
-        let loud = vec![i16::MIN; 320];
-        assert_eq!(mix_frames(&[&loud, &loud])[0], -1.0);
-        // Just below full scale, so one speaker alone is not clamped: this
-        // checks the result is clamped rather than hard-set to -1.
-        let almost = vec![i16::MIN + 1; 320];
-        assert!(mix_frames(&[&almost])[0] > -1.0);
+        assert!(diag.report(start + DIAG_INTERVAL, DIAG_INTERVAL).is_some());
+        assert_eq!(diag.ticks, 0, "counters reset after a report");
     }
 }

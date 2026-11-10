@@ -1,4 +1,4 @@
-/// Re-samples audio between two rates for Whisper's 16 kHz front end.
+/// Re-samples audio between two rates for the models' 16 kHz front end.
 #[derive(Debug, Clone)]
 pub struct Resampler {
     input_rate: u32,
@@ -60,6 +60,9 @@ impl Resampler {
 /// conversation entirely.
 #[must_use]
 pub fn rms(frame: &[f32]) -> f32 {
+    if frame.is_empty() {
+        return 0.0;
+    }
     let mean_square = frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32;
     mean_square.sqrt()
 }
@@ -178,18 +181,5 @@ mod tests {
             "peak {peak}, rms {}",
             rms(&speech)
         );
-    }
-
-    #[test]
-    fn quiet_speech_sits_far_below_the_old_mean_square_gate() {
-        // Ordinary conversation lands around -20 dBFS RMS; a quiet voice or a
-        // low microphone gain around -30 dBFS.
-        let speech = speech_frame(0.05);
-        let mean_square: f32 = speech.iter().map(|s| s * s).sum::<f32>() / FRAME as f32;
-        assert!(
-            mean_square < crate::listener::VAD_RMS_THRESHOLD,
-            "mean square {mean_square} must fall under the threshold"
-        );
-        assert!(rms(&speech) > crate::listener::VAD_RMS_THRESHOLD);
     }
 }

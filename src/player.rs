@@ -166,6 +166,8 @@ pub struct Player {
     /// The "which one did you mean" buttons currently on offer.
     /// The outstanding `/play` search per guild.
     asks: Asks,
+    /// Who has the music lowered while they talk to the bot.
+    ducks: Ducks,
     /// What the bot remembers, or `None` when it has been given no place to
     /// remember in.
     pub library: Option<Arc<crate::library::Library>>,
@@ -398,6 +400,45 @@ impl Asks {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
+
+/// Which voice streams currently have the music lowered, per guild. The music
+/// is low while any of them does, so one speaker finishing does not bring it
+/// back up under another who is still talking.
+#[derive(Debug, Clone, Default)]
+struct Ducks(Arc<Mutex<HashMap<GuildId, std::collections::HashSet<u32>>>>);
+
+impl Ducks {
+    /// Records `ssrc` lowering (or releasing) the music; returns whether the
+    /// guild's music should now be low.
+    fn set(&self, guild_id: GuildId, ssrc: u32, on: bool) -> bool {
+        let mut all = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let holders = all.entry(guild_id).or_default();
+        if on {
+            holders.insert(ssrc);
+        } else {
+            holders.remove(&ssrc);
+        }
+        !holders.is_empty()
+    }
+
+    fn clear(&self, guild_id: GuildId) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&guild_id);
+    }
+
+    fn is_ducked(&self, guild_id: GuildId) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&guild_id)
+            .is_some_and(|holders| !holders.is_empty())
+    }
+}
+
+/// Music volume while somebody is talking to the bot.
+pub const DUCK_VOLUME: f32 = 0.2;
 
 #[derive(Debug, Clone, Default)]
 struct AutocompleteCache(Arc<Mutex<HashMap<String, resolve::CatalogTrack>>>);
@@ -728,11 +769,32 @@ impl Player {
             dashboards: Dashboards::default(),
             catalog,
             asks: Asks::default(),
+            ducks: Ducks::default(),
             library: None,
             pending: PendingLearn::default(),
             started_at: StartedAt::default(),
             fetch: Arc::new(YtDlpFetch),
             autocomplete_cache: AutocompleteCache::default(),
+        }
+    }
+
+    /// Brings the music back to full volume whoever lowered it, as when
+    /// listening is locked and nobody is going to finish their request.
+    pub fn release_duck(&self, guild_id: GuildId) {
+        self.ducks.clear(guild_id);
+        if let Some(handle) = self.tracks.get(guild_id) {
+            let _ = handle.set_volume(1.0);
+        }
+    }
+
+    /// Lowers (or restores) the music while `ssrc` is talking to the bot.
+    ///
+    /// Someone without headphones feeds the song back into their microphone,
+    /// and the model then transcribes the lyrics along with the request.
+    pub fn duck(&self, guild_id: GuildId, ssrc: u32, on: bool) {
+        let low = self.ducks.set(guild_id, ssrc, on);
+        if let Some(handle) = self.tracks.get(guild_id) {
+            let _ = handle.set_volume(if low { DUCK_VOLUME } else { 1.0 });
         }
     }
 
@@ -1181,6 +1243,9 @@ impl Player {
         )
         .await
         {
+            if self.ducks.is_ducked(guild_id) {
+                let _ = handle.set_volume(DUCK_VOLUME);
+            }
             self.tracks.set(guild_id, handle.clone());
             self.follow_when_finished(ctx, config, guild_id, handle, advanced.generation);
         }
@@ -1637,7 +1702,9 @@ impl Player {
 
         // The download runs outside the playback lock for the same reason the
         // spoken path does: a press on "1" must not freeze the Skip button.
-        let started_at = self.coordination.generations.get(guild_id).now();
+        // In line with spoken requests, so a press and a request heard at the
+        // same moment cannot both decide they are the one that starts playback.
+        let (_serialised, started_at) = self.coordination.begin(guild_id).await;
         let song = self
             .fetch
             .fetch(
@@ -2805,5 +2872,16 @@ mod tests {
         assert_eq!(retrieved.artist, "Tame Impala");
         assert_eq!(retrieved.title, "Dracula");
         assert!(cache.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn the_music_stays_low_until_every_speaker_is_done() {
+        let ducks = Ducks::default();
+        let guild = GuildId::new(1);
+        assert!(ducks.set(guild, 1, true));
+        assert!(ducks.set(guild, 2, true));
+        assert!(ducks.set(guild, 1, false), "speaker 2 is still talking");
+        assert!(!ducks.set(guild, 2, false));
+        assert!(!ducks.is_ducked(guild));
     }
 }

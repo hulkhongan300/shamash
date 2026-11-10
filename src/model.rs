@@ -6,34 +6,45 @@
 //! `handy-computer/<repo>/<file>.gguf` and resolves it against its own Hugging
 //! Face cache. Keeping the default in one place stops the two paths drifting
 //! onto different models, and [`resolve`] accepts either spelling so
-//! `PARAKEET_MODEL` keeps working unchanged for people who set it for Handy.
+//! `REQUEST_MODEL` (formerly `PARAKEET_MODEL`) takes either spelling.
 
 use std::path::{Path, PathBuf};
 
-/// The model both engines default to.
+/// The request model: Whisper large-v3-turbo, Q8_0.
 ///
-/// Whisper large-v3-turbo, Q8_0. It is the strongest recogniser the Handy
-/// catalogue offers for general speech and it detects the language itself, so
-/// `ASR_LANGUAGE` is not needed for it. The previous default, Parakeet TDT
-/// 0.6B v2, was English-only and had to be chosen for being the best *English*
-/// model available.
-///
-/// The cost is size and, without a GPU, latency: ~870 MB of weights against
-/// the Parakeet's ~600 MB, and a transformer decode rather than a
-/// frame-aligned one. On the CPU that is ~17 s for a short utterance, which is
-/// why `transcribe-cpp`'s `vulkan` feature is on; on the GPU it is ~1 s. It is
-/// still far quicker than the old `whisper-rs` route either way, because
-/// `ASR_ENGINE=direct` holds the model resident rather than reloading it per
-/// utterance.
-///
-/// `ASR_ENGINE=handy` still prefers [`SMALL_MODEL_ID`], where a 600 ms load per
-/// command really is the dominant cost.
+/// Multilingual and able to detect the language itself, and the one model
+/// family the engine lets us *prompt* (see [`REQUEST_PROMPT`]). The prompt is
+/// what wins it the job: on five synthesised English requests naming artists
+/// that are not in the prompt, Whisper with it spelled all five correctly
+/// ("The Weeknd", "Mr. Brightside", "Dua Lipa"), where Parakeet 0.6B v2 got
+/// two and heard one "play" as "place". The cost is latency: ~1 s per request on the
+/// GPU, ~17 s on the CPU, which is why `transcribe-cpp`'s `vulkan` feature is
+/// on. Whisper also invents text on audio that is mostly silence, which the
+/// voice detector in [`crate::segment`] keeps away from it.
 pub const DEFAULT_MODEL_ID: &str =
     "handy-computer/whisper-large-v3-turbo-gguf/whisper-large-v3-turbo-Q8_0.gguf";
 
-/// The fast-loading model, for the engine that pays to load one per utterance.
+/// The fast alternative for English: Parakeet TDT 0.6B v2, Q8_0.
+///
+/// About ten times quicker than Whisper turbo on the same GPU (~0.1 s against
+/// ~1.1 s per request) and it does not hallucinate on near-silence, but it is
+/// English only and cannot be prompted, so it spells names worse. Set
+/// `REQUEST_MODEL` to this if latency matters more than names.
+pub const ENGLISH_MODEL_ID: &str =
+    "handy-computer/parakeet-tdt-0.6b-v2-gguf/parakeet-tdt-0.6b-v2-Q8_0.gguf";
+
+/// The fast-loading model: the always-on wake model, and the default for the
+/// Handy engine, which pays to load a model per utterance.
 pub const SMALL_MODEL_ID: &str =
     "handy-computer/parakeet-tdt_ctc-110m-gguf/parakeet-tdt_ctc-110m-Q8_0.gguf";
+
+/// What the request model is prompted with, for the models that take a prompt.
+///
+/// Whisper continues the style of its prompt, so an example of a request
+/// biases it towards transcribing one: names capitalised as names, "by"
+/// between title and artist.
+pub const REQUEST_PROMPT: &str =
+    "Bot, play Dracula by Tame Impala. Play Bohemian Rhapsody by Queen.";
 
 /// Turns a model spec into a path this process can open.
 ///

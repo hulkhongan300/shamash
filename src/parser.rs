@@ -276,6 +276,60 @@ impl CommandParser {
         build_request(&words.join(" ")).map(|request| request.query)
     }
 
+    /// Whether any word of `transcript` is a wake word.
+    pub fn contains_wake_word(&self, transcript: &str) -> bool {
+        normalize(transcript)
+            .split(' ')
+            .filter(|word| !word.is_empty())
+            .any(|word| self.is_wake_word(word))
+    }
+
+    /// The grammar applied to a whole utterance the wake gate woke on.
+    ///
+    /// Looser than [`Self::parse_with_reason`] in one way: "play" is optional
+    /// when the wake word opens the utterance, so "bot, Dracula by Tame Impala"
+    /// is a request. A wake word in the middle of a sentence still needs "play"
+    /// after it, which keeps "I told the bot yesterday…" from being searched
+    /// for. [`ParseMiss::EmptyRequest`] is the wake word said on its own, which
+    /// the pipeline answers by waiting for the request.
+    pub fn command(&self, transcript: &str) -> Result<PlayRequest, ParseMiss> {
+        let text = normalize(transcript);
+        let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
+        let wake_at = words
+            .iter()
+            .position(|w| self.is_wake_word(w))
+            .ok_or(ParseMiss::NoWakeWord)?;
+
+        let after = &words[wake_at + 1..];
+        let tail: &[&str] = if words[wake_at] == PLAY_VERB {
+            after
+        } else if let Some(play) = after.iter().position(|w| *w == PLAY_VERB) {
+            &after[play + 1..]
+        } else if words[..wake_at].iter().all(|w| GREETINGS.contains(w)) {
+            strip_fillers(after)
+        } else {
+            return Err(ParseMiss::NoPlayVerb);
+        };
+        build_request(&tail.join(" ")).ok_or(ParseMiss::EmptyRequest)
+    }
+
+    /// The request in an utterance that followed a bare wake word.
+    ///
+    /// The speaker has already been acknowledged, so a repeated wake word or
+    /// "play" at the front is dropped rather than searched for.
+    pub fn armed_request(&self, transcript: &str) -> Option<PlayRequest> {
+        let text = normalize(transcript);
+        let mut words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
+        while let Some(first) = words.first() {
+            if self.is_wake_word(first) || GREETINGS.contains(first) || *first == PLAY_VERB {
+                words.remove(0);
+            } else {
+                break;
+            }
+        }
+        build_request(&strip_fillers(&words).join(" "))
+    }
+
     /// Builds a request from text spoken after a "play" that was already heard.
     ///
     /// A natural pause inside a command splits one sentence across two
@@ -285,6 +339,19 @@ impl CommandParser {
     pub fn request_from_query(&self, text: &str) -> Option<PlayRequest> {
         build_request(&normalize(text))
     }
+}
+
+/// Words that may come before a wake word without making it mid-sentence.
+const GREETINGS: &[&str] = &["hey", "hi", "ok", "okay", "yo", "oi", "hello"];
+
+/// Words between the wake word and a request that are not part of it. Kept
+/// short on purpose: "you" or "now" would also strip the start of real titles
+/// ("You Belong With Me"), and "could you play …" already goes through "play".
+const FILLERS: &[&str] = &["please", "play"];
+
+fn strip_fillers<'a, 'b>(words: &'b [&'a str]) -> &'b [&'a str] {
+    let skip = words.iter().take_while(|w| FILLERS.contains(w)).count();
+    &words[skip..]
 }
 
 /// Turns the text after "play" into a request, or `None` if there is none.
@@ -944,5 +1011,78 @@ mod tests {
         assert_eq!(edit_distance("flaw", "lawn"), 2);
         assert_eq!(edit_distance("kitten", "sitting"), 3);
         assert_eq!(edit_distance("", "bot"), 3);
+    }
+
+    /// The request the old grammar threw away: "bot", then the title with no
+    /// "play" in between.
+    #[test]
+    fn command_does_not_need_play_when_the_wake_word_opens_the_sentence() {
+        let req = parser().command("Bot, Dracula by Tame Impala").unwrap();
+        assert_eq!(req.title.as_deref(), Some("dracula"));
+        assert_eq!(req.artist.as_deref(), Some("tame impala"));
+        let req = parser()
+            .command("hey shamash please bohemian rhapsody")
+            .unwrap();
+        assert_eq!(req.query, "bohemian rhapsody");
+    }
+
+    #[test]
+    fn command_still_understands_play() {
+        assert_eq!(
+            parser().command("bot play dracula").unwrap().query,
+            "dracula"
+        );
+        assert_eq!(
+            parser()
+                .command("shamash could you play bohemian rhapsody")
+                .unwrap()
+                .query,
+            "bohemian rhapsody"
+        );
+        assert_eq!(
+            parser_with_play_wake_word()
+                .command("play stand by me")
+                .unwrap()
+                .query,
+            "stand by me"
+        );
+    }
+
+    #[test]
+    fn command_needs_play_after_a_wake_word_mid_sentence() {
+        assert_eq!(
+            parser().command("i told the bot yesterday about it"),
+            Err(ParseMiss::NoPlayVerb)
+        );
+        assert!(parser().command("i told the bot to play dracula").is_ok());
+    }
+
+    #[test]
+    fn a_bare_wake_word_is_an_empty_request() {
+        assert_eq!(parser().command("Bot."), Err(ParseMiss::EmptyRequest));
+        assert_eq!(parser().command("bot play"), Err(ParseMiss::EmptyRequest));
+        assert_eq!(parser().command("lunch"), Err(ParseMiss::NoWakeWord));
+    }
+
+    #[test]
+    fn an_armed_request_drops_a_repeated_wake_word_and_play() {
+        let p = parser();
+        assert_eq!(
+            p.armed_request("bot play dracula by tame impala")
+                .unwrap()
+                .query,
+            "dracula by tame impala"
+        );
+        assert_eq!(
+            p.armed_request("You Belong With Me").unwrap().query,
+            "you belong with me"
+        );
+        assert!(p.armed_request("bot").is_none());
+    }
+
+    #[test]
+    fn contains_wake_word_ignores_punctuation_and_case() {
+        assert!(parser().contains_wake_word("Hey, BOT!"));
+        assert!(!parser().contains_wake_word("not now"));
     }
 }

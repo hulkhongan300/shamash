@@ -16,6 +16,7 @@ pub mod player;
 pub mod queue;
 pub mod resolve;
 pub mod search;
+pub mod segment;
 pub mod state;
 pub mod timing;
 pub mod transcriber;
