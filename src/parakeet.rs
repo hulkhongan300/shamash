@@ -131,10 +131,10 @@ impl Transcriber for HandyTranscriber {
         }
         let output = result?;
 
-        println!(
-            "  asr: {} ms (load {} ms) via handy",
-            output.transcribe_ms.first().copied().unwrap_or(0),
-            output.load_ms
+        tracing::debug!(
+            transcribe_ms = output.transcribe_ms.first().copied().unwrap_or(0),
+            load_ms = output.load_ms,
+            "transcribed via handy"
         );
         Ok(output.text)
     }

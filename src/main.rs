@@ -109,6 +109,11 @@ async fn main() -> anyhow::Result<()> {
     //
     // RUST_LOG overrides the default: `RUST_LOG=info` for everything, or
     // `RUST_LOG=debug` for songbird's per-packet detail.
+    // Load DISCORD_TOKEN and friends from a .env file, if present, before the
+    // log filter is built, so a RUST_LOG set there is honoured. Real
+    // environment variables take precedence over values in the file.
+    let dotenv = dotenvy::dotenv();
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -117,9 +122,11 @@ async fn main() -> anyhow::Result<()> {
         .with(WithoutRtcpNoise::new(tracing_subscriber::fmt::layer()))
         .init();
 
-    // Load DISCORD_TOKEN and friends from a .env file, if present. Real
-    // environment variables take precedence over values in the file.
-    dotenvy::dotenv().ok();
+    if let Err(e) = dotenv
+        && !e.not_found()
+    {
+        tracing::warn!(error = %e, "could not read .env");
+    }
     bot::start(Config::from_env()?).await
 }
 

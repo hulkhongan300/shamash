@@ -839,6 +839,18 @@ impl CatalogProvider for YtMusic {
     }
 
     async fn search(&self, query: &CatalogQuery) -> Result<Vec<CatalogTrack>, ProviderError> {
+        Ok(self
+            .songs(&query.text())
+            .await?
+            .into_iter()
+            .map(|row| row.track)
+            .collect())
+    }
+}
+
+impl YtMusic {
+    /// The songs YouTube Music lists for `query`, best first, as rows.
+    pub async fn songs(&self, query: &str) -> Result<Vec<SongRow>, ProviderError> {
         // Free text only. YouTube Music has one field for a query and no
         // artist-only mode worth spending a request on, so the fielded shapes
         // the other providers use would be the same string sent twice.
@@ -848,7 +860,7 @@ impl CatalogProvider for YtMusic {
                 "clientVersion": YTMUSIC_CLIENT_VERSION,
                 "hl": "en",
             }},
-            "query": query.text(),
+            "query": query,
             "params": YTMUSIC_SONGS_FILTER,
         });
         let response = self
@@ -877,8 +889,21 @@ impl CatalogProvider for YtMusic {
             .json()
             .await
             .map_err(|_| ProviderError::BadResponse)?;
-        Ok(parse_songs(&body))
+        Ok(parse_song_rows(&body))
     }
+}
+
+/// One song row of a YouTube Music search, with what a person picking from a
+/// list wants to see that a catalog match does not need.
+#[derive(Debug, Clone)]
+pub struct SongRow {
+    pub track: CatalogTrack,
+    /// Every artist credited, as YouTube Music writes them ("Lil Peep &
+    /// XXXTENTACION"). `track.artist` is only the first, which is what a match
+    /// against a catalog wants; a person choosing from a list wants them all.
+    pub credit: String,
+    /// YouTube Music's explicit-content badge.
+    pub explicit: bool,
 }
 
 /// Every song in an InnerTube response, best first, in the order YouTube ranked
@@ -889,24 +914,61 @@ impl CatalogProvider for YtMusic {
 /// `itemSectionRenderer` in between when a card is inserted -- so the tree is
 /// walked rather than addressed. The walk is linear in a ~600 kB response, which
 /// is nothing next to the HTTP round trip it replaces.
-pub(crate) fn parse_songs(body: &serde_json::Value) -> Vec<CatalogTrack> {
-    fn walk(node: &serde_json::Value, out: &mut Vec<CatalogTrack>) {
-        let Some(fields) = node.as_object() else {
-            return;
-        };
-        for (key, value) in fields {
-            if key == "musicResponsiveListItemRenderer" {
-                if let Some(track) = song(value) {
-                    out.push(track);
+pub fn parse_song_rows(body: &serde_json::Value) -> Vec<SongRow> {
+    fn walk(node: &serde_json::Value, out: &mut Vec<SongRow>) {
+        match node {
+            // The rows sit in `contents` *arrays*. Walking objects alone never
+            // reached one, so this returned nothing for every real response.
+            serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    if key == "musicResponsiveListItemRenderer" {
+                        if let Some(track) = song(value) {
+                            out.push(SongRow {
+                                credit: credit(value).unwrap_or_else(|| track.artist.clone()),
+                                track,
+                                explicit: is_explicit(value),
+                            });
+                        }
+                        continue;
+                    }
+                    walk(value, out);
                 }
-                continue;
             }
-            walk(value, out);
+            _ => {}
         }
     }
     let mut out = Vec::new();
     walk(body, &mut out);
     out
+}
+
+/// The subtitle's artist runs, before the first " • ", joined as written.
+fn credit(row: &serde_json::Value) -> Option<String> {
+    let runs = row
+        .pointer("/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text/runs")?
+        .as_array()?;
+    let credit: String = runs
+        .iter()
+        .filter_map(|run| run.get("text").and_then(serde_json::Value::as_str))
+        .take_while(|text| text.trim() != "•")
+        .collect();
+    let credit = credit.trim().to_string();
+    (!credit.is_empty()).then_some(credit)
+}
+
+/// Whether a song row carries the explicit badge.
+fn is_explicit(row: &serde_json::Value) -> bool {
+    row.get("badges")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|badges| {
+            badges.iter().any(|badge| {
+                badge
+                    .pointer("/musicInlineBadgeRenderer/icon/iconType")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("MUSIC_EXPLICIT_BADGE")
+            })
+        })
 }
 
 /// One `musicResponsiveListItemRenderer` as a track, when it is a song.
@@ -2225,6 +2287,32 @@ mod tests {
         assert_eq!(
             crate::config::DEFAULT_CATALOG_MATCH_THRESHOLD,
             matcher::ACCEPT
+        );
+    }
+
+    /// Read from a real recorded response. The walk once skipped arrays, and
+    /// every song row sits inside one, so this provider found nothing in every
+    /// real answer and the unit tests, built from hand-made objects, never
+    /// noticed.
+    #[test]
+    fn songs_are_read_from_a_real_youtube_music_response() {
+        let body: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ytmusic_songs_dracula.json"))
+                .expect("the fixture is JSON");
+        let rows = parse_song_rows(&body);
+        assert!(
+            rows.iter().filter(|r| r.explicit).count() == 3 && !rows[3].explicit,
+            "the explicit badges were not read"
+        );
+        assert_eq!(rows[0].credit, "Tame Impala");
+        let songs: Vec<CatalogTrack> = rows.into_iter().map(|r| r.track).collect();
+        assert!(!songs.is_empty(), "no songs read from a real response");
+        assert!(
+            songs.iter().any(|t| t.artist == "Tame Impala"
+                && t.title == "Dracula"
+                && t.video_id.is_some()
+                && t.duration_secs.is_some()),
+            "{songs:?}"
         );
     }
 }

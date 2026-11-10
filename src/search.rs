@@ -180,6 +180,12 @@ pub struct Candidate {
     /// id is recoverable from `url`.
     #[serde(default)]
     pub id: Option<String>,
+    /// Found by YouTube Music's song search rather than the video search: the
+    /// audio track an artist or label publishes for the song, which is the
+    /// recording itself. Scored as audio whatever its title says, because its
+    /// title is usually just the song's name.
+    #[serde(skip)]
+    pub audio_track: bool,
 }
 
 impl Candidate {
@@ -217,6 +223,7 @@ impl Candidate {
             duration: track.duration_secs,
             channel: Some(track.artist.clone()),
             id: Some(video_id.to_string()),
+            audio_track: track.provider == "ytmusic",
         }
     }
 
@@ -272,6 +279,9 @@ impl Candidate {
     /// - 1 an ordinary upload, which may be either
     /// - 0 an official MV, visualizer, or dance video, which is video first
     fn media_rank(&self) -> u8 {
+        if self.audio_track {
+            return 3;
+        }
         let title = self.title_lowercase();
         if VIDEO_MARKERS.iter().any(|m| title.contains(m)) {
             return 0;
@@ -675,13 +685,88 @@ pub trait VideoSearch: Send + Sync {
     async fn candidates(&self, query: &str, count: usize) -> anyhow::Result<Vec<Candidate>>;
 }
 
-/// The real search, through yt-dlp.
+/// The real search: YouTube through yt-dlp, and YouTube Music's song search
+/// alongside it.
+///
+/// The two answer different questions. The video search returns *uploads*, and
+/// for a popular song its first page is the official video, lyric videos and
+/// re-uploads; the artist's own audio upload of the song is often not on it at
+/// all ("Tame Impala Dracula" puts it ninth, behind a stranger's re-upload of
+/// the same audio). YouTube Music's song search returns exactly those audio
+/// uploads. Both lists are ranked together by the same scorer, so the catalog
+/// still decides which *song* it is and the scorer which upload of it; YouTube
+/// Music only makes sure the right upload is in the running.
 pub struct YtDlpSearch;
+
+/// How long the YouTube Music half may take. It runs alongside the yt-dlp
+/// search, which takes about a second, so this only bounds a stall.
+const YTMUSIC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// YouTube Music's songs for `query`, as candidates.
+///
+/// Every failure is an empty list: this widens the search and must never be the
+/// reason one fails.
+async fn ytmusic_candidates(query: &str) -> Vec<Candidate> {
+    static CLIENT: std::sync::OnceLock<Option<resolve::YtMusic>> = std::sync::OnceLock::new();
+    let Some(ytmusic) = CLIENT.get_or_init(|| resolve::YtMusic::new().ok()) else {
+        return Vec::new();
+    };
+    let loose = resolve::CatalogQuery::Loose(query.to_string());
+    let search = resolve::CatalogProvider::search(ytmusic, &loose);
+    match tokio::time::timeout(YTMUSIC_TIMEOUT, search).await {
+        Ok(Ok(tracks)) => tracks
+            .iter()
+            .filter_map(|track| {
+                let id = track.video_id.as_deref()?;
+                Some(Candidate::for_track(track, id))
+            })
+            .collect(),
+        Ok(Err(e)) => {
+            tracing::debug!(query, error = ?e, "YouTube Music search failed; using the video search alone");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::debug!(
+                query,
+                "YouTube Music search timed out; using the video search alone"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Both result lists as one, without repeating a video either of them found.
+/// A video both found keeps YouTube Music's entry, which knows it is audio, and
+/// the video search's view count, which YouTube Music does not report.
+fn merge_candidates(songs: Vec<Candidate>, videos: Vec<Candidate>) -> Vec<Candidate> {
+    let mut merged = songs;
+    for video in videos {
+        let id = video.video_id().map(str::to_string);
+        match merged
+            .iter_mut()
+            .find(|song| id.is_some() && song.video_id() == id.as_deref())
+        {
+            Some(song) => song.view_count = song.view_count.or(video.view_count),
+            None => merged.push(video),
+        }
+    }
+    merged
+}
 
 #[async_trait::async_trait]
 impl VideoSearch for YtDlpSearch {
     async fn candidates(&self, query: &str, count: usize) -> anyhow::Result<Vec<Candidate>> {
-        youtube_candidates(query, count).await
+        let (songs, videos) =
+            tokio::join!(ytmusic_candidates(query), youtube_candidates(query, count));
+        match videos {
+            Ok(videos) => Ok(merge_candidates(songs, videos)),
+            // The video search failing is not the end if the song search worked.
+            Err(e) if !songs.is_empty() => {
+                tracing::warn!(error = %format!("{e:#}"), "the YouTube video search failed; using YouTube Music's songs alone");
+                Ok(songs)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1070,6 +1155,7 @@ mod tests {
             duration,
             channel: Some("someone".to_string()),
             id: None,
+            audio_track: false,
         }
     }
 
@@ -2149,6 +2235,122 @@ mod tests {
         ));
     }
 
+    /// The request that exposed this: "Dracula by Tame Impala" played a
+    /// stranger's re-upload, because the artist's own audio upload was not on
+    /// the video search's first page. These are the real results: the first
+    /// eight from the video search, and what YouTube Music's song search
+    /// returned for the same query.
+    #[test]
+    fn the_artists_audio_upload_beats_a_reupload_of_it() {
+        let target = Target::from_track(
+            &catalog_track("Tame Impala", "Dracula", Some(205.0)),
+            vec![205.0],
+            "dracula by tame impala",
+        );
+        let video = |id: &str, title: &str, channel: &str, secs: f64, views: u64| Candidate {
+            title: Some(title.to_string()),
+            url: format!("https://www.youtube.com/watch?v={id}"),
+            view_count: Some(views),
+            duration: Some(secs),
+            channel: Some(channel.to_string()),
+            id: Some(id.to_string()),
+            audio_track: false,
+        };
+        let videos = vec![
+            video(
+                "xnP7qKxwzjg",
+                "Tame Impala - Dracula (Official Video)",
+                "Tame Impala",
+                234.0,
+                87_003_079,
+            ),
+            video(
+                "HWyzKmXquJk",
+                "Tame Impala - Dracula (Lyrics)",
+                "TrendingTracks",
+                206.0,
+                28_614_367,
+            ),
+            video(
+                "HpIVBMowfDM",
+                "Tame Impala - 'Dracula' (live for Like A Version)",
+                "triple j",
+                220.0,
+                552_010,
+            ),
+            video(
+                "OPW1wCwus9w",
+                "Tame Impala - Dracula (Lyrics)",
+                "7clouds",
+                206.0,
+                3_816_010,
+            ),
+            video(
+                "jwVMgGs50vE",
+                "Tame Impala - Dracula",
+                "David Dean Burkhart",
+                206.0,
+                1_099_179,
+            ),
+        ];
+        let song = |id: &str, title: &str, artist: &str, secs: f64| {
+            let mut track = catalog_track(artist, title, Some(secs));
+            track.provider = "ytmusic";
+            Candidate::for_track(&track, id)
+        };
+        let songs = vec![
+            song(
+                "6KjVYeQ9SRw",
+                "Dracula (feat. JENNIE)",
+                "Tame Impala",
+                210.0,
+            ),
+            song("5nCOjdHeYjM", "Dracula", "Tame Impala", 206.0),
+            song("cuMuMnCRfqk", "Dracula", "Tame Impala", 206.0),
+            song("obYIyfBwVxk", "Dracula", "Rain Paris", 206.0),
+        ];
+
+        // Without the song search, the re-upload wins: the bug as reported.
+        let before = pick(&videos, &target, DEFAULT_MATCH_THRESHOLD);
+        assert_eq!(
+            before.best().unwrap().candidate.video_id(),
+            Some("jwVMgGs50vE")
+        );
+
+        let after = pick(
+            &merge_candidates(songs, videos),
+            &target,
+            DEFAULT_MATCH_THRESHOLD,
+        );
+        let best = after.best().unwrap();
+        assert_eq!(best.candidate.channel(), "Tame Impala", "{:?}", best.parts);
+        assert!(
+            ["5nCOjdHeYjM", "cuMuMnCRfqk"].contains(&best.candidate.video_id().unwrap()),
+            "picked {:?}",
+            best.candidate
+        );
+        assert!(after.confident, "{:?}", best.parts);
+    }
+
+    #[test]
+    fn a_video_both_searches_found_is_listed_once() {
+        let mut track = catalog_track("Tame Impala", "Dracula", Some(206.0));
+        track.provider = "ytmusic";
+        let song = Candidate::for_track(&track, "cuMuMnCRfqk");
+        let mut video = candidate("Dracula", Some(78_000_000), Some(206.0));
+        video.url = "https://www.youtube.com/watch?v=cuMuMnCRfqk".to_string();
+        let other = candidate("Something else", Some(5), Some(206.0));
+
+        let merged = merge_candidates(vec![song], vec![video, other]);
+        assert_eq!(merged.len(), 2);
+        assert!(merged[0].audio_track, "the song search's entry is kept");
+        assert_eq!(
+            merged[0].view_count,
+            Some(78_000_000),
+            "with the video's views"
+        );
+    }
+
     // ---- live --------------------------------------------------------------
 
     /// The whole path, against the real catalog and the real YouTube.
@@ -2238,14 +2440,22 @@ mod tests {
             vec![205.0],
             "dracula tame impala",
         );
-        let entries = youtube_candidates(&target.search_query(), 8).await.unwrap();
+        let entries = YtDlpSearch
+            .candidates(&target.search_query(), 8)
+            .await
+            .unwrap();
         println!("searched: {}", target.search_query());
         let choice = pick(&entries, &target, DEFAULT_MATCH_THRESHOLD);
         for scored in &choice.ranked {
             println!("{:7.1} {}", scored.score(), scored.parts.explain());
         }
         let best = choice.best().unwrap();
-        assert_eq!(best.candidate.duration, Some(206.0));
+        assert_eq!(
+            best.candidate.channel(),
+            "Tame Impala",
+            "a re-upload of the right length is not the artist's own: {:?}",
+            best.candidate
+        );
         assert!(
             choice.confident,
             "the requested recording should have been recognised: {:?}",

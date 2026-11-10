@@ -1,419 +1,401 @@
-//! The first two stages of listening: a small model that is always on, and the
-//! larger model that is loaded once one of them hears the wake word.
+//! Listening: one wake gate per speaker, and the larger model it wakes.
 //!
-//! Before this the bot transcribed every utterance that crossed the voice gate
-//! and looked for a wake word in the text afterwards, so a conversation in the
-//! channel cost a full-size transcription each time and the answer only arrived
-//! after the speaker had finished. Here the work is inverted. A small model
-//! listens continuously and only has to recognise one short word, so its
-//! inference is cheap enough to run on every window of speech; when it fires,
-//! the speaker is told at once, the larger model is brought up, and only then
-//! is the request itself transcribed.
+//! Each speaker's audio is cut into whole utterances by [`crate::segment`].
+//! While an utterance is in progress the small, always-resident model checks
+//! its most recent two seconds every half second for the wake word, so the
+//! speaker hears the acknowledgement while they are still talking. When the
+//! utterance ends, the **whole** of it — the wake word, whatever followed it in
+//! the same breath, and every quiet frame in between — goes to the larger
+//! model once.
 //!
-//! The gate keeps the audio it checked in a rolling window, so the wake word is
-//! heard in the middle of a sentence rather than only at the start of one, and
-//! it buffers from the moment of the wake word onwards, so a request started
-//! before the model was ready is not lost.
+//! That is what fixes the two ways this used to lose requests. The old gate
+//! started recording only after the wake word was recognised, so the words
+//! said in the same breath ("bot, play Drac…") were already gone; and it kept
+//! only frames above a loudness gate, so what it did record had its quiet parts
+//! spliced out.
+//!
+//! A wake word said on its own ("bot", pause) leaves the speaker *armed*: the
+//! pipeline plays the ready tone, and the speaker's next utterance is taken as
+//! the request without needing the wake word again. See [`Armed`].
 
-use crate::audio::rms;
 use crate::config::AsrEngine;
 use crate::direct::DirectTranscriber;
-use crate::listener::{FRAME_SAMPLES, VAD_RMS_THRESHOLD};
 use crate::parakeet::HandyTranscriber;
 use crate::parser::CommandParser;
+use crate::segment::{SAMPLE_RATE, Segment, Segmenter, VoiceDetector};
 use crate::transcriber::Transcriber;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+/// A voice stream's id within the call (an RTP SSRC). One per speaker.
+pub type Ssrc = u32;
+
+/// One tick of audio: every speaker's samples for it. A speaker the call knows
+/// about but who sent nothing this tick is given silence, so their utterance
+/// can end.
+pub type Tick = Vec<(Ssrc, Vec<f32>)>;
+
 /// How much audio the small model looks at for the wake word.
-///
-/// Long enough for a drawn-out wake word plus the word before it, because the
-/// gate fires mid-sentence as readily as at the start of one. Short enough that
-/// the model is not asked to transcribe a paragraph and start guessing.
 pub const WAKE_WINDOW: Duration = Duration::from_millis(2000);
 
 /// How often the small model runs while somebody is speaking.
 ///
-/// This is the stage's whole cost, so it is the knob that decides how much CPU
-/// the always-on listener uses. Halving it halves the work and doubles how much
-/// of a quick shout can be missed between checks.
+/// This is the always-on stage's whole cost: one inference on the small model
+/// per hop per speaker.
 pub const WAKE_HOP: Duration = Duration::from_millis(500);
 
-/// Silence frames the gate keeps checking for after speech stops: 25 x 20 ms.
-///
-/// A wake word is the tail of what was said as often as the head of it, so the
-/// window has to outlive the last loud frame rather than closing with it. The
-/// run that closes the window is 500 ms of silence.
-const WAKE_TAIL_FRAMES: usize = 25;
+/// How long a speaker who said only the wake word stays armed for the request.
+pub const ARM_TTL: Duration = Duration::from_secs(8);
 
-/// How long the gate ignores itself after firing, so one shout cannot start
-/// several commands.
-const WAKE_COOLDOWN: Duration = Duration::from_secs(3);
-
-/// Silence frames that end a captured request: 25 x 20 ms = 500 ms.
-pub const COMMAND_GAP_FRAMES: usize = 25;
-
-/// Hard cap on one captured request: 250 x 20 ms = 5 s.
-///
-/// The bound is what makes a silent channel safe: a request that is never spoken
-/// closes on the cap instead of leaving the gate armed to capture whatever is
-/// said next.
-pub const COMMAND_MAX_FRAMES: usize = 250;
+fn samples(duration: Duration) -> usize {
+    (duration.as_secs_f32() * SAMPLE_RATE as f32) as usize
+}
 
 /// Something the pipeline has to act on.
 #[derive(Debug)]
 pub enum Heard {
-    /// The wake word was heard.
-    Wake(WakeHit),
-    /// The request, captured once the larger model was ready.
-    Command(Vec<f32>),
+    /// The small model heard the wake word in an utterance still in progress.
+    /// Acknowledge now; the utterance itself follows.
+    Wake { ssrc: Ssrc },
+    /// A finished utterance worth transcribing with the larger model.
+    Utterance {
+        ssrc: Ssrc,
+        audio: Vec<f32>,
+        /// The small model heard the wake word in it.
+        woke: bool,
+        /// The speaker had said the wake word on its own just before, so this
+        /// is the request even if it carries no wake word.
+        armed: bool,
+    },
 }
 
-/// A wake word, and the state the capture of the request depends on.
-#[derive(Debug, Clone)]
-pub struct WakeHit {
-    /// The window the wake word was heard in, kept for the log line only.
-    pub audio: Vec<f32>,
-    /// Set by the pipeline once the larger model is loaded.
-    ///
-    /// Shared rather than returned, because the gate is what decides when a
-    /// capture may end and the pipeline is what knows when the model is up: the
-    /// two have to agree without either owning the other's timing. A gap only
-    /// closes a request once this is set *and* speech has followed it, so the
-    /// silence before the speaker starts talking cannot end the capture early.
-    pub ready: Arc<AtomicBool>,
-}
-
-/// What one tick did to the gate.
+/// What one push asked the caller to do.
 #[derive(Debug)]
 pub enum Step {
-    /// Nothing to do.
-    Idle,
-    /// Transcribe this window with the small model and hand the text back to
-    /// [`WakeGate::transcribed`].
-    Check(Vec<f32>),
+    /// Run the small model on `window` and hand the text to
+    /// [`WakeGate::transcribed`], with `closing` passed back unchanged.
+    Check {
+        ssrc: Ssrc,
+        window: Vec<f32>,
+        /// The finished utterance, when this is the final check on one that
+        /// no rolling check had woken on.
+        closing: Option<Vec<f32>>,
+    },
     /// Deliver this to the pipeline.
     Heard(Heard),
 }
 
-/// What the gate is doing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    /// Listening for the wake word.
-    Idle,
-    /// The wake word was heard and the larger model is loading. Audio keeps
-    /// being buffered, because a speaker who does not wait for the second tone
-    /// would otherwise be clipped.
-    Loading,
-}
+/// Speakers who said only the wake word and whose next utterance is the
+/// request. Shared between the gate, which consumes it, and the pipeline,
+/// which sets it once the larger model has heard a bare wake word.
+#[derive(Debug, Clone, Default)]
+pub struct Armed(Arc<Mutex<HashMap<Ssrc, Instant>>>);
 
-/// Watches the channel for the wake word, then captures the request behind it.
-pub struct WakeGate {
-    /// The small model. Held for the life of the call, which is the point of
-    /// this stage: it runs on every window of speech.
-    transcriber: Arc<dyn Transcriber>,
-    /// Supplies the wake-word matching, so a misheard name is tolerated here
-    /// exactly as it is anywhere else.
-    parser: CommandParser,
-    /// The rolling window the small model is given.
-    window: VecDeque<f32>,
-    /// Window capacity in samples.
-    capacity: usize,
-    /// Enough audio for one check to be worth making.
-    minimum: usize,
-    /// Samples fed since the last check, for [`WAKE_HOP`].
-    ///
-    /// Counted in samples rather than by the clock so the gate is deterministic:
-    /// replaying a recording offers the same windows every time, which is what
-    /// makes the harness in `examples/transcribe.rs` a measurement rather than a
-    /// coin toss.
-    since_check: usize,
-    /// Consecutive quiet frames, which keep the window alive past the speech.
-    quiet: usize,
-    /// When the wake word was last heard, for the cooldown.
-    fired: Option<Instant>,
-    phase: Phase,
-    /// The request being collected.
-    capture: Vec<f32>,
-    /// Consecutive quiet frames since the capture last held speech.
-    silent: usize,
-    /// Whether anything has been said since the model became ready.
-    spoke: bool,
-    /// The readiness flag handed out with the wake word.
-    ///
-    /// Kept as well as given away, because the capture has to know whether the
-    /// model is up before it will let a silence end the request, and only the
-    /// pipeline ever sets it.
-    ready: Option<Arc<AtomicBool>>,
-}
+impl Armed {
+    /// Arms `ssrc` until `ARM_TTL` from now, returning that deadline.
+    pub fn arm(&self, ssrc: Ssrc) -> Instant {
+        let deadline = Instant::now() + ARM_TTL;
+        self.lock().insert(ssrc, deadline);
+        deadline
+    }
 
-impl WakeGate {
-    pub fn new(transcriber: Arc<dyn Transcriber>, parser: CommandParser) -> Self {
-        let rate = transcriber.sample_rate();
-        let samples = |duration: Duration| (duration.as_secs_f32() * rate as f32) as usize;
-        Self {
-            transcriber,
-            parser,
-            window: VecDeque::with_capacity(samples(WAKE_WINDOW)),
-            capacity: samples(WAKE_WINDOW),
-            minimum: samples(WAKE_HOP),
-            since_check: 0,
-            quiet: 0,
-            fired: None,
-            phase: Phase::Idle,
-            capture: Vec::new(),
-            silent: 0,
-            spoke: false,
-            ready: None,
+    /// Whether `ssrc` is armed, without consuming it.
+    pub fn is_armed(&self, ssrc: Ssrc) -> bool {
+        self.lock()
+            .get(&ssrc)
+            .is_some_and(|deadline| Instant::now() < *deadline)
+    }
+
+    /// Consumes the arming, returning whether it was still live.
+    pub fn take(&self, ssrc: Ssrc) -> bool {
+        self.lock()
+            .remove(&ssrc)
+            .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
+    /// Disarms `ssrc` only if it is still armed with `deadline`, so a later
+    /// arming is not cancelled by an earlier one's timer. Returns whether it
+    /// was.
+    pub fn expire(&self, ssrc: Ssrc, deadline: Instant) -> bool {
+        let mut all = self.lock();
+        if all.get(&ssrc) == Some(&deadline) {
+            all.remove(&ssrc);
+            true
+        } else {
+            false
         }
     }
 
-    /// The small model, for a caller that has to transcribe off the blocking
-    /// pool without borrowing the gate across the `await`.
+    pub fn clear(&self) {
+        self.lock().clear();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Ssrc, Instant>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One speaker's state.
+struct Speaker {
+    segmenter: Segmenter,
+    /// Samples since the last rolling check.
+    since_check: usize,
+    /// The wake word was heard in the utterance in progress.
+    woke: bool,
+}
+
+/// Watches every speaker for the wake word and hands over their utterances.
+pub struct WakeGate {
+    transcriber: Arc<dyn Transcriber>,
+    parser: CommandParser,
+    armed: Armed,
+    speakers: HashMap<Ssrc, Speaker>,
+    detector: fn() -> Box<dyn VoiceDetector>,
+}
+
+impl WakeGate {
+    pub fn new(transcriber: Arc<dyn Transcriber>, parser: CommandParser, armed: Armed) -> Self {
+        Self::with_detector(transcriber, parser, armed, || {
+            Box::new(crate::segment::Earshot::default())
+        })
+    }
+
+    /// As [`Self::new`], with a chosen voice detector. For tests.
+    pub fn with_detector(
+        transcriber: Arc<dyn Transcriber>,
+        parser: CommandParser,
+        armed: Armed,
+        detector: fn() -> Box<dyn VoiceDetector>,
+    ) -> Self {
+        Self {
+            transcriber,
+            parser,
+            armed,
+            speakers: HashMap::new(),
+            detector,
+        }
+    }
+
+    /// The small model, for a caller that runs it off the blocking pool.
     pub fn transcriber(&self) -> Arc<dyn Transcriber> {
         Arc::clone(&self.transcriber)
     }
 
-    /// Feeds one tick's worth of samples; returns what to do about them.
-    ///
-    /// Cheap by design: the only work here is bookkeeping and one RMS, so the
-    /// loop that feeds it is never the thing that falls behind. Transcription
-    /// happens on the blocking pool, off the [`Step::Check`] this hands back.
-    pub fn push(&mut self, samples: &[f32]) -> Step {
-        match self.phase {
-            Phase::Idle => self.push_idle(samples),
-            Phase::Loading => self.push_capture(samples),
-        }
+    /// Forgets every speaker's audio, as when listening is locked.
+    pub fn reset(&mut self) {
+        self.speakers.clear();
+        self.armed.clear();
     }
 
-    /// The idle half: keep a window and offer it for checking.
-    fn push_idle(&mut self, samples: &[f32]) -> Step {
-        // A cooldown clears the window rather than pausing the gate, so audio
-        // from before the last wake word is never part of the next check.
-        if self.fired.is_some_and(|at| at.elapsed() < WAKE_COOLDOWN) {
-            self.forget_window();
-            return Step::Idle;
-        }
+    /// Feeds one speaker's samples; returns what to do about them, in order.
+    pub fn push(&mut self, ssrc: Ssrc, audio: &[f32]) -> Vec<Step> {
+        let detector = self.detector;
+        let speaker = self.speakers.entry(ssrc).or_insert_with(|| Speaker {
+            segmenter: Segmenter::new(detector()),
+            since_check: 0,
+            woke: false,
+        });
 
-        self.remember(samples);
-        if rms(samples) >= VAD_RMS_THRESHOLD {
-            self.quiet = 0;
-        } else {
-            self.quiet += frames_in(samples);
-        }
-        // Checked before offering a window, not after: at exactly the tail
-        // length the run of quiet frames has not yet expired, and a check made
-        // there would hand the model a window of pure silence.
-        if self.quiet >= WAKE_TAIL_FRAMES {
-            self.forget_window();
-            return Step::Idle;
-        }
-
-        // The model is never handed a window too short to hold a word, so the
-        // first check after a burst of silence waits for real audio rather than
-        // spending an inference on 20 ms of nothing.
-        if self.since_check < self.minimum {
-            return Step::Idle;
-        }
-        self.since_check = 0;
-        Step::Check(self.window.iter().copied().collect())
-    }
-
-    /// The capture half: buffer the request until it is clearly over.
-    ///
-    /// Shared by loading and capturing, because a request may start before the
-    /// larger model is ready and the audio cannot be recovered afterwards.
-    fn push_capture(&mut self, samples: &[f32]) -> Step {
-        if rms(samples) >= VAD_RMS_THRESHOLD {
-            if self.is_ready() {
-                self.spoke = true;
+        let mut steps = Vec::new();
+        for event in speaker.segmenter.push(audio) {
+            match event {
+                Segment::Started => {
+                    speaker.since_check = 0;
+                    speaker.woke = false;
+                }
+                Segment::Ended(utterance) => {
+                    let woke = std::mem::take(&mut speaker.woke);
+                    if self.armed.take(ssrc) || woke {
+                        let armed = !woke;
+                        steps.push(Step::Heard(Heard::Utterance {
+                            ssrc,
+                            audio: utterance,
+                            woke,
+                            armed,
+                        }));
+                    } else {
+                        // The rolling checks may not have covered the last
+                        // stretch, and a wake word at the very end of what was
+                        // said is as valid as one at the start.
+                        steps.push(Step::Check {
+                            ssrc,
+                            window: tail(&utterance, samples(WAKE_WINDOW)),
+                            closing: Some(utterance),
+                        });
+                    }
+                }
             }
-            self.capture.extend_from_slice(samples);
-            self.silent = 0;
-        } else {
-            self.silent += frames_in(samples);
         }
 
-        if self.spoke && self.silent >= COMMAND_GAP_FRAMES {
-            return self.finish();
+        let checking = speaker.segmenter.in_speech() && !speaker.woke;
+        if checking && !self.armed.is_armed(ssrc) {
+            speaker.since_check += audio.len();
+            let current = speaker.segmenter.current();
+            if speaker.since_check >= samples(WAKE_HOP) && current.len() >= samples(WAKE_HOP) {
+                speaker.since_check = 0;
+                steps.push(Step::Check {
+                    ssrc,
+                    window: tail(current, samples(WAKE_WINDOW)),
+                    closing: None,
+                });
+            }
         }
-        if self.capture.len() >= COMMAND_MAX_FRAMES * FRAME_SAMPLES {
-            return self.finish();
+        steps
+    }
+
+    /// The small model's verdict on a window offered by [`Step::Check`].
+    pub fn transcribed(
+        &mut self,
+        ssrc: Ssrc,
+        transcript: &str,
+        closing: Option<Vec<f32>>,
+    ) -> Vec<Heard> {
+        tracing::debug!(ssrc, transcript = %transcript, "wake model heard");
+        if !self.parser.contains_wake_word(transcript) {
+            return Vec::new();
         }
-        Step::Idle
-    }
-
-    /// The small model's verdict on the window it was given.
-    ///
-    /// Only the first wake word of a window is acted on: the wake word is
-    /// followed by silence while the model loads, and re-reading the same window
-    /// once a second would start the command again.
-    pub fn transcribed(&mut self, transcript: &str) -> Option<Heard> {
-        tracing::debug!(transcript = %transcript, "wake model heard");
-        if self.phase != Phase::Idle {
-            return None;
+        match closing {
+            Some(audio) => vec![
+                Heard::Wake { ssrc },
+                Heard::Utterance {
+                    ssrc,
+                    audio,
+                    woke: true,
+                    armed: false,
+                },
+            ],
+            None => match self.speakers.get_mut(&ssrc) {
+                Some(speaker) if speaker.segmenter.in_speech() && !speaker.woke => {
+                    speaker.woke = true;
+                    vec![Heard::Wake { ssrc }]
+                }
+                _ => Vec::new(),
+            },
         }
-        if !self.woke_on(transcript) {
-            return None;
-        }
-
-        self.fired = Some(Instant::now());
-        self.phase = Phase::Loading;
-        self.capture.clear();
-        self.silent = 0;
-        self.spoke = false;
-        let ready = Arc::new(AtomicBool::new(false));
-        self.ready = Some(Arc::clone(&ready));
-        Some(Heard::Wake(WakeHit {
-            audio: self.window.iter().copied().collect(),
-            ready,
-        }))
-    }
-
-    /// Whether the transcript contained a configured wake word.
-    fn woke_on(&self, transcript: &str) -> bool {
-        transcript
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .any(|word| self.parser.is_wake_word(&word.to_ascii_lowercase()))
-    }
-
-    /// Hands the captured request over and reopens the gate.
-    fn finish(&mut self) -> Step {
-        let audio = std::mem::take(&mut self.capture);
-        self.phase = Phase::Idle;
-        self.silent = 0;
-        self.spoke = false;
-        self.ready = None;
-        // The window is dropped rather than kept: it is the seconds before the
-        // request, and re-checking them would only re-hear the wake word.
-        self.forget_window();
-        Step::Heard(Heard::Command(audio))
-    }
-
-    /// Whether the pipeline has reported the larger model loaded.
-    fn is_ready(&self) -> bool {
-        self.ready
-            .as_ref()
-            .is_some_and(|ready| ready.load(Ordering::Relaxed))
-    }
-
-    fn remember(&mut self, samples: &[f32]) {
-        self.since_check += samples.len();
-        self.window.extend(samples);
-        while self.window.len() > self.capacity {
-            self.window.pop_front();
-        }
-    }
-
-    fn forget_window(&mut self) {
-        self.window.clear();
-        self.quiet = 0;
-        self.since_check = 0;
     }
 }
 
-/// How many 20 ms frames a tick carried.
-///
-/// A tick is 20 ms only while the connection is quiet, so the count is derived
-/// from the samples rather than assumed to be one.
-fn frames_in(samples: &[f32]) -> usize {
-    samples.len().div_ceil(FRAME_SAMPLES).max(1)
+/// The last `len` samples of `audio`.
+fn tail(audio: &[f32], len: usize) -> Vec<f32> {
+    audio[audio.len().saturating_sub(len)..].to_vec()
 }
 
-/// Consumes frames until the channel closes, awaiting `on_heard` for each event.
+/// Consumes ticks until the channel closes, calling `on_heard` for each event.
 ///
-/// `on_heard` is awaited rather than spawned, which is what keeps the stages in
-/// order: the gate cannot deliver the request it captured while the pipeline is
-/// still loading the model for the wake word that came first. Audio that arrives
-/// meanwhile waits in the channel, which is unbounded, so nothing is lost --
-/// and the gate is deliberately idle for that stretch anyway.
-pub async fn run_wake_gate<F, Fut>(
+/// `locked` is asked on every tick: while it is true the audio is dropped and
+/// every speaker's state forgotten, so nothing said while listening was locked
+/// can be acted on once it is unlocked.
+///
+/// `on_heard` must not block: it hands the event to the pipeline's own task, so
+/// a request that takes seconds to resolve never delays hearing the next one.
+pub async fn run_wake_gate(
     mut gate: WakeGate,
-    mut rx: UnboundedReceiver<Vec<f32>>,
-    mut on_heard: F,
-) where
-    F: FnMut(Heard) -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
-    while let Some(frame) = rx.recv().await {
-        let window = match gate.push(&frame) {
-            Step::Idle => continue,
-            Step::Heard(heard) => {
-                on_heard(heard).await;
-                continue;
+    mut rx: UnboundedReceiver<Tick>,
+    locked: impl Fn() -> bool,
+    mut on_heard: impl FnMut(Heard),
+) {
+    let mut was_locked = false;
+    while let Some(tick) = rx.recv().await {
+        if locked() {
+            if !was_locked {
+                gate.reset();
+                was_locked = true;
             }
-            Step::Check(window) => window,
-        };
+            continue;
+        }
+        was_locked = false;
 
-        let transcriber = gate.transcriber();
-        let inferred = tokio::task::spawn_blocking(move || transcriber.transcribe(&window)).await;
-        let transcript = match inferred {
-            Ok(Ok(text)) => text,
-            Ok(Err(e)) => {
-                println!("wake word transcription failed: {e:#}");
-                continue;
-            }
-            Err(e) => {
-                println!("wake word transcription task failed: {e}");
-                continue;
-            }
-        };
+        for (ssrc, audio) in tick {
+            for step in gate.push(ssrc, &audio) {
+                let (window, closing) = match step {
+                    Step::Heard(heard) => {
+                        on_heard(heard);
+                        continue;
+                    }
+                    Step::Check {
+                        window, closing, ..
+                    } => (window, closing),
+                };
 
-        if let Some(heard) = gate.transcribed(&transcript) {
-            on_heard(heard).await;
+                let transcriber = gate.transcriber();
+                let inferred =
+                    tokio::task::spawn_blocking(move || transcriber.transcribe(&window)).await;
+                let transcript = match inferred {
+                    Ok(Ok(text)) => text,
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %format!("{e:#}"), "wake word transcription failed");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "wake word transcription task failed");
+                        continue;
+                    }
+                };
+                for heard in gate.transcribed(ssrc, &transcript, closing) {
+                    on_heard(heard);
+                }
+            }
         }
     }
 }
 
-/// The larger model, loaded when a wake word arrives rather than at startup.
-///
-/// Loading is deferred so the process starts without the big weights resident
-/// and so the acknowledgement can tell the speaker when the model is genuinely
-/// ready, which is the whole reason for the second tone. It is then kept, like
-/// the resident model it replaced: a reload per command would cost more than it
-/// saves, and holding it is what made the in-process engine worth having.
+/// The larger model, loaded on the first wake word rather than at startup, then
+/// kept resident.
 ///
 /// The first load blocks, so it belongs on a blocking pool.
 pub struct BigModels {
     engine: AsrEngine,
     model: String,
     language: Option<String>,
+    prompt: Option<String>,
     loaded: Mutex<Option<Arc<dyn Transcriber>>>,
 }
 
 impl BigModels {
-    pub fn new(engine: AsrEngine, model: &str, language: Option<&str>) -> Self {
+    pub fn new(
+        engine: AsrEngine,
+        model: &str,
+        language: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Self {
         Self {
             engine,
             model: model.to_string(),
             language: language.map(str::to_string),
+            prompt: prompt.map(str::to_string),
             loaded: Mutex::new(None),
         }
     }
 
     /// The loaded model, loading it on the first call.
+    ///
+    /// The lock is held across the load, so the preload started by a wake word
+    /// and the request that follows it cannot both load the weights.
     pub fn get_or_load(&self) -> anyhow::Result<Arc<dyn Transcriber>> {
-        if let Some(loaded) = self.lock().as_ref() {
+        let mut slot = self.lock();
+        if let Some(loaded) = slot.as_ref() {
             return Ok(Arc::clone(loaded));
         }
         let transcriber: Arc<dyn Transcriber> = match self.engine {
             AsrEngine::Direct => Arc::new(DirectTranscriber::new(
                 &self.model,
                 self.language.as_deref(),
+                self.prompt.as_deref(),
             )?),
             AsrEngine::Handy => Arc::new(HandyTranscriber::new(&self.model)),
         };
-        *self.lock() = Some(Arc::clone(&transcriber));
+        *slot = Some(Arc::clone(&transcriber));
         Ok(transcriber)
     }
 
     /// Whether the weights are in memory already.
     pub fn is_loaded(&self) -> bool {
-        self.lock().is_some()
+        self.loaded
+            .try_lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Arc<dyn Transcriber>>> {
@@ -433,41 +415,17 @@ impl std::fmt::Debug for BigModels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segment::tests::{Marked, quiet, voice};
 
-    /// A model that always returns the same text, so the gate's own logic is
-    /// what is under test.
+    /// A model that answers every check with the same text.
     struct FixedText(&'static str);
 
     impl Transcriber for FixedText {
         fn sample_rate(&self) -> u32 {
             16_000
         }
-
         fn transcribe(&self, _samples: &[f32]) -> anyhow::Result<String> {
             Ok(self.0.to_string())
-        }
-    }
-
-    /// A model that returns a different text per call, so a window can answer
-    /// "no" and then "yes".
-    #[derive(Default)]
-    struct Scripted(Mutex<Vec<String>>);
-
-    impl Scripted {
-        fn with(lines: &[&str]) -> Self {
-            Self(Mutex::new(
-                lines.iter().rev().map(|l| l.to_string()).collect(),
-            ))
-        }
-    }
-
-    impl Transcriber for Scripted {
-        fn sample_rate(&self) -> u32 {
-            16_000
-        }
-
-        fn transcribe(&self, _samples: &[f32]) -> anyhow::Result<String> {
-            Ok(self.0.lock().unwrap().pop().unwrap_or_default())
         }
     }
 
@@ -475,237 +433,234 @@ mod tests {
         CommandParser::new(["shamash".to_string(), "bot".to_string()])
     }
 
-    /// One 20 ms frame at a normal speaking level.
-    fn speech() -> Vec<f32> {
-        vec![0.2; FRAME_SAMPLES]
+    fn gate(armed: &Armed) -> WakeGate {
+        WakeGate::with_detector(Arc::new(FixedText("")), parser(), armed.clone(), || {
+            Box::new(Marked)
+        })
     }
 
-    fn silence() -> Vec<f32> {
-        vec![0.0; FRAME_SAMPLES]
-    }
-
-    /// Feeds `frames` of audio and returns the check the gate offered, if any.
-    fn offer(gate: &mut WakeGate, frames: &[Vec<f32>]) -> Option<Vec<f32>> {
-        for frame in frames {
-            if let Step::Check(window) = gate.push(frame) {
-                return Some(window);
-            }
-        }
-        None
+    fn checks(steps: &[Step]) -> usize {
+        steps
+            .iter()
+            .filter(|s| matches!(s, Step::Check { closing: None, .. }))
+            .count()
     }
 
     #[test]
     fn silence_is_never_offered_for_checking() {
-        let mut gate = WakeGate::new(Arc::new(FixedText("")), parser());
-        assert!(offer(&mut gate, &vec![silence(); 100]).is_none());
+        let armed = Armed::default();
+        let mut gate = gate(&armed);
+        assert!(gate.push(1, &quiet(300)).is_empty());
     }
 
     #[test]
-    fn a_burst_of_speech_is_offered_with_the_audio_it_carried() {
-        let mut gate = WakeGate::new(Arc::new(FixedText("")), parser());
-        let window = offer(&mut gate, &vec![speech(); 40]).expect("speech must be checked");
-        assert!(!window.is_empty());
-        assert!(window.iter().all(|s| *s == 0.2));
-    }
-
-    /// The window is what makes a wake word audible in the middle of a sentence.
-    #[test]
-    fn the_window_never_grows_past_its_cap() {
-        let mut gate = WakeGate::new(Arc::new(FixedText("")), parser());
-        let rate = 16_000;
-        let cap = WAKE_WINDOW.as_secs_f32() as usize * rate;
-        for _ in 0..400 {
-            gate.push(&speech());
+    fn speech_is_checked_on_a_rolling_window() {
+        let armed = Armed::default();
+        let mut gate = gate(&armed);
+        let steps: Vec<Step> = voice(200)
+            .chunks(320)
+            .flat_map(|c| gate.push(1, c))
+            .collect();
+        // 200 x 16 ms = 3.2 s of speech, one check per 500 ms.
+        assert!(checks(&steps) >= 5, "{} checks", checks(&steps));
+        for step in &steps {
+            if let Step::Check { window, .. } = step {
+                assert!(window.len() <= samples(WAKE_WINDOW));
+            }
         }
-        assert!(gate.window.len() <= cap, "{} samples", gate.window.len());
+    }
+
+    /// The fix for losing the words said with the wake word: the utterance
+    /// handed over is the whole thing, from before the wake word to the end.
+    #[test]
+    fn a_woken_utterance_is_delivered_whole() {
+        let armed = Armed::default();
+        let mut gate = gate(&armed);
+        gate.push(1, &voice(40));
+        let heard = gate.transcribed(1, "bot play dracula", None);
+        assert!(matches!(heard[..], [Heard::Wake { ssrc: 1 }]));
+
+        gate.push(1, &voice(100));
+        let steps = gate.push(1, &quiet(50));
+        let audio = steps
+            .into_iter()
+            .find_map(|s| match s {
+                Step::Heard(Heard::Utterance {
+                    audio, woke: true, ..
+                }) => Some(audio),
+                _ => None,
+            })
+            .expect("the utterance");
+        assert!(audio.len() >= 140 * crate::segment::VAD_FRAME);
     }
 
     #[test]
-    fn a_wake_word_in_a_sentence_still_fires() {
-        let mut gate = WakeGate::new(Arc::new(FixedText("")), parser());
-        offer(&mut gate, &vec![speech(); 40]).expect("a window");
-        let heard = gate
-            .transcribed("hey shamash play dracula")
-            .expect("the wake word is in the sentence");
-        assert!(matches!(heard, Heard::Wake(_)));
-    }
-
-    #[test]
-    fn a_misheard_wake_word_still_fires() {
-        let mut gate = WakeGate::new(Arc::new(FixedText("")), parser());
-        offer(&mut gate, &vec![speech(); 40]).expect("a window");
+    fn ordinary_speech_is_not_delivered() {
+        let armed = Armed::default();
+        let mut gate = gate(&armed);
+        gate.push(1, &voice(40));
+        assert!(gate.transcribed(1, "what is for lunch", None).is_empty());
+        let steps = gate.push(1, &quiet(50));
+        // Only a final check on the tail, which also finds nothing.
+        let Some(Step::Check {
+            closing: Some(audio),
+            window,
+            ..
+        }) = steps.into_iter().next()
+        else {
+            panic!("expected a closing check");
+        };
+        assert!(window.len() <= samples(WAKE_WINDOW));
         assert!(
-            gate.transcribed("shemash over here").is_some(),
-            "one wrong letter is what the parser already tolerates"
+            gate.transcribed(1, "what is for lunch", Some(audio))
+                .is_empty()
         );
     }
 
     #[test]
-    fn ordinary_speech_does_not_fire_the_gate() {
-        let mut gate = WakeGate::new(Arc::new(FixedText("")), parser());
-        offer(&mut gate, &vec![speech(); 40]).expect("a window");
-        assert!(gate.transcribed("what is for lunch today").is_none());
-    }
-
-    /// One shout must not start several commands.
-    #[test]
-    fn a_fired_gate_ignores_itself_until_it_cools_down() {
-        let mut gate = WakeGate::new(Arc::new(FixedText("")), parser());
-        offer(&mut gate, &vec![speech(); 40]).expect("a window");
-        gate.transcribed("shamash").expect("the first shout fires");
-        assert_eq!(gate.phase, Phase::Loading);
-
-        // The same words again, while the model is still loading.
-        assert!(gate.transcribed("shamash").is_none());
-        // And after the capture is closed out, still inside the cooldown.
-        let heard = gate.push(&speech());
-        assert!(matches!(heard, Step::Idle), "{heard:?}");
-    }
-
-    #[test]
-    fn a_capture_ends_only_after_speech_follows_the_ready_signal() {
-        let mut gate = WakeGate::new(Arc::new(FixedText("bot")), parser());
-        let heard = gate.transcribed("bot").expect("the wake word fires");
-        let Heard::Wake(hit) = heard else {
-            panic!("expected a wake word");
+    fn a_wake_word_at_the_very_end_is_caught_by_the_closing_check() {
+        let armed = Armed::default();
+        let mut gate = gate(&armed);
+        gate.push(1, &voice(40));
+        let steps = gate.push(1, &quiet(50));
+        let Some(Step::Check {
+            closing: Some(audio),
+            ..
+        }) = steps.into_iter().next()
+        else {
+            panic!("expected a closing check");
         };
-        assert_eq!(gate.phase, Phase::Loading);
-
-        // Silence before the model is up must not close anything.
-        for _ in 0..COMMAND_GAP_FRAMES * 2 {
-            assert!(matches!(gate.push(&silence()), Step::Idle));
-        }
-
-        hit.ready.store(true, Ordering::Relaxed);
-        gate.push(&speech());
-        assert_eq!(gate.phase, Phase::Loading);
-
-        let mut ended = None;
-        for _ in 0..COMMAND_GAP_FRAMES {
-            if let Step::Heard(heard) = gate.push(&silence()) {
-                ended = Some(heard);
-                break;
-            }
-        }
-        let Some(Heard::Command(audio)) = ended else {
-            panic!("the request must be handed over once the speaker stops");
-        };
-        assert!(!audio.is_empty(), "the speech before the gap is kept");
-        assert_eq!(gate.phase, Phase::Idle);
-    }
-
-    /// The bound is what stops a silent channel from leaving the gate armed.
-    #[test]
-    fn a_silent_capture_closes_on_the_length_cap() {
-        let mut gate = WakeGate::new(Arc::new(FixedText("bot")), parser());
-        let Heard::Wake(hit) = gate.transcribed("bot").expect("fires") else {
-            panic!("expected a wake word");
-        };
-        hit.ready.store(true, Ordering::Relaxed);
-
-        let mut ended = None;
-        for _ in 0..COMMAND_MAX_FRAMES {
-            if let Step::Heard(heard) = gate.push(&speech()) {
-                ended = Some(heard);
-                break;
-            }
-        }
-        assert!(matches!(ended, Some(Heard::Command(_))), "{ended:?}");
-        assert_eq!(gate.phase, Phase::Idle);
-    }
-
-    /// A back-to-back speech and silence must not register as a zero-length
-    /// request, which would be transcribed into nothing.
-    #[test]
-    fn a_tiny_capture_is_still_handed_over() {
-        let mut gate = WakeGate::new(Arc::new(FixedText("bot")), parser());
-        let Heard::Wake(hit) = gate.transcribed("bot").expect("fires") else {
-            panic!("expected a wake word");
-        };
-        hit.ready.store(true, Ordering::Relaxed);
-        gate.push(&speech());
-        let mut ended = None;
-        for _ in 0..COMMAND_GAP_FRAMES {
-            if let Step::Heard(heard) = gate.push(&silence()) {
-                ended = Some(heard);
-                break;
-            }
-        }
-        assert!(matches!(ended, Some(Heard::Command(_))));
+        let heard = gate.transcribed(1, "okay then shamash", Some(audio));
+        assert!(matches!(
+            heard[..],
+            [
+                Heard::Wake { .. },
+                Heard::Utterance {
+                    woke: true,
+                    armed: false,
+                    ..
+                }
+            ]
+        ));
     }
 
     #[test]
-    fn the_gate_reopens_after_a_command() {
-        let mut gate = WakeGate::new(Arc::new(FixedText("bot")), parser());
-        let Heard::Wake(hit) = gate.transcribed("bot").expect("fires") else {
-            panic!("expected a wake word");
-        };
-        hit.ready.store(true, Ordering::Relaxed);
-        for _ in 0..COMMAND_MAX_FRAMES {
-            if matches!(gate.push(&speech()), Step::Heard(_)) {
-                break;
-            }
-        }
-        // Still inside the cooldown, so the gate is quiet rather than listening.
-        assert_eq!(gate.phase, Phase::Idle);
-        assert!(matches!(gate.push(&speech()), Step::Idle));
+    fn one_utterance_wakes_only_once() {
+        let armed = Armed::default();
+        let mut gate = gate(&armed);
+        gate.push(1, &voice(40));
+        assert_eq!(gate.transcribed(1, "bot", None).len(), 1);
+        assert!(gate.transcribed(1, "bot", None).is_empty());
+        // And no more rolling checks once woken.
+        assert_eq!(checks(&gate.push(1, &voice(100))), 0);
     }
 
     #[test]
-    fn scripted_models_are_consumed_in_order() {
-        let transcriber = Scripted::with(&["lunch", "shamash"]);
-        assert_eq!(transcriber.transcribe(&[]).unwrap(), "lunch");
-        assert_eq!(transcriber.transcribe(&[]).unwrap(), "shamash");
-        assert_eq!(transcriber.transcribe(&[]).unwrap(), "");
+    fn an_armed_speaker_is_delivered_without_a_wake_word() {
+        let armed = Armed::default();
+        let mut gate = gate(&armed);
+        armed.arm(7);
+        let steps = gate.push(7, &voice(60));
+        assert_eq!(checks(&steps), 0, "an armed speaker is not wake-checked");
+        let steps = gate.push(7, &quiet(50));
+        assert!(matches!(
+            steps[..],
+            [Step::Heard(Heard::Utterance {
+                armed: true,
+                woke: false,
+                ..
+            })]
+        ));
+        assert!(!armed.is_armed(7), "arming is consumed");
     }
 
-    /// The cooldown is what stops the same shout being heard twice, so it has to
-    /// outlast the two acknowledgements rather than be a token delay.
     #[test]
-    fn the_cooldown_outlasts_both_tones() {
-        let tones = Duration::from_millis(150 + 50) * 2;
-        assert!(WAKE_COOLDOWN > tones, "{WAKE_COOLDOWN:?}");
+    fn speakers_are_kept_apart() {
+        let armed = Armed::default();
+        let mut gate = gate(&armed);
+        gate.push(1, &voice(40));
+        gate.push(2, &voice(40));
+        gate.transcribed(1, "bot", None);
+        let other = gate.push(2, &quiet(50));
+        assert!(
+            other
+                .iter()
+                .all(|s| !matches!(s, Step::Heard(Heard::Utterance { .. }))),
+            "speaker 2 never said the wake word"
+        );
+        let first = gate.push(1, &quiet(50));
+        assert!(matches!(
+            first[..],
+            [Step::Heard(Heard::Utterance { ssrc: 1, .. })]
+        ));
+    }
+
+    #[test]
+    fn an_expired_arming_is_not_live() {
+        let armed = Armed::default();
+        let deadline = armed.arm(3);
+        assert!(armed.expire(3, deadline));
+        assert!(!armed.take(3));
+        // A newer arming survives an older timer.
+        let old = Instant::now();
+        armed.arm(3);
+        assert!(!armed.expire(3, old));
+        assert!(armed.is_armed(3));
     }
 
     #[tokio::test]
-    async fn the_loop_delivers_the_wake_word_before_the_request() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
-        let order = Arc::new(Mutex::new(Vec::new()));
-
-        let seen = Arc::clone(&order);
-        let handle = tokio::spawn(async move {
-            let gate = WakeGate::new(Arc::new(FixedText("bot")), parser());
-            let on_heard = |heard: Heard| {
-                let seen = Arc::clone(&seen);
-                async move {
-                    match heard {
-                        Heard::Wake(hit) => {
-                            seen.lock().unwrap().push("wake");
-                            // The model is "loaded" immediately, then the gate is
-                            // told so, exactly as the pipeline does.
-                            hit.ready.store(true, Ordering::Relaxed);
-                        }
-                        Heard::Command(_) => seen.lock().unwrap().push("command"),
-                    }
-                }
-            };
-            run_wake_gate(gate, rx, on_heard).await;
-        });
-
-        // Enough speech for several checks, then quiet to close the capture.
-        for _ in 0..40 {
-            tx.send(speech()).unwrap();
-        }
-        for _ in 0..COMMAND_GAP_FRAMES * 3 {
-            tx.send(silence()).unwrap();
-        }
-        drop(tx);
-        let _ = handle.await;
-
-        assert_eq!(
-            order.lock().unwrap().clone(),
-            vec!["wake", "command"],
-            "the request must never arrive before its wake word"
+    async fn the_loop_drops_audio_while_locked() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Tick>();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&heard);
+        let armed = Armed::default();
+        let gate = WakeGate::with_detector(
+            Arc::new(FixedText("bot play dracula")),
+            parser(),
+            armed,
+            || Box::new(Marked),
         );
+        let handle = tokio::spawn(run_wake_gate(
+            gate,
+            rx,
+            || true,
+            move |h| seen.lock().unwrap().push(format!("{h:?}").len()),
+        ));
+        tx.send(vec![(1, voice(100))]).unwrap();
+        tx.send(vec![(1, quiet(60))]).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        assert!(heard.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_loop_delivers_the_wake_before_the_utterance() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Tick>();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&order);
+        let gate = WakeGate::with_detector(
+            Arc::new(FixedText("bot play dracula")),
+            parser(),
+            Armed::default(),
+            || Box::new(Marked),
+        );
+        let handle = tokio::spawn(run_wake_gate(
+            gate,
+            rx,
+            || false,
+            move |h| {
+                seen.lock().unwrap().push(match h {
+                    Heard::Wake { .. } => "wake",
+                    Heard::Utterance { .. } => "utterance",
+                })
+            },
+        ));
+        for chunk in voice(100).chunks(320) {
+            tx.send(vec![(1, chunk.to_vec())]).unwrap();
+        }
+        tx.send(vec![(1, quiet(60))]).unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        assert_eq!(order.lock().unwrap().clone(), vec!["wake", "utterance"]);
     }
 }

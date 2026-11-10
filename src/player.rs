@@ -166,6 +166,9 @@ pub struct Player {
     /// The "which one did you mean" buttons currently on offer.
     /// The outstanding `/play` search per guild.
     asks: Asks,
+    ducks: Ducks,
+    /// `/play` autocomplete, and what each suggestion stands for.
+    pub suggestions: Arc<crate::suggest::Suggestions>,
     /// What the bot remembers, or `None` when it has been given no place to
     /// remember in.
     pub library: Option<Arc<crate::library::Library>>,
@@ -347,33 +350,97 @@ impl Offer {
     }
 }
 
-/// The outstanding question per guild.
+/// The questions on offer, keyed by the message that carries each.
 ///
-/// One per guild, and asking again replaces the previous one: a question nobody
-/// answered must not outlive the question it was for.
+/// Keyed by message rather than by guild, so a spoken question and someone's
+/// `/play` results can both be on screen and each button answers its own.
+/// Asking again replaces only the same owner's earlier question: a question
+/// nobody answered must not outlive the one that superseded it.
 #[derive(Debug, Clone, Default)]
-struct Asks(Arc<Mutex<HashMap<GuildId, Ask>>>);
+struct Asks(Arc<Mutex<Vec<(MessageId, GuildId, Ask)>>>);
 
 impl Asks {
-    fn set(&self, guild_id: GuildId, ask: Ask) {
-        self.lock().insert(guild_id, ask);
+    /// Stores a posted question, dropping the same owner's older one in the
+    /// same guild. Returns the message of the question it replaced, if any.
+    fn insert(
+        &self,
+        guild_id: GuildId,
+        message_id: MessageId,
+        ask: Ask,
+    ) -> Option<(ChannelId, MessageId)> {
+        let mut all = self.lock();
+        let replaced = all
+            .iter()
+            .position(|(_, guild, old)| *guild == guild_id && old.owner == ask.owner)
+            .map(|at| all.remove(at))
+            .and_then(|(_, _, old)| old.posted);
+        all.push((message_id, guild_id, ask));
+        replaced
     }
 
-    fn clear(&self, guild_id: GuildId) -> bool {
-        self.lock().remove(&guild_id).is_some()
+    fn get(&self, message_id: MessageId) -> Option<Ask> {
+        self.lock()
+            .iter()
+            .find(|(id, _, _)| *id == message_id)
+            .map(|(_, _, ask)| ask.clone())
     }
 
-    /// Records where a guild's chooser message ended up.
-    fn posted(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId) {
-        if let Some(slot) = self.lock().get_mut(&guild_id) {
-            slot.posted = Some((channel_id, message_id));
+    fn update(&self, message_id: MessageId, ask: Ask) {
+        if let Some(slot) = self.lock().iter_mut().find(|(id, _, _)| *id == message_id) {
+            slot.2 = ask;
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<GuildId, Ask>> {
+    fn remove(&self, message_id: MessageId) -> bool {
+        let mut all = self.lock();
+        let before = all.len();
+        all.retain(|(id, _, _)| *id != message_id);
+        all.len() != before
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(MessageId, GuildId, Ask)>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
+
+/// Which voice streams currently have the music lowered, per guild. The music
+/// is low while any of them does, so one speaker finishing does not bring it
+/// back up under another who is still talking.
+#[derive(Debug, Clone, Default)]
+struct Ducks(Arc<Mutex<HashMap<GuildId, std::collections::HashSet<u32>>>>);
+
+impl Ducks {
+    /// Records `ssrc` lowering (or releasing) the music; returns whether the
+    /// guild's music should now be low.
+    fn set(&self, guild_id: GuildId, ssrc: u32, on: bool) -> bool {
+        let mut all = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let holders = all.entry(guild_id).or_default();
+        if on {
+            holders.insert(ssrc);
+        } else {
+            holders.remove(&ssrc);
+        }
+        !holders.is_empty()
+    }
+
+    fn clear(&self, guild_id: GuildId) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&guild_id);
+    }
+
+    fn is_ducked(&self, guild_id: GuildId) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&guild_id)
+            .is_some_and(|holders| !holders.is_empty())
+    }
+}
+
+/// Music volume while somebody is talking to the bot.
+pub const DUCK_VOLUME: f32 = 0.2;
 
 /// One lock per guild, so a command in one guild cannot hold up another.
 #[derive(Debug, Clone, Default)]
@@ -684,10 +751,38 @@ impl Player {
             dashboards: Dashboards::default(),
             catalog,
             asks: Asks::default(),
+            ducks: Ducks::default(),
+            suggestions: Arc::default(),
             library: None,
             pending: PendingLearn::default(),
             started_at: StartedAt::default(),
             fetch: Arc::new(YtDlpFetch),
+        }
+    }
+
+    /// Gives the player a library to remember requests in.
+    pub fn with_library(mut self, library: Option<Arc<crate::library::Library>>) -> Self {
+        self.library = library;
+        self
+    }
+
+    /// Brings the music back to full volume whoever lowered it, as when
+    /// listening is locked and nobody is going to finish their request.
+    pub fn release_duck(&self, guild_id: GuildId) {
+        self.ducks.clear(guild_id);
+        if let Some(handle) = self.tracks.get(guild_id) {
+            let _ = handle.set_volume(1.0);
+        }
+    }
+
+    /// Lowers (or restores) the music while `ssrc` is talking to the bot.
+    ///
+    /// Someone without headphones feeds the song back into their microphone,
+    /// and the model then transcribes the lyrics along with the request.
+    pub fn duck(&self, guild_id: GuildId, ssrc: u32, on: bool) {
+        let low = self.ducks.set(guild_id, ssrc, on);
+        if let Some(handle) = self.tracks.get(guild_id) {
+            let _ = handle.set_volume(if low { DUCK_VOLUME } else { 1.0 });
         }
     }
 
@@ -747,6 +842,11 @@ impl Player {
             // Nothing was verified. Say so, and offer unverified results only if
             // the operator asked for them -- clearly labelled, and never played
             // on their own.
+            Ok(Outcome::Unknown)
+                if config.allow_unverified_autoplay
+                    && self
+                        .autoplay_unverified(ctx, config, guild_id, request, timing)
+                        .await => {}
             Ok(Outcome::Unknown) => {
                 let failure = Failure::new(
                     Problem::NoMatch,
@@ -921,22 +1021,21 @@ impl Player {
 
         // The request is being committed; record it for the learning that
         // happens when the song finishes (or is skipped).
-        self.pending.set(
-            best.candidate.url.clone(),
-            Pending {
-                said: request.query.clone(),
-                track: crate::library::Track {
-                    artist: resolved.as_track().unwrap().artist.clone(),
-                    title: resolved.as_track().unwrap().title.clone(),
-                    duration_secs: resolved.as_track().unwrap().duration_secs,
-                    // The upload that was chosen, not the catalog's: it is the
-                    // one that played, so a phrase heard again can go straight
-                    // to it.
-                    video_id: best.candidate.video_id().map(str::to_string),
+        if let Some(track) = resolved.as_track() {
+            self.pending.set(
+                best.candidate.url.clone(),
+                Pending {
+                    said: request.query.clone(),
+                    track: crate::library::Track {
+                        artist: track.artist.clone(),
+                        title: track.title.clone(),
+                        duration_secs: track.duration_secs,
+                        video_id: best.candidate.video_id().map(str::to_string),
+                    },
+                    from_chooser: false,
                 },
-                from_chooser: false,
-            },
-        );
+            );
+        }
         let song = self
             .fetch
             .fetch(guild_id, &best.candidate, &queue.in_use(), timing)
@@ -995,6 +1094,63 @@ impl Player {
             .collect();
         self.offer_choices(ctx, config, guild_id, &request.query, offers)
             .await;
+    }
+
+    /// `ALLOW_UNVERIFIED_AUTOPLAY`: plays the best upload of a request the
+    /// catalog could not confirm, if that upload alone scores confidently.
+    /// Returns whether it played, so the caller can fall back to asking.
+    async fn autoplay_unverified(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        request: &PlayRequest,
+        timing: &Timing,
+    ) -> bool {
+        let choice = match search::find_unverified(
+            request,
+            &search::YtDlpSearch,
+            config.search_candidates,
+            config.match_threshold,
+            timing,
+        )
+        .await
+        {
+            Ok(choice) if choice.confident => choice,
+            _ => return false,
+        };
+        let Some(best) = choice.best() else {
+            return false;
+        };
+        let queue = self.queues.get(guild_id);
+        let (_serialised, started_at) = self.coordination.begin(guild_id).await;
+        let song = match self
+            .fetch
+            .fetch(guild_id, &best.candidate, &queue.in_use(), timing)
+            .await
+        {
+            Ok(song) => song,
+            Err(e) => {
+                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not fetch the unverified upload");
+                return false;
+            }
+        };
+        tracing::info!(guild_id = %guild_id, title = %song.title, "playing an upload the catalog could not confirm");
+        match self
+            .outcome(guild_id, &queue, song, started_at, timing)
+            .await
+        {
+            Outcome::Played { starting: true } => {
+                drop(_serialised);
+                self.start_next(ctx, config, guild_id, timing).await;
+                true
+            }
+            Outcome::Played { starting: false } => {
+                self.draw_dashboard(ctx, config, guild_id).await;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Offers raw YouTube results for a request nothing matched.
@@ -1136,6 +1292,9 @@ impl Player {
         )
         .await
         {
+            if self.ducks.is_ducked(guild_id) {
+                let _ = handle.set_volume(DUCK_VOLUME);
+            }
             self.tracks.set(guild_id, handle.clone());
             self.follow_when_finished(ctx, config, guild_id, handle, advanced.generation);
         }
@@ -1372,7 +1531,6 @@ impl Player {
 
         let total = tracks.len();
         if total == 0 {
-            self.asks.clear(guild_id);
             anyhow::bail!("the catalog has nothing for \"{query}\"");
         }
 
@@ -1389,49 +1547,61 @@ impl Player {
             owner: Owner::User(asker),
             posted: None,
         };
-        let message = ask.view();
-        self.asks.set(guild_id, ask);
-        self.post_ask(ctx, config, guild_id, message).await?;
+        self.post_ask(ctx, config, guild_id, ask).await?;
         tracing::info!(guild_id = %guild_id, query = %query, found = total, "asked the catalog");
         Ok(total)
     }
 
-    /// Posts a chooser and records where it landed.
+    /// Posts a chooser and puts it on offer under the message it landed in.
+    ///
+    /// The same owner's previous chooser is taken down, so its buttons cannot
+    /// be pressed for a question that has been superseded.
     async fn post_ask(
         &self,
         ctx: &SerenityContext,
         config: &Config,
         guild_id: GuildId,
-        message: dashboard::View,
+        mut ask: Ask,
     ) -> anyhow::Result<()> {
         let Some(channel_id) = resolve_alert_channel(ctx, config, guild_id) else {
             anyhow::bail!("no alert channel, so there was nowhere to post the search");
         };
         let sent = channel_id
-            .send_message(&ctx.http, message.into_message())
+            .send_message(&ctx.http, ask.view().into_message())
             .await
             .map_err(|e| anyhow::anyhow!("could not post the search: {e}"))?;
-        self.asks.posted(guild_id, channel_id, sent.id);
+        ask.posted = Some((channel_id, sent.id));
+        if let Some((old_channel, old_message)) = self.asks.insert(guild_id, sent.id, ask) {
+            // In the background: the caller may be inside Discord's three
+            // second window for answering a command, and tidying up an old
+            // message is not worth spending it on.
+            let http = ctx.http.clone();
+            tokio::spawn(async move {
+                if let Err(e) = http.delete_message(old_channel, old_message, None).await {
+                    tracing::debug!(guild_id = %guild_id, error = %format!("{e:#}"), "could not take the superseded chooser down");
+                }
+            });
+        }
         Ok(())
     }
 
     /// Turns to the next page of a `/play` search, redrawing the same message.
     ///
     /// Returns whether it moved, so the caller only answers when it did.
-    pub async fn next_page(&self, ctx: &SerenityContext, guild_id: GuildId) -> bool {
+    pub async fn next_page(&self, ctx: &SerenityContext, message_id: MessageId) -> bool {
         // Bumped on a copy and stored once, only if the redraw landed. Reading
         // the page, rendering from it and writing it back in three steps let a
         // second press render one page behind, and left the stored page wrong
         // when the edit failed.
-        let Some(mut ask) = self.ask_for(guild_id) else {
+        let Some(mut ask) = self.asks.get(message_id) else {
             return false;
         };
         if !ask.has_next() {
             return false;
         }
         ask.page += 1;
-        if self.redraw_ask(ctx, guild_id, ask.view()).await {
-            self.asks.set(guild_id, ask);
+        if self.redraw_ask(ctx, &ask).await {
+            self.asks.update(message_id, ask);
             true
         } else {
             false
@@ -1444,17 +1614,19 @@ impl Player {
         ctx: &SerenityContext,
         config: &Config,
         guild_id: GuildId,
+        message_id: MessageId,
         index: usize,
     ) -> anyhow::Result<()> {
         let ask = self
-            .ask_for(guild_id)
+            .asks
+            .get(message_id)
             .context("that search is no longer on offer; run /play again")?;
         let offer = ask
             .offers
             .get(index)
             .cloned()
             .with_context(|| "that song is not in the search")?;
-        self.asks.clear(guild_id);
+        self.asks.remove(message_id);
         self.play_offer(ctx, config, guild_id, offer).await
     }
 
@@ -1462,8 +1634,9 @@ impl Player {
     ///
     /// The caller needs this to know whose rule applies: a spoken one is answered
     /// by the voice channel, a typed one by the person who typed it.
-    pub fn ask_is_spoken(&self, guild_id: GuildId) -> bool {
-        self.ask_for(guild_id)
+    pub fn ask_is_spoken(&self, message_id: MessageId) -> bool {
+        self.asks
+            .get(message_id)
             .is_some_and(|ask| matches!(ask.owner, Owner::Voice))
     }
 
@@ -1490,9 +1663,7 @@ impl Player {
             owner: Owner::Voice,
             posted: None,
         };
-        let message = ask.view();
-        self.asks.set(guild_id, ask);
-        if let Err(e) = self.post_ask(ctx, config, guild_id, message).await {
+        if let Err(e) = self.post_ask(ctx, config, guild_id, ask).await {
             tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not post the question");
         }
     }
@@ -1562,7 +1733,9 @@ impl Player {
 
         // The download runs outside the playback lock for the same reason the
         // spoken path does: a press on "1" must not freeze the Skip button.
-        let started_at = self.coordination.generations.get(guild_id).now();
+        // In line with spoken requests, so a press and a request heard at the
+        // same moment cannot both decide they are the one that starts playback.
+        let (_serialised, started_at) = self.coordination.begin(guild_id).await;
         let song = self
             .fetch
             .fetch(
@@ -1591,9 +1764,29 @@ impl Player {
         Ok(())
     }
 
+    /// Plays one particular video: a picked `/play` suggestion, or a pasted
+    /// link. Returns what it queued, for the reply.
+    pub async fn play_video(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        video_id: &str,
+    ) -> anyhow::Result<String> {
+        let track = match self.suggestions.track(video_id) {
+            Some(track) => track,
+            None => crate::suggest::describe(video_id).await,
+        };
+        let label = track.label();
+        let candidate = search::Candidate::for_track(&track, video_id);
+        self.play_offer(ctx, config, guild_id, Offer::Video(candidate))
+            .await?;
+        Ok(label)
+    }
+
     /// Throws a `/play` search away, for "None of these".
-    pub fn dismiss_ask(&self, guild_id: GuildId) -> bool {
-        self.asks.clear(guild_id)
+    pub fn dismiss_ask(&self, message_id: MessageId) -> bool {
+        self.asks.remove(message_id)
     }
 
     /// Whether `user` may answer the question this guild is holding.
@@ -1602,37 +1795,27 @@ impl Player {
     /// spoken one belongs to the voice channel, which the caller has already
     /// checked; it returns true here rather than asking again, because the bot
     /// cannot tell who spoke and has nobody to compare against.
-    pub fn ask_belongs_to(&self, guild_id: GuildId, user: UserId) -> bool {
-        match self.ask_for(guild_id).map(|ask| ask.owner) {
+    pub fn ask_belongs_to(&self, message_id: MessageId, user: UserId) -> bool {
+        match self.asks.get(message_id).map(|ask| ask.owner) {
             Some(Owner::User(asker)) => asker == user,
             Some(Owner::Voice) => true,
             None => false,
         }
     }
 
-    /// The guild's outstanding search, if it has one.
-    fn ask_for(&self, guild_id: GuildId) -> Option<Ask> {
-        self.asks.lock().get(&guild_id).cloned()
-    }
-
     /// Edits the outstanding search's message in place, the way the dashboard
     /// is edited, rather than posting a second one.
-    async fn redraw_ask(
-        &self,
-        ctx: &SerenityContext,
-        guild_id: GuildId,
-        message: dashboard::View,
-    ) -> bool {
-        let Some((channel_id, message_id)) = self.ask_for(guild_id).and_then(|a| a.posted) else {
+    async fn redraw_ask(&self, ctx: &SerenityContext, ask: &Ask) -> bool {
+        let Some((channel_id, message_id)) = ask.posted else {
             return false;
         };
         match channel_id
-            .edit_message(&ctx.http, message_id, message.clone().into_edit())
+            .edit_message(&ctx.http, message_id, ask.view().into_edit())
             .await
         {
             Ok(_) => true,
             Err(e) => {
-                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not turn the search page");
+                tracing::warn!(channel_id = %channel_id, error = %format!("{e:#}"), "could not turn the search page");
                 false
             }
         }
@@ -2316,6 +2499,7 @@ mod tests {
             duration: Some(206.0),
             channel: Some("Tame Impala".to_string()),
             id: None,
+            audio_track: false,
         }
     }
 
@@ -2571,8 +2755,8 @@ mod tests {
     }
 
     /// The ownership rule on its own, so it can be tested without a player.
-    fn asks_answers(asks: &Asks, guild_id: GuildId, user: UserId) -> bool {
-        match asks.lock().get(&guild_id).map(|ask| ask.owner) {
+    fn asks_answers(asks: &Asks, message_id: MessageId, user: UserId) -> bool {
+        match asks.get(message_id).map(|ask| ask.owner) {
             Some(Owner::User(asker)) => asker == user,
             Some(Owner::Voice) => true,
             None => false,
@@ -2605,15 +2789,46 @@ mod tests {
         let asks = Asks::default();
         let asker = UserId::new(42);
         let other = UserId::new(43);
-        assert!(!asks_answers(&asks, guild, asker), "nothing to answer");
+        let typed = MessageId::new(1);
+        let spoken = MessageId::new(2);
+        assert!(!asks_answers(&asks, typed, asker), "nothing to answer");
 
-        asks.set(guild, ask_with(5, Owner::User(asker)));
-        assert!(asks_answers(&asks, guild, asker));
-        assert!(!asks_answers(&asks, guild, other), "someone else must not");
+        asks.insert(guild, typed, ask_with(5, Owner::User(asker)));
+        assert!(asks_answers(&asks, typed, asker));
+        assert!(!asks_answers(&asks, typed, other), "someone else must not");
 
         // A spoken one has nobody to compare against: the bot cannot tell who
         // spoke it, so the channel's own check is the only one there is.
-        asks.set(guild, ask_with(5, Owner::Voice));
-        assert!(asks_answers(&asks, guild, other));
+        asks.insert(guild, spoken, ask_with(5, Owner::Voice));
+        assert!(asks_answers(&asks, spoken, other));
+        assert!(
+            asks.get(typed).is_some(),
+            "a spoken question must not take someone's /play results away"
+        );
+    }
+
+    #[test]
+    fn asking_again_replaces_only_the_same_owners_question() {
+        let guild = GuildId::new(3);
+        let asks = Asks::default();
+        let mut first = ask_with(2, Owner::Voice);
+        first.posted = Some((ChannelId::new(9), MessageId::new(1)));
+        asks.insert(guild, MessageId::new(1), first);
+        let replaced = asks.insert(guild, MessageId::new(2), ask_with(2, Owner::Voice));
+        assert_eq!(replaced, Some((ChannelId::new(9), MessageId::new(1))));
+        assert!(asks.get(MessageId::new(1)).is_none());
+        assert!(asks.remove(MessageId::new(2)));
+        assert!(!asks.remove(MessageId::new(2)));
+    }
+
+    #[test]
+    fn the_music_stays_low_until_every_speaker_is_done() {
+        let ducks = Ducks::default();
+        let guild = GuildId::new(1);
+        assert!(ducks.set(guild, 1, true));
+        assert!(ducks.set(guild, 2, true));
+        assert!(ducks.set(guild, 1, false), "speaker 2 is still talking");
+        assert!(!ducks.set(guild, 2, false));
+        assert!(!ducks.is_ducked(guild));
     }
 }

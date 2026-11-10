@@ -4,7 +4,9 @@ use crate::direct::DirectTranscriber;
 use crate::parakeet::HandyTranscriber;
 use crate::player::Player;
 use crate::resolve;
-use crate::state::{BigModelsKey, ConfigKey, HttpClientKey, PlayerKey, TranscriberKey};
+use crate::state::{
+    BigModelsKey, ConfigKey, HttpClientKey, ListenLock, ListenLockKey, PlayerKey, TranscriberKey,
+};
 use crate::transcriber::Transcriber;
 use crate::voice::{VoiceService, decode_config};
 use crate::wake::BigModels;
@@ -35,8 +37,9 @@ pub async fn start(config: Config) -> anyhow::Result<()> {
     )?;
     let big_models = Arc::new(BigModels::new(
         config.asr_engine,
-        &config.parakeet_model,
+        &config.request_model,
         config.asr_language.as_deref(),
+        config.asr_prompt.as_deref(),
     ));
     log_configuration(&config, &big_models);
 
@@ -48,6 +51,7 @@ pub async fn start(config: Config) -> anyhow::Result<()> {
         .type_map_insert::<HttpClientKey>(reqwest::Client::new())
         .type_map_insert::<TranscriberKey>(wake_model)
         .type_map_insert::<BigModelsKey>(big_models)
+        .type_map_insert::<ListenLockKey>(ListenLock::default())
         .await?;
 
     client.start().await?;
@@ -61,7 +65,7 @@ fn build_transcriber(
     language: Option<&str>,
 ) -> anyhow::Result<Arc<dyn Transcriber>> {
     Ok(match engine {
-        AsrEngine::Direct => Arc::new(DirectTranscriber::new(model, language)?),
+        AsrEngine::Direct => Arc::new(DirectTranscriber::new(model, language, None)?),
         AsrEngine::Handy => Arc::new(HandyTranscriber::new(model)),
     })
 }
@@ -98,7 +102,7 @@ fn log_configuration(config: &Config, big_models: &BigModels) {
     tracing::info!(
         asr_engine = asr,
         wake_model = %config.wake_model,
-        request_model = %config.parakeet_model,
+        request_model = %config.request_model,
         request_model_loaded = big_models.is_loaded(),
         asr_language = config.asr_language.as_deref().unwrap_or("auto"),
         rewrite_model = %rewrite,
@@ -115,15 +119,30 @@ fn log_configuration(config: &Config, big_models: &BigModels) {
 
 pub struct Handler;
 
+/// The song library, unless `LIBRARY_PATH=off`.
+fn library(config: &Config) -> Option<Arc<crate::library::Library>> {
+    let path = config.library_path.as_deref()?;
+    tracing::info!(path = %path.display(), "remembering requests in the library");
+    Some(Arc::new(crate::library::Library::load(Some(path))))
+}
+
 /// The slash commands, in one place so both registrations cannot disagree.
 fn commands() -> Vec<CreateCommand> {
     vec![
         CreateCommand::new("stop").description("Stop playback and leave the voice channel"),
+        CreateCommand::new("lock")
+            .description("Stop listening for voice commands (music keeps playing)"),
+        CreateCommand::new("unlock").description("Start listening for voice commands again"),
         CreateCommand::new("play")
-            .description("Search the catalog for a song and choose from the results")
+            .description("Play a song: pick one as you type, paste a YouTube link, or search")
             .add_option(
-                CreateCommandOption::new(CommandOptionType::String, "song", "What to search for")
-                    .required(true),
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "song",
+                    "Start typing to see songs, or paste a link",
+                )
+                .required(true)
+                .set_autocomplete(true),
             ),
     ]
 }
@@ -160,10 +179,9 @@ impl EventHandler for Handler {
         };
         match resolve::Catalog::from_config(&config) {
             Ok(catalog) => {
-                ctx.data
-                    .write()
-                    .await
-                    .insert::<PlayerKey>(Arc::new(Player::new(manager, Arc::new(catalog))));
+                ctx.data.write().await.insert::<PlayerKey>(Arc::new(
+                    Player::new(manager, Arc::new(catalog)).with_library(library(&config)),
+                ));
             }
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "could not reach the song catalog, playback is disabled")
@@ -229,8 +247,13 @@ impl EventHandler for Handler {
             Interaction::Command(command) => match command.data.name.as_str() {
                 "play" => self.slash_play(&ctx, command).await,
                 "stop" => self.slash_stop(&ctx, command).await,
+                "lock" => self.slash_lock(&ctx, command, true).await,
+                "unlock" => self.slash_lock(&ctx, command, false).await,
                 _ => {}
             },
+            Interaction::Autocomplete(typing) if typing.data.name == "play" => {
+                self.suggest(&ctx, typing).await
+            }
             Interaction::Component(button) => self.component(&ctx, button).await,
             // Modal submissions and autocomplete have no dashboard buttons.
             _ => {}
@@ -305,11 +328,12 @@ impl Handler {
         // A chooser raised by speech belongs to the voice channel, so it keeps the
         // channel's rule rather than a named person. `/play` is the other way
         // round and is checked by `ask_belongs_to` below.
-        let spoken = player.ask_is_spoken(guild_id);
+        let message_id = button.message.id;
+        let spoken = player.ask_is_spoken(message_id);
         let may_answer = if spoken {
             may_control(ctx, guild_id, button.user.id).await
         } else {
-            player.ask_belongs_to(guild_id, button.user.id)
+            player.ask_belongs_to(message_id, button.user.id)
         };
         if !may_answer {
             tracing::info!(
@@ -324,7 +348,10 @@ impl Handler {
 
         match asked {
             Asked::Song(index) => {
-                if let Err(e) = player.play_asked(ctx, &config, guild_id, index).await {
+                if let Err(e) = player
+                    .play_asked(ctx, &config, guild_id, message_id, index)
+                    .await
+                {
                     tracing::warn!(guild_id = %guild_id, index, error = %format!("{e:#}"), "could not play that song");
                     refuse(ctx, button).await;
                 } else {
@@ -332,18 +359,46 @@ impl Handler {
                 }
             }
             Asked::Next => {
-                if !player.next_page(ctx, guild_id).await {
+                if !player.next_page(ctx, message_id).await {
                     refuse(ctx, button).await;
                 }
             }
             Asked::Dismiss => {
-                player.dismiss_ask(guild_id);
+                player.dismiss_ask(message_id);
                 drop_question(ctx, button.channel_id, button.message.id, guild_id).await;
             }
         }
     }
     /// Handles `/play <song>`: searches the catalog and posts the results as a
     /// paged chooser for the asker to pick from.
+    /// `/play` autocomplete: the songs matching what has been typed so far.
+    ///
+    /// Always answered, with an empty list if need be: Discord shows an error
+    /// in the box for a request it gets no answer to.
+    async fn suggest(&self, ctx: &Context, typing: CommandInteraction) {
+        let typed = typing
+            .data
+            .autocomplete()
+            .map(|focused| focused.value.to_string())
+            .unwrap_or_default();
+        let player = ctx.data.read().await.get::<PlayerKey>().cloned();
+        let choices = match player {
+            Some(player) => player.suggestions.choices(&typed).await,
+            None => Vec::new(),
+        };
+        let response = choices.into_iter().fold(
+            serenity::builder::CreateAutocompleteResponse::new(),
+            |response, choice| response.add_string_choice(choice.name, choice.value),
+        );
+        if let Err(e) = typing
+            .create_response(&ctx.http, CreateInteractionResponse::Autocomplete(response))
+            .await
+        {
+            // Superseded by the next keystroke more often than not.
+            tracing::debug!(error = %format!("{e:#}"), "could not answer autocomplete");
+        }
+    }
+
     async fn slash_play(
         &self,
         ctx: &Context,
@@ -375,14 +430,51 @@ impl Handler {
             return;
         }
 
-        match player
+        // Acknowledged before the search, not after it. Discord drops an
+        // interaction that is not answered within three seconds, and the
+        // catalog alone can take most of that when its rate limits are shared
+        // with spoken requests; posting the chooser then pushed the reply past
+        // the deadline, and the person who typed /play saw nothing at all.
+        // Deferred, it shows "thinking…" at once and the answer has 15 minutes.
+        if let Err(e) = command.defer_ephemeral(&ctx.http).await {
+            tracing::warn!(error = %format!("{e:#}"), "could not acknowledge /play");
+            return;
+        }
+        let started = std::time::Instant::now();
+        let query = match crate::suggest::wanted(&query) {
+            crate::suggest::Wanted::Video(video_id) => {
+                let played = player.play_video(ctx, &config, guild_id, &video_id).await;
+                tracing::info!(
+                    guild_id = %guild_id,
+                    video_id = %video_id,
+                    ok = played.is_ok(),
+                    took_ms = started.elapsed().as_millis() as u64,
+                    "/play picked"
+                );
+                let text = match played {
+                    Ok(label) => format!("Queued **{label}**."),
+                    Err(e) => format!("I couldn't play that one: {e:#}"),
+                };
+                finish(ctx, &command, &text).await;
+                return;
+            }
+            crate::suggest::Wanted::Search(query) => query,
+        };
+        let searched = player
             .search_and_ask(ctx, &config, guild_id, &query, command.user.id)
-            .await
-        {
+            .await;
+        tracing::info!(
+            guild_id = %guild_id,
+            query = %query,
+            found = searched.as_ref().ok(),
+            took_ms = started.elapsed().as_millis() as u64,
+            "/play"
+        );
+        match searched {
             Ok(found) => {
-                reply(
+                finish(
                     ctx,
-                    command,
+                    &command,
                     &format!(
                         "Found {found} song{} for `{query}`. Pick one below.",
                         if found == 1 { "" } else { "s" }
@@ -396,9 +488,9 @@ impl Handler {
                 // have been refused, which is what this used to report as
                 // "nothing in the catalog" -- true of the second, false of the
                 // first, and the two look identical from the outside.
-                reply(
+                finish(
                     ctx,
-                    command,
+                    &command,
                     &format!("I couldn't send those results: {e:#}"),
                 )
                 .await;
@@ -439,6 +531,56 @@ impl Handler {
         );
         if let Err(e) = command.create_response(&ctx.http, reply).await {
             tracing::warn!("failed to respond to /stop: {e}");
+        }
+    }
+
+    /// `/lock` and `/unlock`: switch voice listening off and on.
+    ///
+    /// Gated like every playback control: only someone in the bot's voice
+    /// channel may do it, since they are the ones being listened to. The reply
+    /// is public, so everyone in the channel can see whether the bot is
+    /// listening.
+    async fn slash_lock(&self, ctx: &Context, command: CommandInteraction, locked: bool) {
+        let Some(guild_id) = command.guild_id else {
+            reply(ctx, command, "This command only works in a server.").await;
+            return;
+        };
+        if !may_control(ctx, guild_id, command.user.id).await {
+            reply(ctx, command, NOT_IN_VOICE).await;
+            return;
+        }
+        let lock = ctx.data.read().await.get::<ListenLockKey>().cloned();
+        let Some(lock) = lock else {
+            reply(
+                ctx,
+                command,
+                "I'm still starting up — try again in a moment.",
+            )
+            .await;
+            return;
+        };
+
+        let changed = lock.set(guild_id, locked);
+        if locked && let Some(player) = ctx.data.read().await.get::<PlayerKey>().cloned() {
+            // Anyone mid-request is not going to finish it now.
+            player.release_duck(guild_id);
+        }
+        tracing::info!(guild_id = %guild_id, user = %command.user.id, locked, changed, "listening lock");
+        let text = match (locked, changed) {
+            (true, true) => {
+                "🔒 Voice commands are off. I'm not listening to anything said in the channel. Use `/unlock` to turn them back on."
+            }
+            (true, false) => {
+                "🔒 Voice commands were already off. Use `/unlock` to turn them back on."
+            }
+            (false, true) => "🔓 Voice commands are on. Say my name to ask for a song.",
+            (false, false) => "🔓 I was already listening.",
+        };
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content(text),
+        );
+        if let Err(e) = command.create_response(&ctx.http, response).await {
+            tracing::warn!(error = %format!("{e:#}"), "could not answer /lock");
         }
     }
 
@@ -518,7 +660,7 @@ impl Handler {
             // Handled after the player lookup because it is not a playback
             // action and needs no dashboard.
             dashboard::ACTION_NONE => {
-                if !player.dismiss_ask(guild_id) {
+                if !player.dismiss_ask(button.message.id) {
                     return;
                 }
                 drop_question(ctx, button.channel_id, button.message.id, guild_id).await;
@@ -596,6 +738,14 @@ async fn reply(ctx: &Context, command: CommandInteraction, text: &str) {
 ///
 /// Ephemeral rather than a public reply, so pressing Skip from the wrong
 /// channel does not announce itself to the room.
+/// Replaces the "thinking…" of a deferred command with its answer.
+async fn finish(ctx: &Context, command: &CommandInteraction, text: &str) {
+    let edit = serenity::builder::EditInteractionResponse::new().content(text);
+    if let Err(e) = command.edit_response(&ctx.http, edit).await {
+        tracing::warn!(error = %format!("{e:#}"), "could not answer a deferred command");
+    }
+}
+
 async fn refuse(ctx: &Context, button: ComponentInteraction) {
     let reply = CreateInteractionResponse::Message(
         CreateInteractionResponseMessage::new()

@@ -4,13 +4,11 @@ use std::path::PathBuf;
 
 /// Wake words used when `WAKE_WORDS` is unset.
 ///
-/// "play" is included because the parser lets it stand in for the wake word,
-/// which makes the bare "play <query>" the shortest thing worth speaking.
-///
-/// "ut" and "ot" are there because speech-to-text often drops the leading
-/// consonant of a short wake word, turning "bot" into "ut" or "ot". Matching
-/// only "bot" left the bot deaf to the word people actually shout at it.
-pub const DEFAULT_WAKE_WORDS: &[&str] = &["bot", "play", "ut", "ot"];
+/// Distinctive words only. "play" used to be one, which made any sentence with
+/// "play" in it ("let's play a game") a song request; and "ut"/"ot" were there
+/// to catch "bot" with its first consonant clipped, which the voice detector's
+/// lead-in now keeps. Add them back in `WAKE_WORDS` if your voice needs them.
+pub const DEFAULT_WAKE_WORDS: &[&str] = &["bot", "shamash"];
 
 /// Identifies the bot to Deezer, which rejects requests without one.
 pub const HTTP_USER_AGENT: &str = concat!("shamash/", env!("CARGO_PKG_VERSION"));
@@ -117,7 +115,7 @@ pub const DEFAULT_MATCH_THRESHOLD: f64 = 90.0;
 ///
 /// The small Parakeet, deliberately: it runs on every window of speech in the
 /// channel, so its cost is paid continuously rather than once per command, and
-/// it only has to hear one short word. `PARAKEET_MODEL` is the opposite
+/// it only has to hear one short word. `REQUEST_MODEL` is the opposite
 /// trade -- loaded once and run only after a wake word, so it can afford to be
 /// the stronger, much larger model.
 pub const DEFAULT_WAKE_MODEL: &str = crate::model::SMALL_MODEL_ID;
@@ -189,7 +187,7 @@ impl AsrEngine {
             "whisper" => anyhow::bail!(
                 "ASR_ENGINE=whisper is gone: the bundled whisper-rs engine cannot be \
                  linked alongside transcribe.cpp, which replaced it. Use \
-                 ASR_ENGINE=direct and set PARAKEET_MODEL to a Whisper GGUF."
+                 ASR_ENGINE=direct and set REQUEST_MODEL to a Whisper GGUF."
             ),
             other => anyhow::bail!("unknown ASR_ENGINE '{other}'; use 'direct' or 'handy'"),
         }
@@ -202,7 +200,12 @@ pub struct Config {
     pub discord_token: String,
     pub voice_channel_id: u64,
     pub asr_engine: AsrEngine,
-    pub parakeet_model: String,
+    /// The larger model that transcribes a request: `REQUEST_MODEL`, or the
+    /// older name `PARAKEET_MODEL`, or [`crate::model::DEFAULT_MODEL_ID`].
+    pub request_model: String,
+    /// What the request model is prompted with, when it accepts a prompt.
+    /// `ASR_PROMPT`; `off` disables it.
+    pub asr_prompt: Option<String>,
     pub asr_language: Option<String>,
     pub wake_words: HashSet<String>,
     pub alert_channel_id: Option<u64>,
@@ -243,37 +246,54 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let discord_token = std::env::var("DISCORD_TOKEN")?;
-        let voice_channel_id = std::env::var("VOICE_CHANNEL_ID")?.parse()?;
+        let discord_token = required("DISCORD_TOKEN")?;
+        let voice_channel_id = required("VOICE_CHANNEL_ID")?
+            .trim()
+            .parse()
+            .context("VOICE_CHANNEL_ID must be a channel id (a number)")?;
         let asr_engine = match std::env::var("ASR_ENGINE") {
             Ok(value) => AsrEngine::parse(&value)?,
             Err(_) => AsrEngine::Direct,
         };
-        let parakeet_model = std::env::var("PARAKEET_MODEL")
-            .unwrap_or_else(|_| crate::model::DEFAULT_MODEL_ID.into());
         // Only the models that cannot detect a language for themselves need
         // this; Canary and Nemotron return empty text without it.
         let asr_language = std::env::var("ASR_LANGUAGE")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let request_model = non_empty("REQUEST_MODEL")
+            .or_else(|| non_empty("PARAKEET_MODEL"))
+            .unwrap_or_else(|| crate::model::DEFAULT_MODEL_ID.to_string());
+        let asr_prompt = match non_empty("ASR_PROMPT") {
+            Some(off)
+                if ["off", "none", "0", "false"].contains(&off.to_ascii_lowercase().as_str()) =>
+            {
+                None
+            }
+            Some(prompt) => Some(prompt),
+            None => Some(crate::model::REQUEST_PROMPT.to_string()),
+        };
+        // Checked now so a typo stops the bot at startup, not at the first
+        // ambiguous request.
+        parse_ambiguous_policy(std::env::var("AMBIGUOUS_POLICY").ok().as_deref())?;
         let alert_channel_id = parse_optional_id(std::env::var("ALERT_CHANNEL_ID").ok())?;
         let wake_words = std::env::var("WAKE_WORDS")
             .map(|s| split_csv(&s))
             .unwrap_or_else(|_| DEFAULT_WAKE_WORDS.iter().map(|w| w.to_string()).collect())
             .into_iter()
             .collect();
-        let catalog_providers = catalog_provider_names(
-            std::env::var("CATALOG_PROVIDERS").ok().as_deref(),
-            std::env::var("CATALOG_PROVIDER").ok().as_deref(),
-        )?;
+        let providers_var = std::env::var("CATALOG_PROVIDERS").ok();
+        let legacy_var = std::env::var("CATALOG_PROVIDER").ok();
+        if uses_legacy_catalog_provider(providers_var.as_deref(), legacy_var.as_deref()) {
+            tracing::warn!(
+                "CATALOG_PROVIDER is deprecated; set CATALOG_PROVIDERS (a comma-separated list) instead"
+            );
+        }
+        let catalog_providers =
+            catalog_provider_names(providers_var.as_deref(), legacy_var.as_deref())?;
         Ok(Self {
             catalog_providers,
-            library_path: std::env::var("LIBRARY_PATH")
-                .ok()
-                .map(|p| p.trim().to_string())
-                .filter(|p| !p.is_empty())
-                .map(PathBuf::from),
+            library_path: library_path(non_empty("LIBRARY_PATH").as_deref()),
             musicbrainz_contact: std::env::var("MUSICBRAINZ_CONTACT")
                 .ok()
                 .map(|c| c.trim().to_string())
@@ -290,7 +310,8 @@ impl Config {
             discord_token,
             voice_channel_id,
             asr_engine,
-            parakeet_model,
+            request_model,
+            asr_prompt,
             asr_language,
             wake_words,
             alert_channel_id,
@@ -371,16 +392,42 @@ pub enum AmbiguousPolicy {
 }
 
 /// Reads `AMBIGUOUS_POLICY`, treating unset as `ask`.
+///
+/// [`Config::from_env`] has already refused a value that is neither, so the
+/// fallback here is never reached by a typo.
 pub fn ambiguous_policy() -> AmbiguousPolicy {
-    match std::env::var("AMBIGUOUS_POLICY")
+    parse_ambiguous_policy(std::env::var("AMBIGUOUS_POLICY").ok().as_deref())
+        .unwrap_or(AmbiguousPolicy::Ask)
+}
+
+fn parse_ambiguous_policy(value: Option<&str>) -> anyhow::Result<AmbiguousPolicy> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("ask") => Ok(AmbiguousPolicy::Ask),
+        Some("popular") => Ok(AmbiguousPolicy::Popular),
+        Some(other) => anyhow::bail!("AMBIGUOUS_POLICY must be ask or popular, got {other:?}"),
+    }
+}
+
+/// Reads a required variable, naming it when it is missing.
+fn required(name: &str) -> anyhow::Result<String> {
+    non_empty(name).with_context(|| format!("{name} is not set; add it to .env"))
+}
+
+/// A variable's trimmed value, with blank treated as unset.
+fn non_empty(name: &str) -> Option<String> {
+    std::env::var(name)
         .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        Some(value) if value.eq_ignore_ascii_case("popular") => AmbiguousPolicy::Popular,
-        // A typo falls back to asking, which is the safe direction: the wrong
-        // reading of this setting is a wrong song rather than an extra click.
-        _ => AmbiguousPolicy::Ask,
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Where the song library lives: `LIBRARY_PATH`, the default when unset, or
+/// nowhere when it is `off`.
+fn library_path(value: Option<&str>) -> Option<PathBuf> {
+    match value {
+        None => Some(PathBuf::from(crate::library::DEFAULT_LIBRARY_PATH)),
+        Some(v) if ["off", "none", "false", "0"].contains(&v.to_ascii_lowercase().as_str()) => None,
+        Some(path) => Some(PathBuf::from(path)),
     }
 }
 
@@ -416,6 +463,32 @@ fn split_csv(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ambiguous_policy_refuses_a_typo() {
+        assert_eq!(parse_ambiguous_policy(None).unwrap(), AmbiguousPolicy::Ask);
+        assert_eq!(
+            parse_ambiguous_policy(Some(" Popular ")).unwrap(),
+            AmbiguousPolicy::Popular
+        );
+        let err = parse_ambiguous_policy(Some("auto"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("AMBIGUOUS_POLICY"), "{err}");
+    }
+
+    #[test]
+    fn the_library_is_on_by_default_and_can_be_turned_off() {
+        assert_eq!(
+            library_path(None),
+            Some(PathBuf::from(crate::library::DEFAULT_LIBRARY_PATH))
+        );
+        assert_eq!(library_path(Some("off")), None);
+        assert_eq!(
+            library_path(Some("/tmp/x.json")),
+            Some(PathBuf::from("/tmp/x.json"))
+        );
+    }
 
     #[test]
     fn parses_csv_wake_words() {

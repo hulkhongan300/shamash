@@ -56,6 +56,7 @@ transcribe-cpp = { version = "0.2.4", features = ["vulkan"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 rphonetic = "3"
+earshot = "1.2.2"
 # transcribe.cpp is the speech engine. It replaced whisper-rs, which cannot
 # coexist with it: both vendor their own copy of ggml and export the same C
 # symbols, so a binary linking both dies with duplicate-symbol errors. Whisper
