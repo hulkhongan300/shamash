@@ -14,7 +14,7 @@ use serenity::all::AutocompleteChoice;
 use serenity::async_trait;
 use serenity::builder::{
     CreateAutocompleteResponse, CreateCommand, CreateCommandOption, CreateInteractionResponse,
-    CreateInteractionResponseMessage, EditInteractionResponse,
+    CreateInteractionResponseFollowup, CreateInteractionResponseMessage, EditInteractionResponse,
 };
 use serenity::model::application::{
     CommandInteraction, CommandOptionType, ComponentInteraction, Interaction, ResolvedValue,
@@ -289,6 +289,19 @@ impl EventHandler for Handler {
 pub const NOT_IN_VOICE: &str =
     "Join the voice channel I'm in first — that's where playback is controlled.";
 
+/// The reply to a press on a `/play` list someone else asked for.
+const NOT_YOURS: &str =
+    "That list belongs to whoever ran `/play`. Run `/play` yourself to pick a song.";
+
+/// The reply to a press on a list the bot is no longer holding.
+const NOT_ON_OFFER: &str = "That search is no longer on offer; run `/play` again.";
+
+/// The reply to "Next page" when the page could not be turned.
+const NO_NEXT_PAGE: &str = "There is no next page to show; run `/play` again.";
+
+/// The reply to anything pressed before the bot has finished starting.
+const STARTING_UP: &str = "I'm still starting up — try again in a moment.";
+
 /// The reply to `/play` with no words in it.
 const NOT_A_SEARCH: &str = "Tell me what to search for: `/play dracula`.";
 
@@ -333,36 +346,46 @@ impl Handler {
     }
 
     /// A press on the `/play` chooser: a song, the next page, or nothing.
+    ///
+    /// Whether the press may be answered at all is settled before it is
+    /// acknowledged, the way the dashboard's buttons are: a refusal is the
+    /// press's one response. Anything that goes wrong after the acknowledgement
+    /// is said in a follow-up instead, because Discord rejects a second response
+    /// to the same press -- which is how a song that failed to play used to
+    /// leave the list in place with nothing said at all.
     async fn asked_button(&self, ctx: &Context, button: ComponentInteraction, asked: Asked) {
         let Some(guild_id) = button.guild_id else {
             return;
         };
-        if let Err(e) = button.defer(&ctx.http).await {
-            tracing::warn!("failed to acknowledge a /play button: {e}");
-            return;
-        }
         let Some((config, player)) = ready(ctx).await else {
             tracing::warn!("a /play button was pressed before the bot was ready");
+            answer_privately(ctx, button, STARTING_UP).await;
             return;
         };
 
         // A chooser raised by speech belongs to the voice channel, so it keeps the
         // channel's rule rather than a named person. `/play` is the other way
         // round and is checked by `ask_belongs_to` below.
+        let on_offer = player.has_ask(guild_id);
         let spoken = player.ask_is_spoken(guild_id);
         let may_answer = if spoken {
             may_control(ctx, guild_id, button.user.id).await
         } else {
             player.ask_belongs_to(guild_id, button.user.id)
         };
-        if !may_answer {
+        if let Some(text) = chooser_refusal(on_offer, spoken, may_answer) {
             tracing::info!(
                 guild_id = %guild_id,
                 user = %button.user.id,
+                on_offer,
                 spoken,
                 "a song was chosen by someone who may not answer this question"
             );
-            refuse(ctx, button).await;
+            answer_privately(ctx, button, text).await;
+            return;
+        }
+        if let Err(e) = button.defer(&ctx.http).await {
+            tracing::warn!("failed to acknowledge a /play button: {e}");
             return;
         }
 
@@ -370,14 +393,14 @@ impl Handler {
             Asked::Song(index) => {
                 if let Err(e) = player.play_asked(ctx, &config, guild_id, index).await {
                     tracing::warn!(guild_id = %guild_id, index, error = %format!("{e:#}"), "could not play that song");
-                    refuse(ctx, button).await;
+                    follow_up(ctx, &button, &format!("I couldn't play that song: {e:#}")).await;
                 } else {
                     drop_question(ctx, button.channel_id, button.message.id, guild_id).await;
                 }
             }
             Asked::Next => {
                 if !player.next_page(ctx, guild_id).await {
-                    refuse(ctx, button).await;
+                    follow_up(ctx, &button, NO_NEXT_PAGE).await;
                 }
             }
             Asked::Dismiss => {
@@ -833,13 +856,55 @@ async fn reply(ctx: &Context, command: CommandInteraction, text: &str) {
 /// Ephemeral rather than a public reply, so pressing Skip from the wrong
 /// channel does not announce itself to the room.
 async fn refuse(ctx: &Context, button: ComponentInteraction) {
+    answer_privately(ctx, button, NOT_IN_VOICE).await;
+}
+
+/// Why a press on the chooser may not be answered, or `None` when it may.
+///
+/// `on_offer` is whether the guild still holds a search, `spoken` whether that
+/// search came from speech, and `may_answer` whether the presser passed the
+/// rule that applies to it.
+fn chooser_refusal(on_offer: bool, spoken: bool, may_answer: bool) -> Option<&'static str> {
+    if !on_offer {
+        Some(NOT_ON_OFFER)
+    } else if may_answer {
+        None
+    } else if spoken {
+        Some(NOT_IN_VOICE)
+    } else {
+        Some(NOT_YOURS)
+    }
+}
+
+/// Answers a button press privately, as its one response.
+///
+/// Only for a press that has not been acknowledged: after `defer`, Discord
+/// rejects this, and [`follow_up`] is the way to say anything.
+async fn answer_privately(ctx: &Context, button: ComponentInteraction, text: &str) {
     let reply = CreateInteractionResponse::Message(
         CreateInteractionResponseMessage::new()
-            .content(NOT_IN_VOICE)
+            .content(text)
             .ephemeral(true),
     );
     if let Err(e) = button.create_response(&ctx.http, reply).await {
-        tracing::warn!("could not refuse a button press: {e}");
+        tracing::warn!("could not answer a button press: {e}");
+    }
+}
+
+/// The private message sent after a press was already acknowledged.
+fn private_follow_up(text: &str) -> CreateInteractionResponseFollowup {
+    CreateInteractionResponseFollowup::new()
+        .content(text)
+        .ephemeral(true)
+}
+
+/// Tells the presser, privately, what happened to a press already acknowledged.
+async fn follow_up(ctx: &Context, button: &ComponentInteraction, text: &str) {
+    if let Err(e) = button
+        .create_followup(&ctx.http, private_follow_up(text))
+        .await
+    {
+        tracing::warn!("could not follow up a button press: {e}");
     }
 }
 
@@ -876,6 +941,37 @@ fn player_with_memory(mut player: Player, config: &Config) -> Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chooser_press_is_refused_only_for_a_reason_that_fits() {
+        // The owner of the list, or anyone in the channel for a spoken one.
+        assert_eq!(chooser_refusal(true, false, true), None);
+        assert_eq!(chooser_refusal(true, true, true), None);
+        // Somebody else's `/play` is theirs; a spoken one is the channel's.
+        assert_eq!(chooser_refusal(true, false, false), Some(NOT_YOURS));
+        assert_eq!(chooser_refusal(true, true, false), Some(NOT_IN_VOICE));
+        // A list the bot no longer holds says so, rather than blaming the
+        // presser for not being in the voice channel.
+        assert_eq!(chooser_refusal(false, false, false), Some(NOT_ON_OFFER));
+        assert_eq!(chooser_refusal(false, true, true), Some(NOT_ON_OFFER));
+    }
+
+    #[test]
+    fn a_failed_pick_is_told_in_a_private_follow_up() {
+        // Issue #42: the press is acknowledged before the song is fetched, and a
+        // second response to it is rejected by Discord, so a failure was never
+        // shown. It is a follow-up, private to the presser, carrying the reason.
+        let sent = serde_json::to_value(private_follow_up(
+            "I couldn't play that song: could not download that song",
+        ))
+        .unwrap();
+        assert_eq!(
+            sent["content"],
+            "I couldn't play that song: could not download that song"
+        );
+        let ephemeral = serenity::model::channel::MessageFlags::EPHEMERAL.bits();
+        assert_eq!(sent["flags"].as_u64().unwrap() & ephemeral, ephemeral);
+    }
 
     #[test]
     fn autocomplete_name_includes_artist_title_and_duration() {

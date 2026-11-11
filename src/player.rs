@@ -1671,6 +1671,11 @@ impl Player {
             .await
     }
 
+    /// Whether the guild still holds a question to answer.
+    pub fn has_ask(&self, guild_id: GuildId) -> bool {
+        self.ask_for(guild_id).is_some()
+    }
+
     /// Whether the outstanding question came from speech rather than `/play`.
     ///
     /// The caller needs this to know whose rule applies: a spoken one is answered
