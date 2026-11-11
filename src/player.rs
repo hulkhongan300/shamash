@@ -235,6 +235,9 @@ impl AudioFetcher for YtDlpFetch {
             artist: found.channel().to_string(),
             url: found.url.clone(),
             video_id,
+            duration_secs: found.duration.filter(|d| *d > 0.0),
+            // The caller says otherwise when it was not a spoken request.
+            origin: crate::queue::Origin::Voice,
         })
     }
 }
@@ -271,6 +274,14 @@ enum Offer {
         track: resolve::CatalogTrack,
         requested: String,
     },
+}
+
+/// How a chosen song was asked for: shown on the dashboard, and, for a pick
+/// from a spoken request's chooser, the words to remember it by.
+#[derive(Debug, Clone, Copy)]
+struct Via<'a> {
+    said: Option<&'a str>,
+    origin: crate::queue::Origin,
 }
 
 /// Who may answer an outstanding question.
@@ -1652,7 +1663,12 @@ impl Player {
         // A spoken request's pick is remembered for those words. A typed
         // `/play` search is not, yet.
         let said = matches!(ask.owner, Owner::Voice).then_some(ask.query.as_str());
-        self.play_offer(ctx, config, guild_id, offer, said).await
+        let origin = match ask.owner {
+            Owner::Voice => crate::queue::Origin::Voice,
+            Owner::User(_) => crate::queue::Origin::Slash,
+        };
+        self.play_offer(ctx, config, guild_id, offer, Via { said, origin })
+            .await
     }
 
     /// Whether the outstanding question came from speech rather than `/play`.
@@ -1702,12 +1718,12 @@ impl Player {
         config: &Config,
         guild_id: GuildId,
         offer: Offer,
-        said: Option<&str>,
+        via: Via<'_>,
     ) -> anyhow::Result<()> {
         // Pressing a button is a request of its own, with its own summary line.
         let timing = Timing::default();
         let _ = self
-            .play_offer_inner(ctx, config, guild_id, offer, said, &timing)
+            .play_offer_inner(ctx, config, guild_id, offer, via, &timing)
             .await?;
         timing.log("/play offer");
         Ok(())
@@ -1719,7 +1735,7 @@ impl Player {
         config: &Config,
         guild_id: GuildId,
         offer: Offer,
-        said: Option<&str>,
+        via: Via<'_>,
         timing: &Timing,
     ) -> anyhow::Result<(String, bool)> {
         // The user has already chosen the song by pressing this button or
@@ -1756,7 +1772,7 @@ impl Player {
         // In line with spoken requests, so a press and a request heard at the
         // same moment cannot both decide they are the one that starts playback.
         let (_serialised, started_at) = self.coordination.begin(guild_id).await;
-        let song = self
+        let mut song = self
             .fetch
             .fetch(
                 guild_id,
@@ -1766,7 +1782,8 @@ impl Player {
             )
             .await
             .context("could not download that song")?;
-        if let Some(said) = said {
+        song.origin = via.origin;
+        if let Some(said) = via.said {
             self.remember_pick(guild_id, said, song_track.as_ref(), &candidate);
         }
         let label = format!("{} — {}", song.artist, song.title);
@@ -1955,7 +1972,10 @@ impl Player {
                 config,
                 guild_id,
                 Offer::Video(candidate),
-                None,
+                Via {
+                    said: None,
+                    origin: crate::queue::Origin::Playlist,
+                },
                 &timing,
             )
             .await;
@@ -1997,7 +2017,17 @@ impl Player {
 
         let timing = Timing::default();
         let res = self
-            .play_offer_inner(ctx, config, guild_id, offer, None, &timing)
+            .play_offer_inner(
+                ctx,
+                config,
+                guild_id,
+                offer,
+                Via {
+                    said: None,
+                    origin: crate::queue::Origin::Slash,
+                },
+                &timing,
+            )
             .await;
         timing.log("/play direct");
         res
@@ -2241,10 +2271,13 @@ async fn draw(
     let view = match page {
         Page::Queue => dashboard::queue_view(&queue.pending_songs()),
         Page::NowPlaying => match &current {
-            Some(song) => {
-                dashboard::dashboard(song, queue.is_paused(), queue.pending(), queue.is_repeat())
-            }
-            None => dashboard::idle_dashboard(),
+            Some(song) => dashboard::dashboard(
+                song,
+                queue.is_paused(),
+                &queue.pending_songs(),
+                queue.is_repeat(),
+            ),
+            None => dashboard::idle_dashboard(&config.wake_words),
         },
     };
 
@@ -2665,6 +2698,8 @@ mod tests {
             artist: "someone".to_string(),
             url: "https://youtu.be/only".to_string(),
             video_id: "only".to_string(),
+            duration_secs: None,
+            origin: crate::queue::Origin::Voice,
         }
     }
 

@@ -3,7 +3,8 @@
 //! An embed plus buttons. Discord echoes a button's `custom_id` back on every
 //! press, which is how the press is matched to [`action_from_id`].
 
-use crate::queue::Queued;
+use crate::queue::{Origin, Queued};
+use serenity::all::ReactionType;
 use serenity::builder::{
     CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, CreateMessage, EditMessage,
 };
@@ -122,108 +123,228 @@ impl View {
     }
 }
 
+/// The colour of a dashboard that is playing.
+const PLAYING: u32 = 0x1d_b9_54;
+/// The colour of a paused dashboard, so the state shows at a glance.
+const PAUSED: u32 = 0x80_84_8e;
+/// The colour of the idle dashboard.
+const IDLE: u32 = 0x2b_2d_31;
+
+/// How much of a title a list line shows. A list is for finding a song, and a
+/// whole title can be read on the song itself.
+const LIST_TITLE: usize = 80;
+/// How much of an artist a list line shows.
+const LIST_ARTIST: usize = 40;
+
+/// A dashboard button with an icon.
+///
+/// The emoji goes in as a string, which carries the variation selector Discord
+/// needs to draw it as an emoji rather than as a plain character.
+fn button(action: &str, label: &str, emoji: &str, style: ButtonStyle) -> CreateButton {
+    CreateButton::new(button_id(action))
+        .label(label)
+        .emoji(ReactionType::Unicode(emoji.to_string()))
+        .style(style)
+}
+
+/// "3:26", or "1:02:03" past an hour.
+fn clock(secs: f64) -> String {
+    let total = secs.max(0.0).round() as u64;
+    let (hours, minutes, seconds) = (total / 3600, total / 60 % 60, total % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// "23 min", or "1 h 05 min" past an hour.
+fn total_time(secs: f64) -> String {
+    let minutes = (secs.max(0.0) / 60.0).round() as u64;
+    if minutes >= 60 {
+        format!("{} h {:02} min", minutes / 60, minutes % 60)
+    } else {
+        format!("{} min", minutes.max(1))
+    }
+}
+
+/// How a song was asked for, as the dashboard says it.
+fn origin_label(origin: Origin) -> &'static str {
+    match origin {
+        Origin::Voice => "🎤 asked by voice",
+        Origin::Slash => "⌨️ from /play",
+        Origin::Playlist => "💿 from a playlist",
+    }
+}
+
+/// "**Title** — Artist", escaped and shortened for a list.
+fn song_line(title: &str, artist: &str) -> String {
+    let title = markdown_escape(&trim(title, LIST_TITLE));
+    if artist.is_empty() {
+        format!("**{title}**")
+    } else {
+        format!(
+            "**{title}** — {}",
+            markdown_escape(&trim(artist, LIST_ARTIST))
+        )
+    }
+}
+
 /// Builds the dashboard for the song playing now.
 ///
 /// `paused` picks between a pause and a resume button, because a paused song
-/// needs the opposite action. `repeat` is stated on the button, because a
-/// toggle whose state is only visible by its effect is one nobody trusts.
-pub fn dashboard(song: &Queued, paused: bool, pending: usize, repeat: bool) -> View {
+/// needs the opposite action, and greys the dashboard so the state shows at a
+/// glance. `repeat` is stated on the button and in the embed, because a toggle
+/// whose state is only visible by its effect is one nobody trusts. `up_next` is
+/// the queue behind this song, of which the first is named.
+pub fn dashboard(song: &Queued, paused: bool, up_next: &[Queued], repeat: bool) -> View {
     let mut embed = CreateEmbed::new()
         .title(trim(&song.title, MAX_TITLE))
         .url(&song.url)
         .thumbnail(song.thumbnail())
-        .color(0x1d_b9_54);
+        .color(if paused { PAUSED } else { PLAYING });
 
     if !song.artist.is_empty() {
         embed = embed.author(CreateEmbedAuthor::new(trim(&song.artist, MAX_FIELD_NAME)));
     }
-    embed = embed.field(
-        trim("Up next", MAX_FIELD_NAME),
-        if pending == 0 {
-            "nothing queued".to_string()
-        } else {
-            format!("{pending} song{}", if pending == 1 { "" } else { "s" })
-        },
-        false,
-    );
-    if paused {
-        embed = embed.description(trim("Paused", MAX_DESCRIPTION));
-    }
 
-    // Labels rather than emoji: serenity builds a reaction type from a single
-    // `char`, which cannot carry the variation selector a button emoji needs.
-    let (toggle_label, toggle_action) = if paused {
-        ("Resume", ACTION_RESUME)
+    let mut lines = Vec::new();
+    if paused {
+        lines.push("⏸️ **Paused**".to_string());
+    }
+    let about: Vec<String> = song
+        .duration_secs
+        .map(clock)
+        .into_iter()
+        .chain([origin_label(song.origin).to_string()])
+        .collect();
+    lines.push(about.join(" · "));
+    if repeat {
+        lines.push("🔂 Repeating this song".to_string());
+    }
+    embed = embed.description(trim(&lines.join("\n"), MAX_DESCRIPTION));
+
+    let next = match up_next {
+        [] => "Nothing queued".to_string(),
+        [next] => song_line(&next.title, &next.artist),
+        [next, rest @ ..] => format!(
+            "{}\n+{} more",
+            song_line(&next.title, &next.artist),
+            rest.len()
+        ),
+    };
+    embed = embed.field("Up next", trim(&next, MAX_FIELD_VALUE), false);
+
+    let toggle = if paused {
+        button(ACTION_RESUME, "Resume", "▶️", ButtonStyle::Primary)
     } else {
-        ("Pause", ACTION_PAUSE)
+        button(ACTION_PAUSE, "Pause", "⏸️", ButtonStyle::Primary)
+    };
+    let queue_label = if up_next.is_empty() {
+        "Queue".to_string()
+    } else {
+        format!("Queue ({})", up_next.len())
     };
 
     View {
         embed,
-        buttons: vec![CreateActionRow::Buttons(vec![
-            CreateButton::new(button_id(toggle_action)).label(toggle_label),
-            CreateButton::new(button_id(ACTION_SKIP)).label("Skip"),
-            CreateButton::new(button_id(ACTION_QUEUE)).label("Queue"),
-            CreateButton::new(button_id(ACTION_REPEAT))
-                .label(if repeat { "Repeat: on" } else { "Repeat" })
-                .style(if repeat {
-                    ButtonStyle::Secondary
-                } else {
-                    ButtonStyle::Primary
-                }),
-            CreateButton::new(button_id(ACTION_STOP))
-                .label("Stop")
-                .style(ButtonStyle::Danger),
-        ])],
+        buttons: vec![
+            CreateActionRow::Buttons(vec![
+                toggle,
+                button(ACTION_SKIP, "Skip", "⏭️", ButtonStyle::Secondary),
+                button(ACTION_QUEUE, &queue_label, "📜", ButtonStyle::Secondary),
+                // Green when on: the colour of a switch that is set.
+                button(
+                    ACTION_REPEAT,
+                    if repeat { "Repeat: on" } else { "Repeat" },
+                    "🔂",
+                    if repeat {
+                        ButtonStyle::Success
+                    } else {
+                        ButtonStyle::Secondary
+                    },
+                ),
+            ]),
+            // A row of its own, so it is not pressed by a thumb aiming at Repeat.
+            CreateActionRow::Buttons(vec![button(ACTION_STOP, "Stop", "⏹️", ButtonStyle::Danger)]),
+        ],
     }
 }
 
 /// The dashboard showing what is waiting, with the way back to now-playing.
 ///
-/// One field per song rather than one line in the description, so a long queue
-/// stays readable and Discord's own limit does the truncating for us.
+/// One line per song, numbered, under a summary of how many and how long: the
+/// queue holds up to twenty songs, and a block per song made it taller than the
+/// screen.
 pub fn queue_view(pending: &[Queued]) -> View {
-    let mut embed = CreateEmbed::new().title("Up next").color(0x1d_b9_54);
+    let mut embed = CreateEmbed::new().title("📜 Up next").color(PLAYING);
 
     if pending.is_empty() {
         embed = embed.description("Nothing is queued.");
     } else {
-        embed = embed.fields(
-            pending
-                .iter()
-                .enumerate()
-                .map(|(index, song)| {
-                    let name = trim(&format!("{}. {}", index + 1, song.title), MAX_FIELD_NAME);
-                    let artist = trim(&song.artist, MAX_FIELD_VALUE);
-                    (
-                        name,
-                        if artist.is_empty() {
-                            "\u{2014}".to_string()
-                        } else {
-                            artist
-                        },
-                        false,
-                    )
-                })
-                .collect::<Vec<_>>(),
+        let known: f64 = pending.iter().filter_map(|song| song.duration_secs).sum();
+        let all_known = pending.iter().all(|song| song.duration_secs.is_some());
+        let count = format!(
+            "{} song{}",
+            pending.len(),
+            if pending.len() == 1 { "" } else { "s" }
         );
+        let summary = match (known > 0.0, all_known) {
+            (false, _) => count,
+            (true, true) => format!("{count} · {}", total_time(known)),
+            (true, false) => format!("{count} · over {}", total_time(known)),
+        };
+        let mut lines = vec![format!("**{summary}**"), String::new()];
+        lines.extend(pending.iter().enumerate().map(|(index, song)| {
+            let mut line = format!(
+                "`{:>2}.` {}",
+                index + 1,
+                song_line(&song.title, &song.artist)
+            );
+            if let Some(duration) = song.duration_secs {
+                line.push_str(&format!(" · {}", clock(duration)));
+            }
+            line
+        }));
+        embed = embed.description(trim(&lines.join("\n"), MAX_DESCRIPTION));
     }
 
     View {
         embed,
-        buttons: vec![CreateActionRow::Buttons(vec![
-            CreateButton::new(button_id(ACTION_BACK)).label("Back"),
-        ])],
+        buttons: vec![CreateActionRow::Buttons(vec![button(
+            ACTION_BACK,
+            "Back",
+            "◀️",
+            ButtonStyle::Secondary,
+        )])],
     }
 }
 
-/// The dashboard shown when there is nothing playing.
-pub fn idle_dashboard() -> View {
+/// "**bot**", "**bot** or **shamash**", "**a**, **b** or **c**".
+fn either(words: &[String]) -> String {
+    let words: Vec<String> = words.iter().map(|w| format!("**{w}**")).collect();
+    match words.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
+/// The dashboard shown when there is nothing playing, saying both ways to
+/// start a song.
+pub fn idle_dashboard<'a>(wake_words: impl IntoIterator<Item = &'a String>) -> View {
+    let mut words: Vec<String> = wake_words.into_iter().cloned().collect();
+    words.sort();
+    let description = if words.is_empty() {
+        "Use `/play` to start the queue.".to_string()
+    } else {
+        format!("Say {} and a song, or use `/play`.", either(&words))
+    };
     View {
         embed: CreateEmbed::new()
             .title("Nothing playing")
-            .description("Say the wake word and a song to start the queue.")
-            .color(0x2b_2d_31),
+            .description(trim(&description, MAX_DESCRIPTION))
+            .color(IDLE),
         buttons: Vec::new(),
     }
 }
@@ -260,28 +381,29 @@ pub fn notice(text: &str) -> View {
 pub fn ask(requested: &str, options: &[ChoiceOption<'_>], page: usize, total: usize) -> View {
     let has_next = (page + 1) * ASK_PAGE < total;
     let total_pages = total.div_ceil(ASK_PAGE).max(1);
+    // One line per song: nine blocks of two lines each was taller than the
+    // screen, and the numbers are what the buttons below say.
+    let mut lines = vec![
+        format!(
+            "Results for “{}”",
+            trim(&markdown_escape(requested), LIST_TITLE * 2)
+        ),
+        String::new(),
+    ];
+    lines.extend(options.iter().enumerate().map(|(index, option)| {
+        format!(
+            "`{}.` **{}** · {}",
+            index + 1,
+            markdown_escape(&trim(option.title, LIST_TITLE)),
+            markdown_escape(&option.detail())
+        )
+    }));
+    lines.push(String::new());
+    lines.push(format!("Page {} of {total_pages}", page + 1));
     let embed = CreateEmbed::new()
         .title("Which one?")
-        .description(format!(
-            "Searching the catalog for {}.\nPage {} of {}.",
-            trim(&markdown_escape(requested), MAX_DESCRIPTION),
-            page + 1,
-            total_pages
-        ))
-        .color(0x1d_b9_54)
-        .fields(
-            options
-                .iter()
-                .enumerate()
-                .map(|(index, option)| {
-                    (
-                        format!("{}. {}", index + 1, trim(option.title, MAX_FIELD_NAME)),
-                        trim(&option.detail(), MAX_FIELD_VALUE),
-                        false,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        );
+        .description(trim(&lines.join("\n"), MAX_DESCRIPTION))
+        .color(PLAYING);
 
     // Five to a row, because that is Discord's limit for one action row. The id
     // carries the position in the whole search, not in this page, so a press
@@ -306,13 +428,13 @@ pub fn ask(requested: &str, options: &[ChoiceOption<'_>], page: usize, total: us
     // Disabled rather than absent when the list has run out: a button that
     // vanishes leaves the message looking broken, and a press on it would fail.
     rows.push(CreateActionRow::Buttons(vec![
-        CreateButton::new(action_id(ACTION_NEXT))
-            .label("Next page")
-            .style(ButtonStyle::Secondary)
-            .disabled(!has_next),
-        CreateButton::new(action_id(ACTION_NOTHING))
-            .label("None of these")
-            .style(ButtonStyle::Secondary),
+        button(ACTION_NEXT, "Next page", "➡️", ButtonStyle::Secondary).disabled(!has_next),
+        button(
+            ACTION_NOTHING,
+            "None of these",
+            "✖️",
+            ButtonStyle::Secondary,
+        ),
     ]));
 
     View {
@@ -410,6 +532,8 @@ mod tests {
             artist: "An Artist".to_string(),
             url: "https://youtu.be/abc".to_string(),
             video_id: "abc".to_string(),
+            duration_secs: Some(206.0),
+            origin: Origin::Voice,
         }
     }
 
@@ -530,7 +654,7 @@ mod tests {
 
     #[test]
     fn the_dashboard_carries_the_title_artist_and_thumbnail() {
-        let view = dashboard(&song(), false, 0, false);
+        let view = dashboard(&song(), false, &[], false);
         let json = serde_json::to_string(&view.embed).expect("embed serialises");
         assert!(json.contains("A Song"), "the title must be shown: {json}");
         assert!(
@@ -549,11 +673,11 @@ mod tests {
 
     #[test]
     fn a_playing_song_offers_pause_and_a_paused_one_offers_resume() {
-        let playing = rendered(&dashboard(&song(), false, 0, false));
+        let playing = rendered(&dashboard(&song(), false, &[], false));
         assert!(playing.contains("Pause"), "{playing}");
         assert!(!playing.contains("Resume"), "{playing}");
 
-        let paused = rendered(&dashboard(&song(), true, 0, false));
+        let paused = rendered(&dashboard(&song(), true, &[], false));
         assert!(paused.contains("Resume"), "{paused}");
         assert!(
             paused.contains("Paused"),
@@ -561,16 +685,81 @@ mod tests {
         );
     }
 
+    fn named(title: &str, artist: &str, duration: Option<f64>) -> Queued {
+        let mut song = song();
+        song.title = title.to_string();
+        song.artist = artist.to_string();
+        song.duration_secs = duration;
+        song
+    }
+
+    /// The next song is named rather than counted, and the rest are summed up.
     #[test]
-    fn the_queue_length_is_summarised() {
-        let empty = rendered(&dashboard(&song(), false, 0, false));
-        assert!(empty.contains("nothing queued"), "{empty}");
+    fn the_next_song_is_named() {
+        let empty = rendered(&dashboard(&song(), false, &[], false));
+        assert!(empty.contains("Nothing queued"), "{empty}");
 
-        let one = rendered(&dashboard(&song(), false, 1, false));
-        assert!(one.contains("1 song"), "{one}");
+        let next = [named("Rhymes Like Dimes", "MF DOOM", None)];
+        let one = rendered(&dashboard(&song(), false, &next, false));
+        assert!(one.contains("**Rhymes Like Dimes** — MF DOOM"), "{one}");
+        assert!(!one.contains("more"), "{one}");
+        assert!(one.contains("Queue (1)"), "{one}");
 
-        let many = rendered(&dashboard(&song(), false, 3, false));
-        assert!(many.contains("3 songs"), "{many}");
+        let three = [next[0].clone(), song(), song()];
+        let many = rendered(&dashboard(&song(), false, &three, false));
+        assert!(many.contains("Rhymes Like Dimes"), "{many}");
+        assert!(many.contains("+2 more"), "{many}");
+        assert!(many.contains("Queue (3)"), "{many}");
+    }
+
+    /// The length and how the song was asked for are shown under the title.
+    #[test]
+    fn the_dashboard_says_how_long_and_how_it_was_asked_for() {
+        let voice = description_of(dashboard(&song(), false, &[], false));
+        assert_eq!(voice, "3:26 · 🎤 asked by voice");
+
+        let mut typed = song();
+        typed.origin = Origin::Playlist;
+        typed.duration_secs = None;
+        assert_eq!(
+            description_of(dashboard(&typed, false, &[], false)),
+            "💿 from a playlist"
+        );
+    }
+
+    /// Paused greys the dashboard and says so; repeat says so too.
+    #[test]
+    fn paused_and_repeat_are_visible_at_a_glance() {
+        let colour = |view: &View| serde_json::to_value(&view.embed).unwrap()["color"].clone();
+        let playing = dashboard(&song(), false, &[], false);
+        let paused = dashboard(&song(), true, &[], true);
+        assert_ne!(colour(&playing), colour(&paused));
+        let description = description_of(paused);
+        assert!(description.starts_with("⏸️ **Paused**"), "{description}");
+        assert!(description.contains("🔂 Repeating"), "{description}");
+    }
+
+    #[test]
+    fn lengths_read_like_a_clock() {
+        assert_eq!(clock(206.0), "3:26");
+        assert_eq!(clock(59.6), "1:00");
+        assert_eq!(clock(3723.0), "1:02:03");
+        assert_eq!(total_time(1380.0), "23 min");
+        assert_eq!(total_time(10.0), "1 min");
+        assert_eq!(total_time(3900.0), "1 h 05 min");
+    }
+
+    /// The idle dashboard names both ways in: the wake words and `/play`.
+    #[test]
+    fn the_idle_dashboard_names_the_wake_words_and_play() {
+        let words = ["shamash".to_string(), "bot".to_string()];
+        let description = description_of(idle_dashboard(&words));
+        assert_eq!(
+            description,
+            "Say **bot** or **shamash** and a song, or use `/play`."
+        );
+        let none: [String; 0] = [];
+        assert!(description_of(idle_dashboard(&none)).contains("/play"));
     }
 
     #[test]
@@ -580,7 +769,7 @@ mod tests {
         let mut long = song();
         long.title = "x".repeat(400);
         let json =
-            serde_json::to_string(&dashboard(&long, false, 0, false).embed).expect("serialises");
+            serde_json::to_string(&dashboard(&long, false, &[], false).embed).expect("serialises");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         let title = value["title"].as_str().expect("a title");
         assert!(
@@ -616,7 +805,7 @@ mod tests {
     /// is unreachable.
     #[test]
     fn the_dashboard_offers_the_queue_and_the_queue_offers_the_way_back() {
-        let now_playing = rendered(&dashboard(&song(), false, 1, false));
+        let now_playing = rendered(&dashboard(&song(), false, &[song()], false));
         assert!(now_playing.contains("Queue"), "{now_playing}");
         assert!(!now_playing.contains("Back"), "{now_playing}");
 
@@ -630,6 +819,30 @@ mod tests {
     /// named, soonest first.
     #[test]
     fn the_queue_view_lists_every_waiting_song_in_order() {
+        let view = queue_view(&[
+            named("Rhymes Like Dimes", "MF DOOM", Some(259.0)),
+            named("All Caps", "Madvillain", Some(130.0)),
+        ]);
+        let description = description_of(view);
+        assert!(
+            description.starts_with("**2 songs · 6 min**"),
+            "{description}"
+        );
+        assert!(
+            description.contains("` 1.` **Rhymes Like Dimes** — MF DOOM · 4:19\n` 2.` **All Caps** — Madvillain · 2:10"),
+            "{description}"
+        );
+    }
+
+    /// A song of unknown length makes the total a lower bound.
+    #[test]
+    fn a_queue_with_an_unknown_length_says_over() {
+        let view = queue_view(&[named("A", "", Some(600.0)), named("B", "", None)]);
+        assert!(description_of(view).starts_with("**2 songs · over 10 min**"));
+    }
+
+    #[test]
+    fn the_queue_view_keeps_the_order_and_artist() {
         let mut second = song();
         second.title = "Second Song".to_string();
         let view = queue_view(&[song(), second]);
@@ -656,23 +869,56 @@ mod tests {
     /// so the button has to say which way it is set.
     #[test]
     fn the_repeat_button_says_whether_repeat_is_on() {
-        let off = rendered(&dashboard(&song(), false, 0, false));
+        let off = rendered(&dashboard(&song(), false, &[], false));
         assert!(off.contains("Repeat"), "{off}");
         assert!(!off.contains("Repeat: on"), "off by default: {off}");
 
-        let on = rendered(&dashboard(&song(), false, 0, true));
+        let on = rendered(&dashboard(&song(), false, &[], true));
         assert!(on.contains("Repeat: on"), "{on}");
     }
 
-    /// Discord takes at most five buttons in a row, and this row now has five.
-    /// A sixth would be dropped by the API, taking Stop with it.
+    /// Every control is still there, with Stop on a row of its own so it is
+    /// not pressed by accident, and every button has an icon.
     #[test]
-    fn the_button_row_stays_within_discords_limit() {
-        let json = serde_json::to_string(&dashboard(&song(), false, 0, false).buttons)
-            .expect("serialises");
-        let buttons = json.matches("\"type\":2").count();
-        assert!(buttons <= 5, "{buttons} buttons in one row: {json}");
-        assert_eq!(buttons, 5, "the row lost a button: {json}");
+    fn stop_has_a_row_of_its_own_and_nothing_was_lost() {
+        let value = serde_json::to_value(&dashboard(&song(), false, &[], false).buttons).unwrap();
+        let rows = value.as_array().expect("rows");
+        assert_eq!(rows.len(), 2, "{value}");
+        let ids = |row: &serde_json::Value| -> Vec<String> {
+            row["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| b["custom_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            ids(&rows[0]),
+            [
+                "shamash:pause",
+                "shamash:skip",
+                "shamash:queue",
+                "shamash:repeat"
+            ]
+        );
+        assert_eq!(ids(&rows[1]), ["shamash:stop"]);
+        for row in rows {
+            for button in row["components"].as_array().unwrap() {
+                assert!(button["emoji"]["name"].is_string(), "no icon: {button}");
+            }
+        }
+    }
+
+    /// Repeat is grey when off and green when on, the colours of a switch.
+    #[test]
+    fn the_repeat_button_is_green_when_on() {
+        let style = |repeat| {
+            serde_json::to_value(&dashboard(&song(), false, &[], repeat).buttons).unwrap()[0]
+                ["components"][3]["style"]
+                .clone()
+        };
+        assert_eq!(style(false), 2, "secondary when off");
+        assert_eq!(style(true), 3, "success when on");
     }
 
     /// A queued title can be arbitrarily long, and Discord rejects an embed
@@ -681,14 +927,15 @@ mod tests {
     fn an_over_long_queued_title_is_trimmed_rather_than_rejected() {
         let mut long = song();
         long.title = "x".repeat(400);
-        let json = serde_json::to_string(&queue_view(&[long]).embed).expect("serialises");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
-        let name = value["fields"][0]["name"].as_str().expect("a field name");
+        let mut queue = vec![long; crate::queue::MAX_QUEUE];
+        queue[0].artist = "y".repeat(400);
+        let description = description_of(queue_view(&queue));
         assert!(
-            name.chars().count() <= MAX_FIELD_NAME,
-            "field name was {} chars",
-            name.chars().count()
+            description.chars().count() <= MAX_DESCRIPTION,
+            "{} chars",
+            description.chars().count()
         );
+        assert!(!description.contains(&"x".repeat(LIST_TITLE + 1)));
     }
 
     #[test]
@@ -759,23 +1006,25 @@ mod tests {
     /// button that vanishes makes the message look broken.
     #[test]
     fn the_next_page_button_is_disabled_when_the_list_has_run_out() {
-        let more = serde_json::to_string(&ask("dracula", &offers(9), 0, 20).into_message())
-            .expect("serialises");
+        let next_disabled = |view: View| {
+            let value = serde_json::to_value(&view.buttons).unwrap();
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|row| row["components"].as_array().unwrap().clone())
+                .find(|b| b["custom_id"] == "shamash:next")
+                .map(|b| b["disabled"].as_bool().unwrap())
+                .expect("a next page button")
+        };
         assert!(
-            more.contains(
-                "\"custom_id\":\"shamash:next\",\"label\":\"Next page\",\"disabled\":false"
-            ),
-            "more results exist: {more}"
+            !next_disabled(ask("dracula", &offers(9), 0, 20)),
+            "more exist"
         );
-
         // 20 songs, 9 to a page: page three is the last, and holds two.
-        let last = serde_json::to_string(&ask("dracula", &offers(2), 2, 20).into_message())
-            .expect("serialises");
         assert!(
-            last.contains(
-                "\"custom_id\":\"shamash:next\",\"label\":\"Next page\",\"disabled\":true"
-            ),
-            "the last page disables it: {last}"
+            next_disabled(ask("dracula", &offers(2), 2, 20)),
+            "the last page"
         );
     }
 
@@ -817,6 +1066,27 @@ mod tests {
         );
         assert!(json.contains(r#""label":"1""#), "but is labelled 1: {json}");
         assert!(json.contains(r#""label":"9""#), "and the last is 9: {json}");
+    }
+
+    /// One line per song, numbered like the buttons, with what was asked for
+    /// echoed above them.
+    #[test]
+    fn the_chooser_is_one_line_per_song() {
+        let mut first = option("All Caps", "Madvillain", Some(130.0));
+        first.plays = Some(120_000_000);
+        let description = description_of(ask(
+            "all caps by mf doom",
+            &[first, option("All Caps", "Someone Else", None)],
+            0,
+            2,
+        ));
+        assert_eq!(
+            description,
+            "Results for “all caps by mf doom”\n\n\
+             `1.` **All Caps** · Madvillain \u{2022} 2:10 \u{2022} 120M plays\n\
+             `2.` **All Caps** · Someone Else\n\n\
+             Page 1 of 1"
+        );
     }
 
     /// The page count has to be the whole list's, not this page's.
