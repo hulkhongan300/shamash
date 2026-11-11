@@ -8,10 +8,10 @@
 //! Two things are stored:
 //!
 //! - **Aliases.** `normalize(transcript)` → the song it meant. An exact alias
-//!   hit skips the catalog entirely. It is written when a confidently-played
-//!   song is *kept* for ten seconds, or immediately when the listener presses a
-//!   chooser button -- a press is a stronger statement of intent than a song
-//!   that happened not to be skipped.
+//!   hit skips the catalog entirely. It is written only when a listener picks
+//!   a song from the chooser for a spoken request: a song the bot chose by
+//!   itself is never remembered, however long it plays, because putting up with
+//!   a guess is not the same as asking for it.
 //! - **History.** Every catalog song this guild has played, with a count. A
 //!   transcript that fuzzily matches one of them is resolved without a network
 //!   call too, using [`crate::matcher`] -- the same matcher that decides between
@@ -41,12 +41,11 @@ pub const MAX_ALIASES: usize = 2_000;
 /// How many history rows are kept, across every guild.
 pub const MAX_HISTORY: usize = 5_000;
 
-/// How long a song has to keep playing before the request that queued it is
-/// believed.
+/// How long a remembered song has to play before a skip no longer counts
+/// against the phrase that recalled it.
 ///
 /// Ten seconds is past the point where anyone skips by accident and well before
-/// a song anyone wanted has finished. Learning from a song that was skipped in
-/// two seconds is how a library learns the wrong thing.
+/// a song anyone wanted has finished.
 pub const KEPT_SECS: u64 = 10;
 
 /// How many times a song has to be skipped that fast before the alias is
@@ -461,6 +460,24 @@ mod tests {
 
     fn path_of(dir: &Path) -> PathBuf {
         dir.join("library.json")
+    }
+
+    /// The case from the request: "All Caps by MF DOOM" is credited to
+    /// Madvillain, the listener picks it from the list, and the same words play
+    /// it next time, after a restart too. The artist that was said never has to
+    /// match the one that is stored.
+    #[test]
+    fn a_pick_is_recalled_even_when_the_artist_said_is_another() {
+        let (dir, library) = scratch("pick-other-artist");
+        let mut picked = track("Madvillain", "All Caps");
+        picked.video_id = Some("playedvideo".to_string());
+        library.remember(1, "All Caps by MF DOOM", &picked, true);
+        library.save();
+
+        let reopened = Library::load(Some(&path_of(&dir)));
+        assert_eq!(reopened.recall("all caps by mf doom!"), Some(picked));
+        assert_eq!(reopened.recall("all caps by madvillain"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The whole point: the same misheard phrase costs one lookup the first

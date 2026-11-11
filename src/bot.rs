@@ -185,7 +185,10 @@ impl EventHandler for Handler {
                 ctx.data
                     .write()
                     .await
-                    .insert::<PlayerKey>(Arc::new(Player::new(manager, Arc::new(catalog))));
+                    .insert::<PlayerKey>(Arc::new(player_with_memory(
+                        Player::new(manager, Arc::new(catalog)),
+                        &config,
+                    )));
             }
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "could not reach the song catalog, playback is disabled")
@@ -854,6 +857,20 @@ fn format_autocomplete_name(track: &resolve::CatalogTrack) -> String {
         name = name.chars().take(97).collect::<String>() + "...";
     }
     name
+}
+
+/// Gives the player its song memory, read from `LIBRARY_PATH`.
+///
+/// With the memory, a song picked from the "Which one?" list is played straight
+/// away the next time the same words are said.
+fn player_with_memory(mut player: Player, config: &Config) -> Player {
+    match config.library_path.as_deref() {
+        Some(path) => {
+            player.library = Some(Arc::new(crate::library::Library::load(Some(path))));
+        }
+        None => tracing::info!("LIBRARY_PATH is off; picked songs are not remembered"),
+    }
+    player
 }
 
 #[cfg(test)]

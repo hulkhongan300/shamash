@@ -29,6 +29,11 @@ leaves the host.
   song catalog, which supplies the real title, artist, running time and the
   video the song is on. So the artist's own upload beats a remix, a lyric video
   or someone else's re-upload. If it is not sure, it asks instead of guessing.
+- **Remembers your answer.** When it asks "Which one?" about a spoken
+  request and you pick a song, the same words play that song straight away
+  next time, even when the artist you said is not the one credited ("All Caps
+  by MF DOOM" → Madvillain). Only your picks are remembered, never the bot's own
+  guesses. A remembered song skipped within 10 seconds twice is forgotten.
 - **`/play` with live suggestions.** Start typing and matching songs from
   YouTube Music appear. Pick one and that exact song is queued.
 - **`/lock` and `/unlock`.** Turn listening off without removing the bot.
@@ -304,6 +309,7 @@ the bot at startup instead of silently falling back to a default.
 | `UNVERIFIED_CHOOSER` | `true` | When no catalog knows the song, offer the YouTube results as a choice. With `false`, the bot only plays the miss tone |
 | `LLM_ENDPOINT` | unset | An Ollama-compatible endpoint that rewrites misheard transcripts. See [The rewrite stage](#the-rewrite-stage) |
 | `LLM_MODEL` | `llama3.2` | The model to use at that endpoint |
+| `LIBRARY_PATH` | `data/library.json` | Where picked songs are remembered (Docker: `/data/library.json`, in the volume). `off` remembers nothing |
 
 ### The two models
 

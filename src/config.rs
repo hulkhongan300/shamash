@@ -184,6 +184,28 @@ pub struct Config {
     /// mishearing, so this has to earn its place before it is switched on.
     pub llm_endpoint: Option<String>,
     pub llm_model: String,
+    /// Where the song memory is kept: what a spoken request meant, as picked
+    /// from the chooser. `LIBRARY_PATH`; `off` keeps nothing.
+    pub library_path: Option<std::path::PathBuf>,
+}
+
+/// Where the song memory is kept unless `LIBRARY_PATH` says otherwise. The
+/// image sets it to `/data/library.json`, inside the volume.
+pub const DEFAULT_LIBRARY_PATH: &str = "data/library.json";
+
+/// Reads `LIBRARY_PATH`: unset is the default, `off` (or `none`, `0`, `false`)
+/// keeps no memory.
+fn library_path(value: Option<String>) -> Option<std::path::PathBuf> {
+    match value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        Some(off) if ["off", "none", "0", "false"].contains(&off.to_ascii_lowercase().as_str()) => {
+            None
+        }
+        Some(path) => Some(path.into()),
+        None => Some(DEFAULT_LIBRARY_PATH.into()),
+    }
 }
 
 impl Config {
@@ -256,6 +278,7 @@ impl Config {
                 .map(|m| m.trim().to_string())
                 .filter(|m| !m.is_empty())
                 .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string()),
+            library_path: library_path(std::env::var("LIBRARY_PATH").ok()),
         })
     }
 }
@@ -326,6 +349,22 @@ fn split_csv(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_song_memory_path_defaults_and_can_be_switched_off() {
+        assert_eq!(library_path(None), Some(DEFAULT_LIBRARY_PATH.into()));
+        assert_eq!(
+            library_path(Some("  ".into())),
+            Some(DEFAULT_LIBRARY_PATH.into())
+        );
+        assert_eq!(
+            library_path(Some("/data/library.json".into())),
+            Some("/data/library.json".into())
+        );
+        for off in ["off", "OFF", "none", "0", "false"] {
+            assert_eq!(library_path(Some(off.into())), None, "{off}");
+        }
+    }
 
     #[test]
     fn parses_csv_wake_words() {

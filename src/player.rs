@@ -549,9 +549,29 @@ struct Pending {
     said: String,
     /// What it turned out to mean.
     track: crate::library::Track,
-    /// Whether a chooser button chose it, rather than a spoken request that
-    /// resolved on its own.
-    from_chooser: bool,
+}
+
+/// What a chooser pick is remembered as: the catalog song when the pick was
+/// one, otherwise the upload itself, with the video that was played either way.
+fn picked_track(
+    song: Option<&resolve::CatalogTrack>,
+    candidate: &search::Candidate,
+) -> Option<crate::library::Track> {
+    let video_id = candidate.video_id().map(str::to_string);
+    Some(match song {
+        Some(song) => crate::library::Track {
+            artist: song.artist.clone(),
+            title: song.title.clone(),
+            duration_secs: song.duration_secs,
+            video_id,
+        },
+        None => crate::library::Track {
+            artist: candidate.channel.clone().unwrap_or_default(),
+            title: candidate.title.clone().filter(|t| !t.trim().is_empty())?,
+            duration_secs: candidate.duration,
+            video_id,
+        },
+    })
 }
 
 /// The songs waiting to be judged, by video URL.
@@ -1057,7 +1077,6 @@ impl Player {
                     // to it.
                     video_id: best.candidate.video_id().map(str::to_string),
                 },
-                from_chooser: false,
             },
         );
         let song = self
@@ -1270,11 +1289,11 @@ impl Player {
 
     /// Decides what a finished song says about the request that queued it.
     ///
-    /// Kept for [`crate::library::KEPT_SECS`], the request is believed and
-    /// remembered. Skipped sooner than that, it is feedback against the phrase
-    /// that asked for it -- twice, and the phrase is forgotten. A song queued by
-    /// pressing a chooser button was already believed when the button was
-    /// pressed, so it is remembered either way.
+    /// Only a pick from the chooser teaches the memory (see
+    /// [`Self::remember_pick`]); a song the bot chose by itself is never
+    /// remembered, however long it plays. What a finished song can still do is
+    /// count against a remembered phrase: skipped within
+    /// [`crate::library::KEPT_SECS`], twice, and the phrase is forgotten.
     fn learn_from_stopped(&self, guild_id: GuildId, stopped: Option<&Queued>) {
         let (Some(stopped), Some(library)) = (stopped, self.library.as_deref()) else {
             return;
@@ -1287,28 +1306,38 @@ impl Player {
             .started_at
             .take(guild_id)
             .map_or(Duration::ZERO, |since| since.elapsed());
-        if played_for >= Duration::from_secs(crate::library::KEPT_SECS) {
-            tracing::info!(
-                guild_id = %guild_id,
-                said = %pending.said,
-                track = %stopped.title,
-                played_for_s = played_for.as_secs(),
-                "remembering what that request meant"
-            );
-            library.remember(
-                guild_id.get(),
-                &pending.said,
-                &pending.track,
-                pending.from_chooser,
-            );
-        } else if pending.from_chooser {
-            // The listener chose this by pressing it, so a quick skip is them
-            // changing their mind rather than the bot having guessed wrong.
-            library.remember(guild_id.get(), &pending.said, &pending.track, true);
-        } else {
+        if played_for < Duration::from_secs(crate::library::KEPT_SECS) {
             library.quick_skip(&pending.said, &pending.track);
+            library.maybe_save();
         }
-        library.maybe_save();
+    }
+
+    /// Remembers that `said` meant the song just picked from the chooser, so the
+    /// same words play it straight away next time.
+    ///
+    /// Saved at once rather than debounced: picks are rare, and an update that
+    /// restarts the bot a minute later must not lose one.
+    fn remember_pick(
+        &self,
+        guild_id: GuildId,
+        said: &str,
+        song: Option<&resolve::CatalogTrack>,
+        candidate: &search::Candidate,
+    ) {
+        let Some(library) = self.library.as_deref() else {
+            return;
+        };
+        let Some(track) = picked_track(song, candidate) else {
+            return;
+        };
+        tracing::info!(
+            guild_id = %guild_id,
+            said = %said,
+            track = %track.label(),
+            "remembering the song picked for that request"
+        );
+        library.remember(guild_id.get(), said, &track, true);
+        library.save();
     }
 
     /// Starts the next queued song once this one finishes on its own.
@@ -1620,7 +1649,10 @@ impl Player {
             .cloned()
             .with_context(|| "that song is not in the search")?;
         self.asks.clear(guild_id);
-        self.play_offer(ctx, config, guild_id, offer).await
+        // A spoken request's pick is remembered for those words. A typed
+        // `/play` search is not, yet.
+        let said = matches!(ask.owner, Owner::Voice).then_some(ask.query.as_str());
+        self.play_offer(ctx, config, guild_id, offer, said).await
     }
 
     /// Whether the outstanding question came from speech rather than `/play`.
@@ -1670,11 +1702,12 @@ impl Player {
         config: &Config,
         guild_id: GuildId,
         offer: Offer,
+        said: Option<&str>,
     ) -> anyhow::Result<()> {
         // Pressing a button is a request of its own, with its own summary line.
         let timing = Timing::default();
         let _ = self
-            .play_offer_inner(ctx, config, guild_id, offer, &timing)
+            .play_offer_inner(ctx, config, guild_id, offer, said, &timing)
             .await?;
         timing.log("/play offer");
         Ok(())
@@ -1686,18 +1719,19 @@ impl Player {
         config: &Config,
         guild_id: GuildId,
         offer: Offer,
+        said: Option<&str>,
         timing: &Timing,
     ) -> anyhow::Result<(String, bool)> {
         // The user has already chosen the song by pressing this button or
         // selecting from autocomplete, so the best upload of it is taken even
         // when the upload's own score is modest. The hard part -- deciding
         // which song it is -- was answered by the catalog and by them.
-        let candidate = match offer {
-            Offer::Video(candidate) => candidate,
+        let (candidate, song_track) = match offer {
+            Offer::Video(candidate) => (candidate, None),
             Offer::Song { track, requested } => {
                 let resolved = search::Resolved::Track {
                     durations: track.duration_secs.into_iter().collect(),
-                    track,
+                    track: track.clone(),
                 };
                 let choice = search::find_video(
                     &resolved,
@@ -1709,10 +1743,11 @@ impl Player {
                 )
                 .await
                 .with_context(|| "could not find that song on YouTube")?;
-                choice
+                let candidate = choice
                     .best()
                     .map(|scored| scored.candidate.clone())
-                    .context("YouTube returned nothing for that song")?
+                    .context("YouTube returned nothing for that song")?;
+                (candidate, Some(track))
             }
         };
 
@@ -1731,6 +1766,9 @@ impl Player {
             )
             .await
             .context("could not download that song")?;
+        if let Some(said) = said {
+            self.remember_pick(guild_id, said, song_track.as_ref(), &candidate);
+        }
         let label = format!("{} — {}", song.artist, song.title);
         let outcome = self
             .outcome(
@@ -1912,7 +1950,14 @@ impl Player {
         };
         let timing = Timing::default();
         let played = self
-            .play_offer_inner(ctx, config, guild_id, Offer::Video(candidate), &timing)
+            .play_offer_inner(
+                ctx,
+                config,
+                guild_id,
+                Offer::Video(candidate),
+                None,
+                &timing,
+            )
             .await;
         timing.log("/play playlist track");
         played
@@ -1952,7 +1997,7 @@ impl Player {
 
         let timing = Timing::default();
         let res = self
-            .play_offer_inner(ctx, config, guild_id, offer, &timing)
+            .play_offer_inner(ctx, config, guild_id, offer, None, &timing)
             .await;
         timing.log("/play direct");
         res
@@ -2560,6 +2605,56 @@ mod tests {
             drop(guard);
             Ok(queued(found.title()))
         }
+    }
+
+    fn upload(title: Option<&str>, channel: Option<&str>, id: &str) -> search::Candidate {
+        search::Candidate {
+            title: title.map(str::to_string),
+            url: format!("https://www.youtube.com/watch?v={id}"),
+            view_count: None,
+            duration: Some(130.0),
+            channel: channel.map(str::to_string),
+            id: Some(id.to_string()),
+        }
+    }
+
+    /// A picked catalog song is remembered under the catalog's names, with the
+    /// video that was actually played.
+    #[test]
+    fn a_picked_song_is_remembered_with_the_played_video() {
+        let song = resolve::CatalogTrack {
+            artist: "Madvillain".to_string(),
+            title: "All Caps".to_string(),
+            duration_secs: Some(130.0),
+            popularity: None,
+            video_id: Some("catalogsown".to_string()),
+        };
+        let track = picked_track(
+            Some(&song),
+            &upload(Some("ALL CAPS"), Some("Stones Throw"), "playedvideo"),
+        )
+        .expect("remembered");
+        assert_eq!(track.label(), "Madvillain — All Caps");
+        assert_eq!(track.video_id.as_deref(), Some("playedvideo"));
+    }
+
+    /// A picked upload with no catalog song behind it is remembered as the
+    /// upload; one without a title has nothing to remember it by.
+    #[test]
+    fn a_picked_upload_is_remembered_as_the_upload() {
+        let track = picked_track(
+            None,
+            &upload(
+                Some("Madvillain - All Caps"),
+                Some("Stones Throw"),
+                "playedvideo",
+            ),
+        )
+        .expect("remembered");
+        assert_eq!(track.artist, "Stones Throw");
+        assert_eq!(track.title, "Madvillain - All Caps");
+        assert_eq!(track.video_id.as_deref(), Some("playedvideo"));
+        assert_eq!(picked_track(None, &upload(None, None, "playedvideo")), None);
     }
 
     /// A song already in hand, as `commit` receives one.
