@@ -33,6 +33,14 @@ pub const ACTION_BACK: &str = "back";
 /// Turns repeat-one on or off.
 pub const ACTION_REPEAT: &str = "repeat";
 
+/// Says a remembered song was the wrong one: forgets the phrase, skips the
+/// song and asks "Which one?" again. Only shown on a song the memory chose.
+pub const ACTION_WRONG: &str = "wrong";
+
+/// What the dashboard says under a song the song memory chose, so nobody
+/// wonders why the bot did not ask.
+pub const REMEMBERED_NOTE: &str = "🧠 remembered from last time";
+
 /// Shows the next page of a `/play` search.
 pub const ACTION_NEXT: &str = "next";
 
@@ -71,7 +79,7 @@ pub fn action_from_id(custom_id: &str) -> Option<&str> {
     let action = custom_id.strip_prefix(&format!("{PREFIX}:"))?;
     match action {
         ACTION_PAUSE | ACTION_RESUME | ACTION_SKIP | ACTION_STOP | ACTION_QUEUE | ACTION_BACK
-        | ACTION_REPEAT | ACTION_NEXT | ACTION_NOTHING => Some(action),
+        | ACTION_REPEAT | ACTION_WRONG | ACTION_NEXT | ACTION_NOTHING => Some(action),
         _ => None,
     }
 }
@@ -262,6 +270,9 @@ pub fn dashboard(
             lines.push(about.join(" · "));
         }
     }
+    if song.remembered.is_some() {
+        lines.push(REMEMBERED_NOTE.to_string());
+    }
     if repeat {
         lines.push("🔂 Repeating this song".to_string());
     }
@@ -309,7 +320,14 @@ pub fn dashboard(
                 ),
             ]),
             // A row of its own, so it is not pressed by a thumb aiming at Repeat.
-            CreateActionRow::Buttons(vec![button(ACTION_STOP, "Stop", "⏹️", ButtonStyle::Danger)]),
+            CreateActionRow::Buttons(
+                song.remembered
+                    .is_some()
+                    .then(|| button(ACTION_WRONG, "Wrong song", "🙅", ButtonStyle::Secondary))
+                    .into_iter()
+                    .chain([button(ACTION_STOP, "Stop", "⏹️", ButtonStyle::Danger)])
+                    .collect(),
+            ),
         ],
     }
 }
@@ -577,6 +595,7 @@ mod tests {
             video_id: "abc".to_string(),
             duration_secs: Some(206.0),
             origin: Origin::Voice,
+            remembered: None,
         }
     }
 
@@ -674,6 +693,7 @@ mod tests {
             ACTION_QUEUE,
             ACTION_BACK,
             ACTION_REPEAT,
+            ACTION_WRONG,
         ] {
             let id = button_id(action);
             assert_eq!(action_from_id(&id), Some(action));
@@ -753,6 +773,26 @@ mod tests {
         assert!(many.contains("Rhymes Like Dimes"), "{many}");
         assert!(many.contains("+2 more"), "{many}");
         assert!(many.contains("Queue (3)"), "{many}");
+    }
+
+    /// A song the memory chose says so and offers the way to correct it; one
+    /// that was looked up has nothing to correct, so it offers neither.
+    #[test]
+    fn a_remembered_song_says_so_and_offers_wrong_song() {
+        let looked_up = rendered(&dashboard(&song(), None, false, &[], false));
+        assert!(!looked_up.contains(REMEMBERED_NOTE), "{looked_up}");
+        assert!(!looked_up.contains("Wrong song"), "{looked_up}");
+
+        let mut recalled = song();
+        recalled.remembered = Some("all caps by mf doom".to_string());
+        let view = dashboard(&recalled, None, false, &[], false);
+        let json = rendered(&view);
+        assert!(json.contains("Wrong song"), "{json}");
+        assert!(json.contains(&button_id(ACTION_WRONG)), "{json}");
+        assert_eq!(
+            description_of(view),
+            format!("3:26 · 🎤 asked by voice\n{REMEMBERED_NOTE}")
+        );
     }
 
     /// The length and how the song was asked for are shown under the title.

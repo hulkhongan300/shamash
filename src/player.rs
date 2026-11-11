@@ -241,6 +241,8 @@ impl AudioFetcher for YtDlpFetch {
             duration_secs: found.duration.filter(|d| *d > 0.0),
             // The caller says otherwise when it was not a spoken request.
             origin: crate::queue::Origin::Voice,
+            // The caller says so when the song memory chose it.
+            remembered: None,
         })
     }
 }
@@ -629,6 +631,43 @@ fn put_first(tracks: &mut Vec<resolve::CatalogTrack>, song: resolve::CatalogTrac
         None => song,
     };
     tracks.insert(0, song);
+}
+
+/// Typed or remembered words as a request, read the way a spoken one is, so
+/// "dracula by tame impala" searches the catalog as if it had been said.
+fn request_for(words: &str) -> PlayRequest {
+    PlayRequest {
+        query: words.to_string(),
+        title: None,
+        artist: None,
+        splits: crate::parser::readings(words)
+            .into_iter()
+            .filter_map(|(title, artist)| Some((title?, artist?)))
+            .collect(),
+    }
+}
+
+/// The songs to offer again after the memory picked `wrong` for those words:
+/// all of them but that one. The wrong song stays when it is the only one,
+/// because a single choice is still a question and an empty one is not.
+fn without_wrong(
+    tracks: Vec<resolve::CatalogTrack>,
+    wrong: Option<&crate::library::Track>,
+) -> Vec<resolve::CatalogTrack> {
+    let Some(wrong) = wrong else {
+        return tracks;
+    };
+    let is_wrong = |track: &resolve::CatalogTrack| {
+        crate::matcher::normalize(&track.artist) == crate::matcher::normalize(&wrong.artist)
+            && crate::matcher::normalize(&track.title) == crate::matcher::normalize(&wrong.title)
+    };
+    if tracks.iter().all(is_wrong) {
+        return tracks;
+    }
+    tracks
+        .into_iter()
+        .filter(|track| !is_wrong(track))
+        .collect()
 }
 
 /// The songs waiting to be judged, by video URL.
@@ -1134,15 +1173,27 @@ impl Player {
         // lands while this request waits its turn still counts against it.
         let (_serialised, started_at) = self.coordination.begin(guild_id).await;
 
-        let resolved = search::resolve_request(
-            request,
-            &self.catalog,
-            rewrite,
-            self.library.as_deref(),
-            guild_id,
-            timing,
-        )
-        .await;
+        // A phrase the song memory was taught plays what it was taught, and the
+        // song says so on the dashboard, with the button that untaught it.
+        let remembered = self
+            .library
+            .as_deref()
+            .and_then(|library| search::remembered(library, &request.query));
+        let recalled = remembered.is_some();
+        let resolved = match remembered {
+            Some(resolved) => resolved,
+            None => {
+                search::resolve_request(
+                    request,
+                    &self.catalog,
+                    rewrite,
+                    self.library.as_deref(),
+                    guild_id,
+                    timing,
+                )
+                .await
+            }
+        };
         if matches!(resolved, search::Resolved::Unknown) {
             return Ok(Outcome::Unknown);
         }
@@ -1200,11 +1251,12 @@ impl Player {
                 },
             },
         );
-        let song = self
+        let mut song = self
             .fetch
             .fetch(guild_id, &best.candidate, &queue.in_use(), timing)
             .await
             .map_err(|e| Failure::new(Problem::FetchFailed, e))?;
+        song.remembered = recalled.then(|| request.query.clone());
         Ok(self
             .outcome(guild_id, &queue, song, started_at, timing)
             .await)
@@ -1368,6 +1420,89 @@ impl Player {
         self.tracks.take(guild_id);
         self.queues.get(guild_id).clear();
         self.draw_dashboard(ctx, config, guild_id).await;
+    }
+
+    /// The Wrong song button: forgets the phrase that recalled the song now
+    /// playing, skips it, and asks "Which one?" again for the same words, so
+    /// the right pick is learned in its place.
+    ///
+    /// Returns false when the song playing was not chosen by the song memory,
+    /// which is a press on a dashboard that has since moved on.
+    pub async fn wrong_song(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+    ) -> bool {
+        let (said, forgotten) = {
+            // Checked and skipped under the lock Skip takes, so a song ending
+            // at the same moment cannot make this skip the one after it.
+            let lock = self.coordination.busy(guild_id);
+            let _guard = lock.lock().await;
+            let Some(song) = self.queues.get(guild_id).current() else {
+                return false;
+            };
+            let Some(said) = song.remembered.clone() else {
+                return false;
+            };
+            let forgotten = self.library.as_deref().and_then(|library| {
+                let forgotten = library.forget(&said);
+                library.save();
+                forgotten
+            });
+            // Already judged, by the listener: the skip below must not also
+            // count as a quick one.
+            self.pending.take(&song.url);
+            tracing::info!(guild_id = %guild_id, said = %said, "wrong song; asking again");
+            self.start_next(ctx, config, guild_id, &Timing::default())
+                .await;
+            (said, forgotten)
+        };
+        self.ask_again(ctx, config, guild_id, &said, forgotten.as_ref())
+            .await;
+        true
+    }
+
+    /// Puts the "Which one?" chooser up again for words the memory got wrong.
+    ///
+    /// The same question a spoken request raises, owned by the voice channel, so
+    /// the pick is remembered for those words. The song it got wrong is left
+    /// out, unless it is all the catalog has.
+    async fn ask_again(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        said: &str,
+        wrong: Option<&crate::library::Track>,
+    ) {
+        let request = request_for(said);
+        let timing = Timing::default();
+        let tracks: Vec<resolve::CatalogTrack> = timing
+            .stage(
+                "catalog.hits",
+                self.catalog.hits(&resolve::Target::from_request(&request)),
+            )
+            .await
+            .iter()
+            .map(|hit| hit.to_track())
+            .collect();
+        let tracks = without_wrong(tracks, wrong);
+        if tracks.is_empty() {
+            if config.unverified_chooser {
+                self.offer_unverified(ctx, config, guild_id, &request, &timing)
+                    .await;
+            } else {
+                let failure = Failure::new(
+                    Problem::NoMatch,
+                    anyhow::anyhow!("nothing in the catalog matched '{said}'"),
+                );
+                self.report(ctx, config, guild_id, said, &failure).await;
+            }
+            return;
+        }
+        self.offer_songs(ctx, config, guild_id, &request, &tracks)
+            .await;
     }
 
     /// Moves the queue on by one song and plays it.
@@ -1614,15 +1749,7 @@ impl Player {
         // Typed words go through the same reading logic a spoken request does, so
         // "dracula by tame impala" searches the catalog the way it would have
         // if it had been said rather than typed.
-        let request = PlayRequest {
-            query: query.to_string(),
-            title: None,
-            artist: None,
-            splits: crate::parser::readings(query)
-                .into_iter()
-                .filter_map(|(title, artist)| Some((title?, artist?)))
-                .collect(),
-        };
+        let request = request_for(query);
         let mut tracks: Vec<resolve::CatalogTrack> = timing
             .stage(
                 "catalog.hits",
@@ -1921,15 +2048,7 @@ impl Player {
 
     /// Autocomplete candidates for a slash command query.
     pub async fn autocomplete(&self, query: &str) -> Vec<resolve::CatalogTrack> {
-        let request = PlayRequest {
-            query: query.to_string(),
-            title: None,
-            artist: None,
-            splits: crate::parser::readings(query)
-                .into_iter()
-                .filter_map(|(title, artist)| Some((title?, artist?)))
-                .collect(),
-        };
+        let request = request_for(query);
         let target = resolve::Target::from_request(&request);
         let hits = self.catalog.hits(&target).await;
         let mut tracks = Vec::new();
@@ -2955,6 +3074,45 @@ mod tests {
         assert_eq!(empty.len(), 1);
     }
 
+    /// Asking again after a wrong song leaves that song out, matched by name
+    /// rather than by exact spelling.
+    #[test]
+    fn asking_again_leaves_out_the_wrong_song() {
+        let wrong = crate::library::Track {
+            artist: "MF DOOM".to_string(),
+            title: "All Caps".to_string(),
+            duration_secs: Some(130.0),
+            video_id: Some("wrongvideo".to_string()),
+        };
+        let offered = without_wrong(
+            vec![
+                catalog("MF Doom", "All Caps!", None),
+                catalog("Madvillain", "All Caps", None),
+            ],
+            Some(&wrong),
+        );
+        assert_eq!(offered, vec![catalog("Madvillain", "All Caps", None)]);
+    }
+
+    /// The wrong song is still offered when the catalog has nothing else, and
+    /// nothing is left out when there is no remembered song to leave out.
+    #[test]
+    fn asking_again_never_leaves_an_empty_question() {
+        let wrong = crate::library::Track {
+            artist: "MF DOOM".to_string(),
+            title: "All Caps".to_string(),
+            duration_secs: None,
+            video_id: None,
+        };
+        let only = vec![catalog("MF DOOM", "All Caps", None)];
+        assert_eq!(without_wrong(only.clone(), Some(&wrong)), only);
+        let both = vec![
+            catalog("MF DOOM", "All Caps", None),
+            catalog("Madvillain", "All Caps", None),
+        ];
+        assert_eq!(without_wrong(both.clone(), None), both);
+    }
+
     /// A song already in hand, as `commit` receives one.
     fn queued(title: &str) -> Queued {
         Queued {
@@ -2965,6 +3123,7 @@ mod tests {
             video_id: "only".to_string(),
             duration_secs: None,
             origin: crate::queue::Origin::Voice,
+            remembered: None,
         }
     }
 

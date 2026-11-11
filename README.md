@@ -38,6 +38,9 @@ leaves the host.
   about as close to two remembered songs, or one with a different number in it,
   is asked about again. Only your picks are remembered, never the bot's own
   guesses. A remembered song skipped within 10 seconds twice is forgotten.
+  The dashboard marks such a song "🧠 remembered from last time" and shows a
+  **Wrong song** button, which forgets those words, skips the song and asks
+  "Which one?" again so the right pick is learned.
   Picks from a typed `/play` search count too, and typed and spoken words are
   remembered as one: teach it by typing and saying the words plays the song,
   and a typed search for words it already knows lists that song first. Links
@@ -258,6 +261,7 @@ progress bar (`▬▬▬▬🔘▬▬▬▬▬▬▬ 1:12 / 3:26`) and these but
 | Skip | Starts the next song in the queue |
 | Queue | Shows what is waiting, soonest first, with a **Back** button |
 | Repeat | Replays the current song when it ends with nothing queued after it |
+| Wrong song | Only on a song played because it was remembered: forgets those words, skips the song and asks "Which one?" again |
 | Stop | Stops playback and clears the queue |
 
 A song asked for while another is playing waits in the queue, which holds up to
@@ -580,7 +584,7 @@ they mean the bot has stopped hearing.
 | --- | --- |
 | No tone at all | Listening is locked (`/unlock`), or the wake word is not recognised. Check the debug log for what the wake model heard, and adjust `WAKE_WORDS` |
 | A tone, then nothing plays | Look in the text channel: there is either a chooser or a message saying what was heard |
-| The wrong song plays | Name the artist. Check `RUST_LOG=shamash=debug` for the scores |
+| The wrong song plays | Press **Wrong song** if the dashboard says it was remembered. Otherwise name the artist, and check `RUST_LOG=shamash=debug` for the scores |
 | The first request after startup is slow | The request model loads on the first wake word. Later requests are fast |
 | Requests take many seconds | The model is running on the CPU. Check the `backend=` in the startup log |
 | `/play` suggestions do not appear | Restart the bot so it re-registers the command, then reload Discord |

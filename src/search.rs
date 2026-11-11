@@ -791,6 +791,10 @@ pub fn popular_beats_a_rival(winner: &CatalogTrack, rivals: &[CatalogTrack]) -> 
 /// wins, but the rewrite can only ever *propose* a transcript: it is scored
 /// against the same catalog hits by the same matcher, so it cannot bypass
 /// verification.
+///
+/// An exact phrase the song memory knows is not looked up here: the caller
+/// asks [`remembered`] first, because a remembered song is shown as one.
+/// `library` only lends this the guild's play history.
 pub async fn resolve_request(
     request: &PlayRequest,
     catalog: &resolve::Catalog,
@@ -800,16 +804,6 @@ pub async fn resolve_request(
     timing: &crate::timing::Timing,
 ) -> Resolved {
     let heard = request.query.clone();
-
-    // An exact alias hit skips the catalog entirely: the same misheard phrase
-    // cost the same lookup every time it was heard, and this is what stops it.
-    if let Some(track) = library.and_then(|library| library.recall(&heard)) {
-        tracing::info!(said = %heard, track = %track.label(), "recalled from the song library");
-        return Resolved::Track {
-            track: track.to_catalog_track(),
-            durations: track.duration_secs.into_iter().collect(),
-        };
-    }
 
     // The target carries every reading of the phrase, which is what the query
     // plan is built from; the caller keeps the request for its own text.
@@ -866,6 +860,19 @@ pub async fn resolve_request(
         }
     }
     decide(&verdict)
+}
+
+/// The song this exact phrase was taught to mean, as a resolved song.
+///
+/// An alias hit skips the catalog entirely: the same misheard phrase cost the
+/// same lookup every time it was heard, and this is what stops it.
+pub fn remembered(library: &library::Library, heard: &str) -> Option<Resolved> {
+    let track = library.recall(heard)?;
+    tracing::info!(said = %heard, track = %track.label(), "recalled from the song library");
+    Some(Resolved::Track {
+        track: track.to_catalog_track(),
+        durations: track.duration_secs.into_iter().collect(),
+    })
 }
 
 /// Runs the rewrite as a second request and returns its hits.
