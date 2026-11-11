@@ -25,11 +25,13 @@ jobs:
       # 2026-11-11). `transcribe-cpp` is built with its `vulkan` feature, and
       # ggml's Vulkan backend compiles compute shaders at build time, so it
       # needs the Vulkan headers, `glslc` and the SPIR-V headers. Bump
-      # `version` to refresh the cached packages.
+      # `version` to refresh the cached packages. The runtime libraries are
+      # listed too: the cache does not follow dependencies, and without them the
+      # link fails with "unable to find library -lopus".
       - uses: awalsh128/cache-apt-pkgs-action@v1.6.3
         with:
-          packages: pkg-config libopus-dev libvulkan-dev glslc spirv-headers
-          version: 1
+          packages: pkg-config libopus0 libopus-dev libvulkan1 libvulkan-dev glslc spirv-headers
+          version: 2
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
