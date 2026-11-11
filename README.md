@@ -47,8 +47,9 @@ leaves the host.
   and leaves. That works even if someone dragged it into another channel.
 - **A queue and a dashboard.** A now-playing message in the text channel shows
   the song with a progress bar, how it was asked for and what plays next, with
-  Pause, Skip, Queue, Repeat and Stop buttons (Stop on its own row, so it is
-  not hit by accident). It turns grey while paused. It is edited in place, so the
+  Pause, Skip, Queue (where waiting songs can be reordered or removed), Repeat
+  and Stop buttons (Stop on its own row, so it is not hit by accident). It
+  turns grey while paused. It is edited in place, so the
   channel does not fill up.
 - **Fast playback.** Songs stream from YouTube while they are cached, and a
   song asked for again plays from the cache.
@@ -252,7 +253,7 @@ progress bar (`▬▬▬▬🔘▬▬▬▬▬▬▬ 1:12 / 3:26`) and these but
 | --- | --- |
 | Pause / Resume | Pauses or carries on with the current song |
 | Skip | Starts the next song in the queue |
-| Queue | Shows what is waiting, soonest first, with a **Back** button |
+| Queue | Shows what is waiting, soonest first, where songs can be moved or removed, with a **Back** button |
 | Repeat | Replays the current song when it ends with nothing queued after it |
 | Stop | Stops playback and clears the queue |
 
@@ -264,6 +265,13 @@ Discord messages do not update by themselves, so while a song plays the bot
 edits the message every 15 seconds to move the bar along. Pausing freezes the
 bar, and the edits stop while paused, while the queue is shown, and when
 nothing is playing. A song whose length is unknown shows no bar.
+
+In the queue view, pick a song from the menu, then press **Play next**, **Up**,
+**Down** or **Remove**. The song stays picked after a move, so pressing **Up**
+again keeps moving it. The view updates in place while the queue plays on, and
+a button always acts on the song that was picked: if that song has started
+playing or was removed in the meantime, the press does nothing. The song
+playing now is not in the queue view; **Skip** is for that.
 
 Only members currently in the bot's voice channel can press these buttons.
 Everyone else gets a private "join the voice channel first" and nothing happens.

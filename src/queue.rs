@@ -103,11 +103,37 @@ impl Queued {
     }
 }
 
+/// A song waiting to play, with the number that names it while it waits.
+///
+/// Positions shift whenever a song finishes or is added, so a change picked
+/// from the queue view names the song by this number instead: a remove or a
+/// move then acts on the song that was picked, never on whatever has since
+/// slid into its place.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Waiting {
+    /// Unique within one guild's queue, and never reused.
+    pub id: u64,
+    pub song: Queued,
+}
+
+/// Where a waiting song is moved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shift {
+    /// One place sooner.
+    Up,
+    /// One place later.
+    Down,
+    /// To the front, so it plays next.
+    Front,
+}
+
 /// One guild's queue, plus whether the current song is paused.
 #[derive(Debug, Default)]
 struct State {
     /// Not yet played, oldest first.
-    pending: VecDeque<Queued>,
+    pending: VecDeque<Waiting>,
+    /// The id the next song to join `pending` gets.
+    next_id: u64,
     /// The song currently playing, if any.
     current: Option<Queued>,
     /// Whether the current song is paused rather than playing.
@@ -134,7 +160,26 @@ fn requeue_if_repeating(state: &mut State, stopped: &Option<Queued>) {
         && state.pending.is_empty()
         && let Some(song) = stopped
     {
-        state.pending.push_back(song.clone());
+        state.enqueue(song.clone());
+    }
+}
+
+impl State {
+    /// Adds a song to the end of the waiting list under a fresh id.
+    fn enqueue(&mut self, song: Queued) {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.push_back(Waiting { id, song });
+    }
+
+    /// Makes the next waiting song the current one.
+    fn take_next(&mut self) {
+        self.current = self.pending.pop_front().map(|waiting| waiting.song);
+    }
+
+    /// Where the waiting song with this id is now, if it is still waiting.
+    fn position(&self, id: u64) -> Option<usize> {
+        self.pending.iter().position(|waiting| waiting.id == id)
     }
 }
 
@@ -174,7 +219,7 @@ impl Queue {
         if state.pending.len() >= MAX_QUEUE {
             return false;
         }
-        state.pending.push_back(song);
+        state.enqueue(song);
         true
     }
 
@@ -184,7 +229,7 @@ impl Queue {
         let mut state = self.lock();
         let stopped = state.current.take();
         requeue_if_repeating(&mut state, &stopped);
-        state.current = state.pending.pop_front();
+        state.take_next();
         state.paused = false;
         state.generation = state.generation.wrapping_add(1);
         Advanced {
@@ -207,7 +252,7 @@ impl Queue {
         }
         let stopped = state.current.take();
         requeue_if_repeating(&mut state, &stopped);
-        state.current = state.pending.pop_front();
+        state.take_next();
         state.paused = false;
         state.generation = state.generation.wrapping_add(1);
         Some(Advanced {
@@ -252,7 +297,52 @@ impl Queue {
 
     /// The songs waiting behind the current one, soonest first.
     pub fn pending_songs(&self) -> Vec<Queued> {
+        self.lock()
+            .pending
+            .iter()
+            .map(|waiting| waiting.song.clone())
+            .collect()
+    }
+
+    /// The songs waiting behind the current one, soonest first, each with the
+    /// id that [`remove`] and [`shift`] take.
+    ///
+    /// [`remove`]: Queue::remove
+    /// [`shift`]: Queue::shift
+    pub fn waiting(&self) -> Vec<Waiting> {
         self.lock().pending.iter().cloned().collect()
+    }
+
+    /// Takes a waiting song out of the queue.
+    ///
+    /// `None` when no song with that id is waiting any more -- it started
+    /// playing, or was removed already -- in which case nothing changes. The
+    /// song playing now is never in the waiting list, so it cannot be removed
+    /// this way; that is what skip is for.
+    pub fn remove(&self, id: u64) -> Option<Queued> {
+        let mut state = self.lock();
+        let index = state.position(id)?;
+        state.pending.remove(index).map(|waiting| waiting.song)
+    }
+
+    /// Moves a waiting song, and returns its new position, counting from 0 for
+    /// the song that plays next.
+    ///
+    /// `None` when no song with that id is waiting any more, in which case
+    /// nothing changes. A song already first moved up, or already last moved
+    /// down, stays where it is.
+    pub fn shift(&self, id: u64, shift: Shift) -> Option<usize> {
+        let mut state = self.lock();
+        let from = state.position(id)?;
+        let last = state.pending.len() - 1;
+        let to = match shift {
+            Shift::Up => from.saturating_sub(1),
+            Shift::Down => (from + 1).min(last),
+            Shift::Front => 0,
+        };
+        let waiting = state.pending.remove(from)?;
+        state.pending.insert(to, waiting);
+        Some(to)
     }
 
     /// Whether the current song is paused.
@@ -289,7 +379,7 @@ impl Queue {
         state
             .current
             .iter()
-            .chain(state.pending.iter())
+            .chain(state.pending.iter().map(|waiting| &waiting.song))
             .map(|song| song.source.cache().to_path_buf())
             .collect()
     }
@@ -657,5 +747,131 @@ mod tests {
         let now = queue.advance();
         assert!(now.current.is_none(), "stop must beat repeat: {now:?}");
         assert_eq!(queue.pending(), 0);
+    }
+
+    /// The titles waiting, soonest first.
+    fn titles(queue: &Queue) -> Vec<String> {
+        queue.pending_songs().into_iter().map(|s| s.title).collect()
+    }
+
+    /// The id the queue gave the waiting song with this title.
+    fn id_of(queue: &Queue, title: &str) -> u64 {
+        queue
+            .waiting()
+            .into_iter()
+            .find(|waiting| waiting.song.title == title)
+            .expect("the song is waiting")
+            .id
+    }
+
+    #[test]
+    fn every_waiting_song_gets_its_own_id() {
+        let queue = Queue::default();
+        queue.push(song("a"));
+        queue.push(song("a"));
+        queue.push(song("b"));
+        let ids: Vec<u64> = queue.waiting().iter().map(|w| w.id).collect();
+        let mut unique = ids.clone();
+        unique.dedup();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(unique, ids, "the same song queued twice is two entries");
+    }
+
+    #[test]
+    fn removing_takes_out_only_the_song_picked() {
+        let queue = Queue::default();
+        queue.push(song("first"));
+        queue.push(song("mistake"));
+        queue.push(song("last"));
+
+        let removed = queue.remove(id_of(&queue, "mistake"));
+        assert_eq!(removed.expect("removed").title, "mistake");
+        assert_eq!(titles(&queue), ["first", "last"]);
+    }
+
+    /// The queue moves on while the view is open, so the id the button carries
+    /// can be stale. Acting on it must not hit whatever now sits in its place.
+    #[test]
+    fn removing_a_song_that_already_started_changes_nothing() {
+        let queue = Queue::default();
+        queue.push(song("started"));
+        queue.push(song("next"));
+        let picked = id_of(&queue, "started");
+
+        queue.advance();
+        assert!(queue.remove(picked).is_none());
+        assert_eq!(titles(&queue), ["next"], "the song behind it is untouched");
+        assert_eq!(queue.current().expect("playing").title, "started");
+        assert!(queue.shift(picked, Shift::Front).is_none());
+        assert_eq!(titles(&queue), ["next"]);
+    }
+
+    #[test]
+    fn removing_twice_removes_once() {
+        let queue = Queue::default();
+        queue.push(song("gone"));
+        queue.push(song("stays"));
+        let picked = id_of(&queue, "gone");
+        assert!(queue.remove(picked).is_some());
+        assert!(queue.remove(picked).is_none());
+        assert_eq!(titles(&queue), ["stays"]);
+    }
+
+    /// An id belongs to one entry, so the same song queued again later is not
+    /// what an old pick refers to.
+    #[test]
+    fn an_id_is_not_reused_for_a_later_song() {
+        let queue = Queue::default();
+        queue.push(song("again"));
+        let first = id_of(&queue, "again");
+        queue.remove(first);
+        queue.push(song("again"));
+        assert!(queue.remove(first).is_none());
+        assert_eq!(titles(&queue), ["again"]);
+    }
+
+    #[test]
+    fn a_song_moves_up_down_and_to_the_front() {
+        let queue = Queue::default();
+        for title in ["a", "b", "c", "d"] {
+            queue.push(song(title));
+        }
+        let c = id_of(&queue, "c");
+
+        assert_eq!(queue.shift(c, Shift::Up), Some(1));
+        assert_eq!(titles(&queue), ["a", "c", "b", "d"]);
+
+        assert_eq!(queue.shift(c, Shift::Down), Some(2));
+        assert_eq!(titles(&queue), ["a", "b", "c", "d"]);
+
+        let d = id_of(&queue, "d");
+        assert_eq!(queue.shift(d, Shift::Front), Some(0));
+        assert_eq!(titles(&queue), ["d", "a", "b", "c"]);
+        assert_eq!(queue.advance().current.expect("next").title, "d");
+    }
+
+    #[test]
+    fn a_song_at_either_end_stays_put() {
+        let queue = Queue::default();
+        queue.push(song("first"));
+        queue.push(song("last"));
+        assert_eq!(queue.shift(id_of(&queue, "first"), Shift::Up), Some(0));
+        assert_eq!(queue.shift(id_of(&queue, "last"), Shift::Down), Some(1));
+        assert_eq!(queue.shift(id_of(&queue, "first"), Shift::Front), Some(0));
+        assert_eq!(titles(&queue), ["first", "last"]);
+    }
+
+    /// A move keeps the id, so pressing "up" again moves the same song again.
+    #[test]
+    fn a_moved_song_keeps_its_id() {
+        let queue = Queue::default();
+        for title in ["a", "b", "c"] {
+            queue.push(song(title));
+        }
+        let c = id_of(&queue, "c");
+        queue.shift(c, Shift::Up);
+        queue.shift(c, Shift::Up);
+        assert_eq!(titles(&queue), ["c", "a", "b"]);
+        assert_eq!(id_of(&queue, "c"), c);
     }
 }
