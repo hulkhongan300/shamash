@@ -1,0 +1,19 @@
+# NVIDIA GPUs, on top of compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.nvidia.yaml up -d
+#
+# Needs the NVIDIA Container Toolkit on the host. The `graphics` capability is
+# what brings the driver's Vulkan support into the container.
+
+services:
+  shamash:
+    devices: !reset []
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,graphics,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

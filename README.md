@@ -42,7 +42,74 @@ leaves the host.
 
 ## Quick start
 
-### 1. Install the prerequisites
+### 1. Create the Discord bot
+
+1. In the [Discord developer portal](https://discord.com/developers/applications),
+   create an application and add a bot. Copy its token.
+2. Invite it with the `bot` and `applications.commands` scopes, and the
+   **Connect**, **Speak**, **View Channel** and **Send Messages** permissions.
+   No privileged intents are needed: the bot uses only `GUILDS` and
+   `GUILD_VOICE_STATES`.
+3. In Discord, turn on Developer Mode. Then right-click the voice channel the
+   bot should listen in, and the text channel it should write to, and choose
+   **Copy Channel ID** for each.
+
+### 2. Configure it
+
+```sh
+cp .env.example .env
+```
+
+Fill in `DISCORD_TOKEN`, `VOICE_CHANNEL_ID` and `ALERT_CHANNEL_ID`. Everything
+else is optional; see [Settings](#settings).
+
+### 3. Run it
+
+Either in Docker, which needs nothing else installed, or from source.
+
+The two speech models, about 1 GB together, download on the first start and
+are kept from then on. `MODEL_DOWNLOAD=off` turns that off, for a machine that
+must not reach out; then fetch them yourself (see
+[The two models](#the-two-models)).
+
+The slash commands are registered with each server when the bot starts. If
+`/play` suggestions do not show up straight after an update, reload Discord.
+
+#### With Docker (recommended)
+
+Needs Docker with Compose v2.24 or newer.
+
+| GPU | Command |
+| --- | --- |
+| AMD or Intel | `docker compose up -d` |
+| NVIDIA | `docker compose -f compose.yaml -f compose.nvidia.yaml up -d` |
+| None | Remove the `devices:` lines from `compose.yaml`, then `docker compose up -d` |
+
+Then `docker compose logs -f` to watch it start. The first start spends a
+minute or two downloading the models. Look for `backend=Vulkan0` in the log:
+that is the GPU being used. Without a GPU a request takes ~17 s instead of
+~1 s; set the English-only `REQUEST_MODEL` in `.env` for ~0.1 s on a CPU.
+
+- **AMD and Intel** work through `/dev/dri` and Mesa's drivers in the image.
+- **NVIDIA** needs the
+  [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+  on the host.
+- **Windows and macOS:** Docker Desktop cannot pass a GPU to Vulkan there, so
+  the bot runs on the CPU. Run it from source for GPU speed.
+
+Models, the song cache and the bot's data live in the `shamash-data` volume,
+so updates keep them. yt-dlp updates itself at every start, because YouTube
+breaks old versions within weeks.
+
+```sh
+docker compose pull && docker compose up -d   # update to the published image
+docker compose build && docker compose up -d  # or rebuild from this checkout
+```
+
+To have a machine update itself whenever `main` changes, see
+[deploy/README.md](deploy/README.md).
+
+#### From source
 
 - Rust (edition 2024)
 - `ffmpeg`, `yt-dlp`, `libopus-dev` (or `opus`), `pkg-config`, `cmake`, and a
@@ -58,46 +125,11 @@ leaves the host.
   CPU only instead, drop the `vulkan` feature of `transcribe-cpp` from
   `Cargo.toml`.
 
-### 2. Create the Discord bot
-
-1. In the [Discord developer portal](https://discord.com/developers/applications),
-   create an application and add a bot. Copy its token.
-2. Invite it with the `bot` and `applications.commands` scopes, and the
-   **Connect**, **Speak**, **View Channel** and **Send Messages** permissions.
-   No privileged intents are needed: the bot uses only `GUILDS` and
-   `GUILD_VOICE_STATES`.
-3. In Discord, turn on Developer Mode. Then right-click the voice channel the
-   bot should listen in, and the text channel it should write to, and choose
-   **Copy Channel ID** for each.
-
-### 3. Download the two models
-
-```sh
-huggingface-cli download handy-computer/parakeet-tdt_ctc-110m-gguf parakeet-tdt_ctc-110m-Q8_0.gguf
-huggingface-cli download handy-computer/whisper-large-v3-turbo-gguf whisper-large-v3-turbo-Q8_0.gguf
-```
-
-They land in the Hugging Face cache, which is where the bot looks by default.
-See [The two models](#the-two-models) for why there are two.
-
-### 4. Configure and run
-
-Create a gitignored `.env` next to the binary:
-
-```sh
-DISCORD_TOKEN=your-bot-token
-VOICE_CHANNEL_ID=your-voice-channel-id
-ALERT_CHANNEL_ID=your-text-channel-id
-```
-
-Then:
+Then, from the folder with the `.env`:
 
 ```sh
 cargo run --release
 ```
-
-The slash commands are registered with each server when the bot starts. If
-`/play` suggestions do not show up straight after an update, reload Discord.
 
 ## Using it
 
@@ -244,6 +276,8 @@ the bot at startup instead of silently falling back to a default.
 | `ASR_LANGUAGE` | detected | One ISO-639-1 code, such as `en` or `pt` |
 | `ASR_ENGINE` | `direct` | `direct` runs transcribe.cpp in-process. `handy` shells out to the Handy app, for comparing engines only |
 | `VOICE_DIAG` | off | Set to `1` to log how loud each speaker is |
+| `MODEL_DOWNLOAD` | on | Download a missing model at startup. `off` makes a missing model an error instead |
+| `YTDLP_UPDATE` | on | Docker only: update yt-dlp at every start. `off` keeps the image's copy |
 
 **Finding songs**
 
@@ -269,7 +303,13 @@ The models are loaded differently, which is the whole reason there are two:
 | Default | `parakeet-tdt_ctc-110m` | `whisper-large-v3-turbo` |
 
 Either setting takes a path to any `.gguf` that transcribe.cpp supports, or a
-Hugging Face id resolved against the local cache.
+Hugging Face id resolved against the local cache. A model id that is not in the
+cache yet is downloaded on startup. To fetch the defaults yourself instead:
+
+```sh
+huggingface-cli download handy-computer/parakeet-tdt_ctc-110m-gguf parakeet-tdt_ctc-110m-Q8_0.gguf
+huggingface-cli download handy-computer/whisper-large-v3-turbo-gguf whisper-large-v3-turbo-Q8_0.gguf
+```
 
 **GPU.** Inference runs on the GPU through ggml's Vulkan backend when it is
 available, and on the CPU otherwise. The startup log names the device each

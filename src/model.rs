@@ -52,6 +52,10 @@ pub const REQUEST_PROMPT: &str =
 /// (`handy-computer/<repo>/<file>.gguf`), or a bare filename to look up in the
 /// cache by name.
 pub fn resolve(spec: &str) -> anyhow::Result<PathBuf> {
+    resolve_in(&hf_cache_dir(), spec)
+}
+
+fn resolve_in(cache: &Path, spec: &str) -> anyhow::Result<PathBuf> {
     let direct = Path::new(spec);
     if direct.is_file() {
         return Ok(direct.to_path_buf());
@@ -66,10 +70,9 @@ pub fn resolve(spec: &str) -> anyhow::Result<PathBuf> {
         None => (String::new(), spec),
     };
 
-    let cache = hf_cache_dir();
     let candidates: Vec<PathBuf> = if repo.is_empty() {
         // No repo given: search every Handy snapshot for a file of this name.
-        snapshot_dirs(&cache)
+        snapshot_dirs(cache)
             .into_iter()
             .map(|d| d.join(file))
             .collect()
@@ -78,7 +81,7 @@ pub fn resolve(spec: &str) -> anyhow::Result<PathBuf> {
             cache
                 .join(format!("models--{}", repo.replace('/', "--")))
                 .join("snapshots")
-                .join(current_revision(&cache, &repo).unwrap_or_default())
+                .join(current_revision(cache, &repo).unwrap_or_default())
                 .join(file),
         ]
     };
@@ -140,9 +143,156 @@ fn snapshot_dirs(repo_cache: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// Where a `org/repo/file.gguf` model id is downloaded from, and where it goes.
+///
+/// The file lands in the Hugging Face cache layout [`resolve`] already reads,
+/// under a `main` snapshot, so a downloaded model and one fetched with
+/// `huggingface-cli` are found the same way. `None` for a path or a bare file
+/// name, which say nothing about where to fetch them from.
+fn download_target(cache: &Path, spec: &str) -> Option<(String, PathBuf)> {
+    let mut parts = spec.splitn(3, '/');
+    let (org, repo, file) = (parts.next()?, parts.next()?, parts.next()?);
+    let safe = |part: &str| {
+        !part.is_empty() && part != ".." && !part.starts_with('.') && !part.contains('\\')
+    };
+    if !safe(org) || !safe(repo) || !file.ends_with(".gguf") || !file.split('/').all(safe) {
+        return None;
+    }
+    let url = format!("https://huggingface.co/{org}/{repo}/resolve/main/{file}");
+    let dest = cache
+        .join(format!("models--{org}--{repo}"))
+        .join("snapshots/main")
+        .join(file);
+    Some((url, dest))
+}
+
+/// Makes sure `spec` is on disk, downloading it from Hugging Face if it is a
+/// model id that is not in the cache yet.
+///
+/// This is what lets a fresh install, or a fresh container, start with nothing
+/// but a `.env`: the defaults are model ids, and the first start fetches them.
+/// `MODEL_DOWNLOAD=off` turns it off, for a machine that must not reach out.
+pub async fn ensure(spec: &str) -> anyhow::Result<PathBuf> {
+    ensure_in(&hf_cache_dir(), spec).await
+}
+
+async fn ensure_in(cache: &Path, spec: &str) -> anyhow::Result<PathBuf> {
+    if let Ok(path) = resolve_in(cache, spec) {
+        return Ok(path);
+    }
+    let off = std::env::var("MODEL_DOWNLOAD")
+        .is_ok_and(|v| ["off", "false", "0", "no"].contains(&v.trim().to_lowercase().as_str()));
+    let Some((url, dest)) = download_target(cache, spec).filter(|_| !off) else {
+        // Let the loader report it, with the message it already has.
+        return resolve_in(cache, spec);
+    };
+    download(&url, &dest).await?;
+    resolve_in(cache, spec)
+}
+
+/// Streams `url` to `dest`, through a `.part` file so an interrupted download
+/// is never mistaken for a model.
+async fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let parent = dest.parent().context("model path has no directory")?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("could not create {}", parent.display()))?;
+    let client = reqwest::Client::builder()
+        .user_agent(crate::config::HTTP_USER_AGENT)
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .build()?;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .with_context(|| format!("could not download {url}"))?;
+    let total = response.content_length();
+    tracing::info!(
+        url,
+        size_mb = total.map(|b| b / 1_000_000),
+        to = %dest.display(),
+        "downloading a model; this happens once"
+    );
+
+    let part = dest.with_extension("gguf.part");
+    let mut file = tokio::fs::File::create(&part)
+        .await
+        .with_context(|| format!("could not write {}", part.display()))?;
+    let mut written: u64 = 0;
+    let mut reported = 0;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("the download of {url} broke off"))?
+    {
+        file.write_all(&chunk).await?;
+        written += chunk.len() as u64;
+        if let Some(total) = total.filter(|t| *t > 0) {
+            let percent = written * 100 / total;
+            if percent >= reported + 10 {
+                reported = percent - percent % 10;
+                tracing::info!(percent = reported, "downloading the model");
+            }
+        }
+    }
+    file.flush().await?;
+    drop(file);
+    if let Some(total) = total {
+        anyhow::ensure!(
+            written == total,
+            "the download of {url} stopped at {written} of {total} bytes"
+        );
+    }
+    tokio::fs::rename(&part, dest).await?;
+    tracing::info!(path = %dest.display(), "model downloaded");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_id_downloads_into_the_cache_layout_resolve_reads() {
+        let cache = std::env::temp_dir().join(format!("shamash-dl-{}", std::process::id()));
+        let spec = "handy-computer/parakeet-tdt_ctc-110m-gguf/parakeet-tdt_ctc-110m-Q8_0.gguf";
+        let (url, dest) = download_target(&cache, spec).expect("a model id");
+        assert_eq!(
+            url,
+            "https://huggingface.co/handy-computer/parakeet-tdt_ctc-110m-gguf/resolve/main/parakeet-tdt_ctc-110m-Q8_0.gguf"
+        );
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"gguf").unwrap();
+        // No refs/main at all, as after a first download.
+        assert_eq!(resolve_in(&cache, spec).unwrap(), dest);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    /// Downloads the 130 MB wake model into a scratch cache.
+    #[tokio::test]
+    #[ignore = "downloads 130 MB from Hugging Face"]
+    async fn a_missing_model_is_downloaded_and_then_found() {
+        let cache = std::env::temp_dir().join(format!("shamash-live-{}", std::process::id()));
+        let path = ensure_in(&cache, SMALL_MODEL_ID).await.expect("download");
+        assert!(std::fs::metadata(&path).unwrap().len() > 100_000_000);
+        // A second call finds it rather than downloading again.
+        assert_eq!(ensure_in(&cache, SMALL_MODEL_ID).await.unwrap(), path);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn only_a_model_id_is_downloaded() {
+        let cache = Path::new("/cache");
+        assert!(download_target(cache, "/models/whisper.gguf").is_none());
+        assert!(download_target(cache, "whisper.gguf").is_none());
+        assert!(download_target(cache, "org/repo/notes.txt").is_none());
+        assert!(download_target(cache, "org/../x.gguf").is_none());
+        assert!(download_target(cache, "org/repo/../../x.gguf").is_none());
+    }
 
     #[test]
     fn an_existing_path_is_returned_unchanged() {

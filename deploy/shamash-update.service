@@ -1,0 +1,11 @@
+[Unit]
+Description=Update Shamash to the newest published image
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# The folder holding deploy/compose.yaml and your .env.
+Environment=SHAMASH_DIR=/opt/shamash
+ExecStart=/usr/local/bin/shamash-update

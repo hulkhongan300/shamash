@@ -1,0 +1,27 @@
+# Shamash with an AMD or Intel GPU (or none):
+#
+#   cp .env.example .env    # fill in DISCORD_TOKEN and the channel ids
+#   docker compose up -d
+#   docker compose logs -f
+#
+# NVIDIA: docker compose -f compose.yaml -f compose.nvidia.yaml up -d
+
+services:
+  shamash:
+    # Pulled from GitHub's registry when it is published there; built from
+    # this checkout otherwise (`docker compose build` forces a local build).
+    image: ghcr.io/hulkhongan300/shamash:main
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Models (~1 GB, downloaded on the first start), the song cache, and the
+      # bot's data. Kept across rebuilds and updates.
+      - shamash-data:/data
+    devices:
+      # The GPU, for Vulkan. On a machine without one, remove `devices:` and
+      # this entry, or the container will not start.
+      - /dev/dri:/dev/dri
+
+volumes:
+  shamash-data:

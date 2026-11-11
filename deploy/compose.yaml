@@ -1,0 +1,19 @@
+# Runs the published image, with no source checkout. Used by the automatic
+# updater (see deploy/README.md); keep .env next to this file.
+
+name: shamash
+
+services:
+  shamash:
+    image: ghcr.io/hulkhongan300/shamash:${SHAMASH_TAG:-main}
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - shamash-data:/data
+    devices:
+      # The GPU, for Vulkan. Remove both lines on a machine without one.
+      - /dev/dri:/dev/dri
+
+volumes:
+  shamash-data:
+    name: shamash-data

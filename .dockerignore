@@ -1,0 +1,6 @@
+# Never in the image: secrets, build output, local data.
+.env
+target/
+data/
+Archive.zip
+.git/
