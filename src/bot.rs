@@ -4,7 +4,6 @@ use crate::direct::DirectTranscriber;
 use crate::parakeet::HandyTranscriber;
 use crate::player::Player;
 use crate::resolve;
-use crate::search;
 use crate::state::{
     BigModelsKey, ConfigKey, HttpClientKey, ListenLock, ListenLockKey, PlayerKey, TranscriberKey,
 };
@@ -138,11 +137,15 @@ fn commands() -> Vec<CreateCommand> {
             .description("Stop listening for voice commands (music keeps playing)"),
         CreateCommand::new("unlock").description("Start listening for voice commands again"),
         CreateCommand::new("play")
-            .description("Search the catalog for a song and choose from the results")
+            .description("Play a song, or a whole YouTube playlist or album from its link")
             .add_option(
-                CreateCommandOption::new(CommandOptionType::String, "song", "What to search for")
-                    .required(true)
-                    .set_autocomplete(true),
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "song",
+                    "Start typing to pick a song, or paste a YouTube video, playlist or album link",
+                )
+                .required(true)
+                .set_autocomplete(true),
             ),
     ]
 }
@@ -413,12 +416,27 @@ impl Handler {
             return;
         }
 
-        // If the query is a specific video selected from autocomplete (or a direct URL),
-        // play it directly without needing another chooser.
-        if let Some(video_id) = search::url_video_id(&query) {
+        // A playlist or album link queues the whole thing. Only here: a
+        // spoken request never queues a playlist.
+        if let Some(url) = crate::playlist::playlist_url(&query) {
+            let _ = command.defer_ephemeral(&ctx.http).await;
+            let text = match player.play_playlist(ctx, &config, guild_id, &url).await {
+                Ok(queued) => playlist_reply(&queued),
+                Err(e) => {
+                    tracing::warn!(guild_id = %guild_id, url = %url, error = %format!("{e:#}"), "could not queue a playlist");
+                    format!("I couldn't play that playlist: {e:#}")
+                }
+            };
+            finish(ctx, &command, &text).await;
+            return;
+        }
+
+        // A link to one video, picked from autocomplete or pasted, plays that
+        // video without another chooser. Links only: a typed word is a search.
+        if let Some(video_id) = crate::playlist::video_id(&query) {
             let _ = command.defer_ephemeral(&ctx.http).await;
             match player
-                .play_direct(ctx, &config, guild_id, &query, video_id)
+                .play_direct(ctx, &config, guild_id, &query, &video_id)
                 .await
             {
                 Ok((title, starting)) => {
@@ -753,6 +771,38 @@ fn typed_song(command: &CommandInteraction) -> Option<String> {
         })?;
     let query = words.trim().to_string();
     (!query.is_empty()).then_some(query)
+}
+
+/// The reply to a queued playlist.
+fn playlist_reply(queued: &crate::player::PlaylistQueued) -> String {
+    let others = queued.queued - 1;
+    let mut text = if queued.starting {
+        format!("Playing **{}** from **{}**", queued.first, queued.title)
+    } else {
+        format!("Queued **{}** from **{}**", queued.first, queued.title)
+    };
+    if others > 0 {
+        text.push_str(&format!(
+            ", and adding the other {others} song{} behind it.",
+            if others == 1 { "" } else { "s" }
+        ));
+    } else {
+        text.push('.');
+    }
+    if queued.left_out > 0 {
+        text.push_str(&format!(
+            "\n{} more didn't fit: the queue holds {} songs.",
+            queued.left_out,
+            crate::queue::MAX_QUEUE
+        ));
+    }
+    if queued.unavailable > 0 {
+        text.push_str(&format!(
+            "\n{} couldn't be played (private, deleted or unavailable).",
+            queued.unavailable
+        ));
+    }
+    text
 }
 
 /// Replaces the "thinking…" of a deferred command with its answer.

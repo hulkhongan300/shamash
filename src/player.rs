@@ -494,6 +494,22 @@ struct Coordination {
     generations: Generations,
 }
 
+/// What `/play` did with a playlist link, for its reply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistQueued {
+    pub title: String,
+    /// The first track, already queued: "artist — title".
+    pub first: String,
+    /// Whether the first track started playing, rather than waiting its turn.
+    pub starting: bool,
+    /// Tracks being queued, the first included.
+    pub queued: usize,
+    /// Tracks that did not fit in the queue.
+    pub left_out: usize,
+    /// Tracks that could not be played: private, deleted, or failed to load.
+    pub unavailable: usize,
+}
+
 /// What adding a downloaded song to the queue did.
 #[derive(Debug, PartialEq)]
 enum Commit {
@@ -1761,6 +1777,145 @@ impl Player {
             }
         }
         tracks
+    }
+
+    /// Queues every track of a playlist or album, for `/play <playlist link>`.
+    ///
+    /// Slash command only: a spoken request never reaches this.
+    ///
+    /// The first track is queued before this returns, so the reply can say it
+    /// is playing. The rest follow in the background, in playlist order, each
+    /// one downloaded and queued like a picked song. A Stop, the bot leaving,
+    /// or the queue filling ends that early. A playlist longer than the room
+    /// left in the queue is cut at the end, so an album still starts at its
+    /// first track.
+    pub async fn play_playlist(
+        self: &Arc<Self>,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        url: &str,
+    ) -> anyhow::Result<PlaylistQueued> {
+        self.manager
+            .get(guild_id)
+            .context("bot is not in a voice channel")?;
+        let playlist = crate::playlist::list(url).await?;
+        anyhow::ensure!(
+            !playlist.tracks.is_empty(),
+            "{} has no tracks that can be played",
+            playlist.title
+        );
+        let listed = playlist.tracks.len();
+        let room = crate::playlist::fitting(
+            listed,
+            self.queues.get(guild_id).pending(),
+            crate::queue::MAX_QUEUE,
+        );
+        anyhow::ensure!(
+            room > 0,
+            "the queue is full ({} songs); skip some or wait",
+            crate::queue::MAX_QUEUE
+        );
+        self.asks.clear(guild_id);
+        // Anything that bumps this after now, a Stop above all, ends the
+        // background queuing.
+        let generation = self.coordination.generations.get(guild_id).now();
+
+        let mut tracks = playlist.tracks.into_iter().take(room);
+        let mut unplayable = 0;
+        let mut first = None;
+        for track in tracks.by_ref() {
+            match self.play_track(ctx, config, guild_id, &track).await {
+                Ok(played) => {
+                    first = Some(played);
+                    break;
+                }
+                Err(e) => {
+                    unplayable += 1;
+                    tracing::warn!(guild_id = %guild_id, track = %track.title, error = %format!("{e:#}"), "a playlist track could not be played");
+                }
+            }
+        }
+        let (first, starting) = first.context("none of its tracks could be played")?;
+        let rest: Vec<crate::playlist::Track> = tracks.collect();
+        let queued = 1 + rest.len();
+        tracing::info!(guild_id = %guild_id, playlist = %playlist.title, listed, queued, "queuing a playlist");
+
+        let this = Arc::clone(self);
+        let ctx = ctx.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            this.queue_rest(&ctx, &config, guild_id, rest, generation)
+                .await;
+        });
+
+        Ok(PlaylistQueued {
+            title: playlist.title,
+            first,
+            starting,
+            queued,
+            left_out: listed - room,
+            unavailable: playlist.unavailable + unplayable,
+        })
+    }
+
+    /// Queues the tracks after the first, one at a time and in order.
+    async fn queue_rest(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        rest: Vec<crate::playlist::Track>,
+        generation: u64,
+    ) {
+        let total = rest.len();
+        let mut added = 0;
+        for track in rest {
+            if self.coordination.generations.get(guild_id).now() != generation {
+                tracing::info!(guild_id = %guild_id, added, total, "playback was stopped; the rest of the playlist is dropped");
+                return;
+            }
+            if self.manager.get(guild_id).is_none() {
+                tracing::info!(guild_id = %guild_id, added, total, "left the voice channel; the rest of the playlist is dropped");
+                return;
+            }
+            if self.queues.get(guild_id).is_full() {
+                tracing::info!(guild_id = %guild_id, added, total, "the queue filled up; the rest of the playlist is dropped");
+                return;
+            }
+            match self.play_track(ctx, config, guild_id, &track).await {
+                Ok(_) => added += 1,
+                Err(e) => {
+                    tracing::warn!(guild_id = %guild_id, track = %track.title, error = %format!("{e:#}"), "a playlist track could not be played; going on to the next")
+                }
+            }
+        }
+        tracing::info!(guild_id = %guild_id, added, total, "the rest of the playlist is queued");
+    }
+
+    /// Downloads one playlist track and queues it, exactly as a picked
+    /// `/play` suggestion is: the track *is* the song, so nothing is searched.
+    async fn play_track(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        track: &crate::playlist::Track,
+    ) -> anyhow::Result<(String, bool)> {
+        let candidate = search::Candidate {
+            title: Some(track.title.clone()),
+            url: track.url(),
+            view_count: None,
+            duration: track.duration_secs,
+            channel: track.channel.clone(),
+            id: Some(track.video_id.clone()),
+        };
+        let timing = Timing::default();
+        let played = self
+            .play_offer_inner(ctx, config, guild_id, Offer::Video(candidate), &timing)
+            .await;
+        timing.log("/play playlist track");
+        played
     }
 
     /// Plays or queues a specific YouTube track chosen via autocomplete or direct URL.

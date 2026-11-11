@@ -13,6 +13,7 @@ pub mod parakeet;
 pub mod parser;
 pub mod pipeline;
 pub mod player;
+pub mod playlist;
 pub mod queue;
 pub mod resolve;
 pub mod search;
