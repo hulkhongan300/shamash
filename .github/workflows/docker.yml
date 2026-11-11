@@ -13,6 +13,11 @@ on:
     paths: [Dockerfile, docker/**, .github/workflows/docker.yml, Cargo.toml, Cargo.lock]
   workflow_dispatch:
 
+# A newer push to the same branch makes the older build pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
   packages: write
