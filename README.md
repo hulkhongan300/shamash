@@ -34,6 +34,10 @@ leaves the host.
   next time, even when the artist you said is not the one credited ("All Caps
   by MF DOOM" → Madvillain). Only your picks are remembered, never the bot's own
   guesses. A remembered song skipped within 10 seconds twice is forgotten.
+  Picks from a typed `/play` search count too, and typed and spoken words are
+  remembered as one: teach it by typing and saying the words plays the song,
+  and a typed search for words it already knows lists that song first. Links
+  are never remembered.
 - **`/play` with live suggestions.** Start typing and matching songs from
   YouTube Music appear. Pick one and that exact song is queued.
 - **`/lock` and `/unlock`.** Turn listening off without removing the bot.

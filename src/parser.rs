@@ -337,8 +337,18 @@ impl CommandParser {
     /// arrives with no wake word in it. This turns that trailing half into the
     /// request the first half was waiting for.
     pub fn request_from_query(&self, text: &str) -> Option<PlayRequest> {
-        build_request(&normalize(text))
+        typed_request(text)
     }
+}
+
+/// Reads text that is already just the request, with no wake word or "play".
+///
+/// Cleaned exactly the way the request part of a spoken command is, so the same
+/// words typed into `/play` and said out loud come out as the same
+/// [`PlayRequest::query`]. The song memory keys on that query, which is what
+/// lets a phrase taught by typing be found when spoken, and the other way round.
+pub fn typed_request(text: &str) -> Option<PlayRequest> {
+    build_request(&normalize(text))
 }
 
 /// Words that may come before a wake word without making it mid-sentence.
@@ -1078,6 +1088,27 @@ mod tests {
             "you belong with me"
         );
         assert!(p.armed_request("bot").is_none());
+    }
+
+    /// Typed words come out as the same query the same words spoken do.
+    #[test]
+    fn a_typed_request_reads_like_the_same_words_spoken() {
+        let p = parser();
+        for (typed, spoken) in [
+            (
+                "Dracula by Tame Impala",
+                "Shamash, play dracula by tame impala.",
+            ),
+            ("Don't Stop Me Now!", "bot play don't stop me now"),
+            ("Stand By Me", "bot play stand by me"),
+        ] {
+            assert_eq!(
+                typed_request(typed).map(|r| r.query),
+                p.parse(spoken).map(|r| r.query),
+                "for {typed:?}"
+            );
+        }
+        assert!(typed_request("?!").is_none());
     }
 
     #[test]
