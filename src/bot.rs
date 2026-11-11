@@ -34,6 +34,15 @@ pub async fn start(config: Config) -> anyhow::Result<()> {
     // runs on every window of speech, so a load per command would cost far more
     // than it saves. The larger one is loaded on the first wake word instead,
     // which is what lets the bot tell the speaker when it is ready for a request.
+    //
+    // Both are fetched now if they are not on disk yet, so a fresh install
+    // downloads them once at startup rather than the request model holding up
+    // the first wake word for a gigabyte download.
+    if config.asr_engine == AsrEngine::Direct {
+        for spec in [&config.wake_model, &config.request_model] {
+            crate::model::ensure(spec).await?;
+        }
+    }
     let wake_model: Arc<dyn Transcriber> = build_transcriber(
         config.asr_engine,
         &config.wake_model,
