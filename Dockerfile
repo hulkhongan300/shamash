@@ -12,7 +12,12 @@ ARG RUST_VERSION=1.98
 ARG DEBIAN_RELEASE=trixie
 
 # ---------------------------------------------------------------- build ----
-FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS build
+# Built with cargo-chef, so the dependencies (transcribe.cpp, ggml and its
+# Vulkan shaders: most of the build time) are compiled in a layer of their own
+# that only changes with Cargo.lock. Layers are what CI's cache keeps; a
+# `--mount=type=cache` folder is thrown away with the runner, which made every
+# CI build compile everything from scratch.
+FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS chef
 
 # cmake and the C++ toolchain build transcribe.cpp's ggml; libvulkan-dev, glslc
 # and spirv-headers are its Vulkan backend; libopus-dev is songbird's codec.
@@ -21,19 +26,33 @@ RUN apt-get update \
       cmake pkg-config libopus-dev libvulkan-dev glslc spirv-headers \
  && rm -rf /var/lib/apt/lists/*
 
+ARG CARGO_CHEF_VERSION=0.1.78
+RUN cargo install cargo-chef --locked --version ${CARGO_CHEF_VERSION}
+WORKDIR /src
+
+# The recipe: the dependency graph, without the code. Unchanged code-only
+# edits produce the same recipe, so the layer below stays cached.
+FROM chef AS plan
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS build
+
 # ggml tunes itself for the build machine's CPU (-march=native) unless
 # SOURCE_DATE_EPOCH is set. An image is run on other machines, so it is: the
 # binary then uses the portable instruction set and cannot crash with an
 # illegal instruction on an older CPU. Inference is on the GPU, where this
 # costs nothing. Build with `--build-arg PORTABLE=0` for a CPU-only box you
-# build on yourself.
+# build on yourself. Both steps below must see the same setting, or the second
+# rebuilds ggml.
 ARG PORTABLE=1
 
-WORKDIR /src
+COPY --from=plan /src/recipe.json recipe.json
+RUN if [ "$PORTABLE" = "1" ]; then export SOURCE_DATE_EPOCH=0; fi \
+ && cargo chef cook --release --locked --recipe-path recipe.json
+
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    if [ "$PORTABLE" = "1" ]; then export SOURCE_DATE_EPOCH=0; fi \
+RUN if [ "$PORTABLE" = "1" ]; then export SOURCE_DATE_EPOCH=0; fi \
  && cargo build --release --locked \
  && cp target/release/shamash /usr/local/bin/shamash
 

@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     name: fmt + clippy + test
@@ -15,17 +20,16 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libopus-dev
-          # `transcribe-cpp` is built with its `vulkan` feature, and ggml's
-          # Vulkan backend compiles compute shaders at build time. It needs the
-          # Vulkan headers, `glslc` to compile them, and the SPIR-V headers for
-          # its shader generator. Without these the build fails at
-          # "Could NOT find Vulkan (missing: Vulkan_LIBRARY Vulkan_INCLUDE_DIR
-          # glslc)".
-          sudo apt-get install -y libvulkan-dev glslc spirv-headers
+      # Installed from GitHub's cache rather than Ubuntu's mirrors: faster, and
+      # a mirror outage no longer fails the build (it did, twice, on
+      # 2026-11-11). `transcribe-cpp` is built with its `vulkan` feature, and
+      # ggml's Vulkan backend compiles compute shaders at build time, so it
+      # needs the Vulkan headers, `glslc` and the SPIR-V headers. Bump
+      # `version` to refresh the cached packages.
+      - uses: awalsh128/cache-apt-pkgs-action@v1.6.3
+        with:
+          packages: pkg-config libopus-dev libvulkan-dev glslc spirv-headers
+          version: 1
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
