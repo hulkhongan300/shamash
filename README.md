@@ -163,7 +163,7 @@ them.
 
 | Command | What it does |
 | --- | --- |
-| `/play <song>` | Suggests songs as you type and queues the one you pick. A pasted YouTube or YouTube Music link plays that video |
+| `/play <song>` | Suggests songs as you type and queues the one you pick. A pasted YouTube or YouTube Music link plays that video, and a playlist or album link queues all of it |
 | `/lock` | Stops listening. The bot stays in the channel and keeps playing |
 | `/unlock` | Starts listening again |
 | `/stop` | Stops playback, clears the queue and leaves the voice channel |
@@ -183,7 +183,19 @@ Iuly Neamtu — Dracula (Frappula) (2:17)
 - **Pick a suggestion** and that exact song is queued. Each suggestion carries
   the video id YouTube Music lists for the song, so there is nothing left to
   search for.
-- **Paste a YouTube link** and that video is queued.
+- **Paste a YouTube link** and that video is queued. A link to a video
+  inside a playlist (`watch?v=…&list=…`) is that one video.
+- **Paste a playlist or album link** (`youtube.com/playlist?list=…`, the same
+  on `music.youtube.com`, or a YouTube Music album page) and every track is
+  queued in order. The first one is queued straight away and the reply says
+  so; the rest follow in the background over the next few seconds. Tracks
+  that do not fit in the 20-song queue are left off the end, and private or
+  deleted ones are skipped. The reply says how many of each. Pressing Stop
+  drops whatever has not been queued yet.
+
+  Only `/play` does this. Saying a playlist or album to the bot is not
+  supported: it cannot show what it is about to queue, and an album nobody
+  meant to ask for is a lot of songs to skip.
 - **Press Enter on your own text** without picking a suggestion, and the bot
   searches the catalog and replies with a numbered list, nine to a page:
 
