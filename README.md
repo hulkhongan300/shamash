@@ -42,9 +42,9 @@ leaves the host.
   it waits 15 seconds, in case someone only dropped out, then clears the queue
   and leaves. That works even if someone dragged it into another channel.
 - **A queue and a dashboard.** A now-playing message in the text channel shows
-  the song, its length, how it was asked for and what plays next, with Pause,
-  Skip, Queue, Repeat and Stop buttons (Stop on its own row, so it is not hit
-  by accident). It turns grey while paused. It is edited in place, so the
+  the song with a progress bar, how it was asked for and what plays next, with
+  Pause, Skip, Queue, Repeat and Stop buttons (Stop on its own row, so it is
+  not hit by accident). It turns grey while paused. It is edited in place, so the
   channel does not fill up.
 - **Fast playback.** Songs stream from YouTube while they are cached, and a
   song asked for again plays from the cache.
@@ -241,8 +241,8 @@ listened to. The lock is held in memory, so a restart starts listening again.
 
 ### The dashboard
 
-The text channel has one now-playing message with the song's thumbnail and
-these buttons:
+The text channel has one now-playing message with the song's thumbnail, a
+progress bar (`▬▬▬▬🔘▬▬▬▬▬▬▬ 1:12 / 3:26`) and these buttons:
 
 | Button | Effect |
 | --- | --- |
@@ -255,6 +255,11 @@ these buttons:
 A song asked for while another is playing waits in the queue, which holds up to
 20 songs. Repeat is repeat *one*: it never stops the next queued song from
 playing.
+
+Discord messages do not update by themselves, so while a song plays the bot
+edits the message every 15 seconds to move the bar along. Pausing freezes the
+bar, and the edits stop while paused, while the queue is shown, and when
+nothing is playing. A song whose length is unknown shows no bar.
 
 Only members currently in the bot's voice channel can press these buttons.
 Everyone else gets a private "join the voice channel first" and nothing happens.
