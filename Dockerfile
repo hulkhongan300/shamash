@@ -83,7 +83,8 @@ COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 # Everything that must survive a restart lives under /data: the models (about
 # 1 GB, downloaded once), the song cache, and the bot's own data.
 ENV HF_HOME=/data/models \
-    XDG_CACHE_HOME=/data/cache
+    XDG_CACHE_HOME=/data/cache \
+    LIBRARY_PATH=/data/library.json
 WORKDIR /data
 VOLUME ["/data"]
 
