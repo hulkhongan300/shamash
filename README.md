@@ -32,7 +32,11 @@ leaves the host.
 - **Remembers your answer.** When it asks "Which one?" about a spoken
   request and you pick a song, the same words play that song straight away
   next time, even when the artist you said is not the one credited ("All Caps
-  by MF DOOM" → Madvillain). Only your picks are remembered, never the bot's own
+  by MF DOOM" → Madvillain). The words do not have to come out exactly the
+  same: "M.F. DOOM", a close mishearing like "MF Dume", or the title alone
+  ("All Caps", when only one remembered song has it) find it too, but a phrase
+  about as close to two remembered songs, or one with a different number in it,
+  is asked about again. Only your picks are remembered, never the bot's own
   guesses. A remembered song skipped within 10 seconds twice is forgotten.
 - **`/play` with live suggestions.** Start typing and matching songs from
   YouTube Music appear. Pick one and that exact song is queued.
