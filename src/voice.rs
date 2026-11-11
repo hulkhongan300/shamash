@@ -27,6 +27,8 @@ enum Presence {
 const JOIN_ATTEMPTS: usize = 3;
 /// Pause between join attempts.
 const JOIN_RETRY_DELAY: Duration = Duration::from_secs(3);
+/// How long a channel must stay empty before the bot leaves it.
+const LEAVE_GRACE: Duration = Duration::from_secs(15);
 
 /// Builds the songbird driver config that decodes incoming voice to mono
 /// 16 kHz PCM, the format the voice detector and the models expect.
@@ -173,7 +175,7 @@ impl VoiceService {
     }
 
     /// Reconciles bot presence with the configured target channel: joins when
-    /// members are present, leaves when it empties.
+    /// people are present, leaves whatever channel it is in once nobody is.
     ///
     /// Called both from `voice_state_update` and from `guild_create`, so a
     /// channel that was already occupied when the bot started counts the same
@@ -184,57 +186,98 @@ impl VoiceService {
         guild_id: GuildId,
     ) -> anyhow::Result<()> {
         let target = ChannelId::new(self.config.voice_channel_id);
-        let bot_id = ctx.cache.current_user().id;
-
-        let member_count = ctx
-            .cache
-            .guild(guild_id)
-            .map(|guild| {
-                guild
-                    .voice_states
-                    .values()
-                    .filter(|vs| vs.channel_id == Some(target) && vs.user_id != bot_id)
-                    .count()
-            })
-            .unwrap_or(0);
-
-        let connected_to_target = match self.manager.get(guild_id) {
-            Some(call) => {
-                let handler = call.lock().await;
-                handler.current_channel() == Some(target.into())
-            }
-            None => false,
-        };
-
-        match Self::what_to_do(member_count, connected_to_target) {
+        match self.presence(ctx, guild_id).await {
             Presence::Join => {
                 self.join_with_retry(ctx, guild_id, target).await?;
                 tracing::info!(guild_id = %guild_id, channel = %target, "joined the voice channel");
             }
             Presence::Leave => {
-                tracing::info!(guild_id = %guild_id, channel = %target, "the voice channel is empty; leaving");
-                self.manager
-                    .remove(guild_id)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to leave voice channel: {e}"))?;
+                // Someone dropping out for a second, a network blip or a
+                // client restart, must not cost everyone the queue.
+                tokio::time::sleep(LEAVE_GRACE).await;
+                if self.presence(ctx, guild_id).await != Presence::Leave {
+                    tracing::debug!(guild_id = %guild_id, "someone came back; staying");
+                    return Ok(());
+                }
+                self.leave_empty(ctx, guild_id).await?;
             }
             Presence::None => {}
         }
         Ok(())
     }
 
-    /// What presence in the target channel should be reconciled to.
+    /// What presence should be reconciled to right now.
+    async fn presence(&self, ctx: &SerenityContext, guild_id: GuildId) -> Presence {
+        let target = ChannelId::new(self.config.voice_channel_id);
+        let current = match self.manager.get(guild_id) {
+            Some(call) => call
+                .lock()
+                .await
+                .current_channel()
+                .map(|c| ChannelId::new(c.0.get())),
+            None => None,
+        };
+        let in_target = self.people_in(ctx, guild_id, target);
+        let here = current.map(|channel| self.people_in(ctx, guild_id, channel));
+        Self::what_to_do(in_target, here)
+    }
+
+    /// The people in `channel`: other bots, this one included, do not count,
+    /// or a second bot in the channel would keep this one there forever.
+    fn people_in(&self, ctx: &SerenityContext, guild_id: GuildId, channel: ChannelId) -> usize {
+        let me = ctx.cache.current_user().id;
+        let Some(guild) = ctx.cache.guild(guild_id) else {
+            return 0;
+        };
+        guild
+            .voice_states
+            .values()
+            .filter(|vs| vs.channel_id == Some(channel) && vs.user_id != me)
+            .filter(|vs| {
+                let bot = vs
+                    .member
+                    .as_ref()
+                    .map(|m| m.user.bot)
+                    .or_else(|| guild.members.get(&vs.user_id).map(|m| m.user.bot));
+                // Unknown counts as a person: staying is the safe mistake.
+                !bot.unwrap_or(false)
+            })
+            .count()
+    }
+
+    /// Leaves an empty channel, the way `/stop` would: the queue is cleared and
+    /// the dashboard says nothing is playing, rather than showing a song nobody
+    /// can hear.
+    async fn leave_empty(&self, ctx: &SerenityContext, guild_id: GuildId) -> anyhow::Result<()> {
+        if self.manager.get(guild_id).is_none() {
+            return Ok(());
+        }
+        tracing::info!(guild_id = %guild_id, "nobody is left in the voice channel; leaving");
+        let player = ctx.data.read().await.get::<PlayerKey>().cloned();
+        if let Some(player) = player {
+            player.release_duck(guild_id);
+            player.stop(ctx, &self.config, guild_id).await;
+        }
+        self.stop(guild_id).await
+    }
+
+    /// What presence should be reconciled to.
     ///
-    /// Join whenever anyone is there, which is what makes a channel that was
-    /// already occupied at startup count the same as one somebody just walked
-    /// into. Leaving is only for a channel that has emptied, and a bot that is
-    /// already where it should be is left alone rather than rejoined.
-    fn what_to_do(member_count: usize, connected_to_target: bool) -> Presence {
-        match (member_count, connected_to_target) {
-            (0, true) => Presence::Leave,
-            (0, false) => Presence::None,
-            (_, true) => Presence::None,
-            (_, false) => Presence::Join,
+    /// `in_target` is how many people are in the configured channel, and
+    /// `here` how many are in the channel the bot is connected to, if it is in
+    /// one. That is usually the same channel, but not when someone dragged
+    /// the bot elsewhere, and an emptied channel is left either way.
+    ///
+    /// Join whenever anyone is in the target, which is what makes a channel
+    /// that was already occupied at startup count the same as one somebody
+    /// just walked into. A bot that is with people is left alone rather than
+    /// rejoined.
+    fn what_to_do(in_target: usize, here: Option<usize>) -> Presence {
+        match here {
+            Some(0) => Presence::Leave,
+            Some(_) => Presence::None,
+            None if in_target > 0 => Presence::Join,
+            None => Presence::None,
         }
     }
 
@@ -350,12 +393,12 @@ mod tests {
     #[test]
     fn an_occupied_channel_is_joined_without_anyone_moving() {
         assert_eq!(
-            VoiceService::what_to_do(1, false),
+            VoiceService::what_to_do(1, None),
             Presence::Join,
             "one person already there and the bot outside"
         );
         assert_eq!(
-            VoiceService::what_to_do(1, true),
+            VoiceService::what_to_do(1, Some(1)),
             Presence::None,
             "already where it should be"
         );
@@ -365,12 +408,21 @@ mod tests {
     /// on every sync would tear down the call the music is playing in.
     #[test]
     fn only_an_emptied_channel_is_left() {
-        assert_eq!(VoiceService::what_to_do(0, true), Presence::Leave);
+        assert_eq!(VoiceService::what_to_do(0, Some(0)), Presence::Leave);
         assert_eq!(
-            VoiceService::what_to_do(0, false),
+            VoiceService::what_to_do(0, None),
             Presence::None,
             "nothing to leave"
         );
-        assert_eq!(VoiceService::what_to_do(2, true), Presence::None);
+        assert_eq!(VoiceService::what_to_do(2, Some(2)), Presence::None);
+    }
+
+    /// Dragged into another channel, the bot stays while people are with it
+    /// and leaves once they are gone, whoever is in its own channel.
+    #[test]
+    fn a_bot_moved_elsewhere_leaves_when_that_channel_empties() {
+        assert_eq!(VoiceService::what_to_do(3, Some(1)), Presence::None);
+        assert_eq!(VoiceService::what_to_do(3, Some(0)), Presence::Leave);
+        assert_eq!(VoiceService::what_to_do(0, Some(2)), Presence::None);
     }
 }
