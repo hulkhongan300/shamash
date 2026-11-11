@@ -33,7 +33,9 @@ leaves the host.
   YouTube Music appear. Pick one and that exact song is queued.
 - **`/lock` and `/unlock`.** Turn listening off without removing the bot.
 - **Autonomous.** Joins when someone enters the configured channel, including
-  at startup, and leaves when it is empty.
+  at startup. Once nobody is left in its channel (other bots do not count)
+  it waits 15 seconds, in case someone only dropped out, then clears the queue
+  and leaves. That works even if someone dragged it into another channel.
 - **A queue and a dashboard.** A now-playing message in the text channel has
   Pause, Skip, Queue, Repeat and Stop buttons. It is edited in place, so the
   channel does not fill up.

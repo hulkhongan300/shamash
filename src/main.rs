@@ -9,7 +9,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// lines on top are only the ones worth reading while the bot runs: the models
 /// it loaded and the requests it handled. Serenity and songbird log a line per
 /// connection and per packet at info, which drowns those out.
-const DEFAULT_LOG: &str = "warn,shamash::pipeline=info,shamash::direct=info,shamash::bot=info";
+const DEFAULT_LOG: &str =
+    "warn,shamash::pipeline=info,shamash::direct=info,shamash::bot=info,shamash::voice=info";
 
 /// Whether an event is the RTCP warning that cannot be acted on.
 ///
@@ -156,7 +157,12 @@ mod tests {
     #[test]
     fn the_default_log_filter_keeps_the_pipeline_and_the_model_lines() {
         let d = directives();
-        for target in ["shamash::pipeline", "shamash::direct", "shamash::bot"] {
+        for target in [
+            "shamash::pipeline",
+            "shamash::direct",
+            "shamash::bot",
+            "shamash::voice",
+        ] {
             assert!(
                 d.contains(&format!("{target}=info")),
                 "{target} is silenced at info; DEFAULT_LOG is {DEFAULT_LOG}"

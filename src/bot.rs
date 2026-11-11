@@ -215,18 +215,31 @@ impl EventHandler for Handler {
         let Some(guild_id) = new.guild_id else {
             return;
         };
-        if new.user_id == ctx.cache.current_user().id {
-            return;
-        }
-
         let Ok(service) = VoiceService::from_ctx(&ctx).await else {
             return;
         };
         let target = ChannelId::new(service.config.voice_channel_id);
-        let touches_target = new.channel_id == Some(target)
-            || old.as_ref().and_then(|vs| vs.channel_id) == Some(target);
-        if !touches_target {
-            return;
+        let me = ctx.cache.current_user().id;
+        if new.user_id == me {
+            // Joining or leaving is the bot's own doing and needs no answer.
+            // Being dragged into another channel does: that one may be empty.
+            if new.channel_id.is_none() || new.channel_id == Some(target) {
+                return;
+            }
+        } else {
+            let touches = |channel: ChannelId| {
+                new.channel_id == Some(channel)
+                    || old.as_ref().and_then(|vs| vs.channel_id) == Some(channel)
+            };
+            let bot_channel = ctx.cache.guild(guild_id).and_then(|guild| {
+                guild
+                    .voice_states
+                    .get(&me)
+                    .and_then(|state| state.channel_id)
+            });
+            if !touches(target) && !bot_channel.is_some_and(touches) {
+                return;
+            }
         }
 
         if let Err(e) = service.sync_channel(&ctx, guild_id).await {
