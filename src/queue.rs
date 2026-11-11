@@ -75,6 +75,23 @@ pub struct Queued {
     pub url: String,
     /// Video id, used to build the thumbnail URL.
     pub video_id: String,
+    /// The song's length, when YouTube reported it.
+    pub duration_secs: Option<f64>,
+    /// How it was asked for, shown on the dashboard.
+    pub origin: Origin,
+}
+
+/// How a song came to be queued.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Origin {
+    /// Said to the bot in the voice channel, or picked from the chooser a
+    /// spoken request raised.
+    #[default]
+    Voice,
+    /// Typed with `/play`.
+    Slash,
+    /// One track of a playlist or album queued with `/play`.
+    Playlist,
 }
 
 impl Queued {
@@ -304,6 +321,8 @@ mod tests {
             artist: "someone".to_string(),
             url: format!("https://youtu.be/{title}"),
             video_id: title.to_string(),
+            duration_secs: None,
+            origin: Origin::Voice,
         }
     }
 
@@ -322,6 +341,8 @@ mod tests {
             artist: "someone".to_string(),
             url: format!("https://youtu.be/{title}"),
             video_id: title.to_string(),
+            duration_secs: None,
+            origin: Origin::Voice,
         }
     }
 

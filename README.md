@@ -41,8 +41,10 @@ leaves the host.
   at startup. Once nobody is left in its channel (other bots do not count)
   it waits 15 seconds, in case someone only dropped out, then clears the queue
   and leaves. That works even if someone dragged it into another channel.
-- **A queue and a dashboard.** A now-playing message in the text channel has
-  Pause, Skip, Queue, Repeat and Stop buttons. It is edited in place, so the
+- **A queue and a dashboard.** A now-playing message in the text channel shows
+  the song, its length, how it was asked for and what plays next, with Pause,
+  Skip, Queue, Repeat and Stop buttons (Stop on its own row, so it is not hit
+  by accident). It turns grey while paused. It is edited in place, so the
   channel does not fill up.
 - **Fast playback.** Songs stream from YouTube while they are cached, and a
   song asked for again plays from the cache.
