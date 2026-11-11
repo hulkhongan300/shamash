@@ -106,6 +106,9 @@ docker compose pull && docker compose up -d   # update to the published image
 docker compose build && docker compose up -d  # or rebuild from this checkout
 ```
 
+To have a machine update itself whenever `main` changes, see
+[deploy/README.md](deploy/README.md).
+
 #### From source
 
 - Rust (edition 2024)

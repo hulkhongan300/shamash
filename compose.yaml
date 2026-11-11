@@ -10,7 +10,7 @@ services:
   shamash:
     # Pulled from GitHub's registry when it is published there; built from
     # this checkout otherwise (`docker compose build` forces a local build).
-    image: ghcr.io/hulkhongan300/shamash:latest
+    image: ghcr.io/hulkhongan300/shamash:main
     build: .
     restart: unless-stopped
     env_file: .env
