@@ -820,7 +820,10 @@ struct Dashboards(Arc<Mutex<HashMap<GuildId, Dashboard>>>);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     NowPlaying,
-    Queue,
+    /// The queue, with the id of the waiting song picked for editing, if any.
+    Queue {
+        selected: Option<u64>,
+    },
 }
 
 impl Dashboards {
@@ -1551,7 +1554,65 @@ impl Player {
 
     /// Shows what is waiting in the queue instead of the now-playing view.
     pub async fn show_queue(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
-        draw(&self.board(), ctx, config, guild_id, Some(Page::Queue)).await;
+        self.pick_in_queue(ctx, config, guild_id, None).await;
+    }
+
+    /// Redraws the queue view with `selected` picked for editing.
+    pub async fn pick_in_queue(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        selected: Option<u64>,
+    ) {
+        draw(
+            &self.board(),
+            ctx,
+            config,
+            guild_id,
+            Some(Page::Queue { selected }),
+        )
+        .await;
+    }
+
+    /// Removes or moves the waiting song `id`, then redraws the queue view.
+    ///
+    /// The song is named by id, so a song that started playing or was removed
+    /// since it was picked is left alone rather than whatever took its place.
+    pub async fn edit_queue(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        edit: dashboard::Edit,
+        id: u64,
+    ) {
+        let queue = self.queues.get(guild_id);
+        let selected = match edit {
+            dashboard::Edit::Remove => {
+                match queue.remove(id) {
+                    Some(song) => {
+                        tracing::info!(guild_id = %guild_id, title = %song.title, "removed from the queue")
+                    }
+                    None => {
+                        tracing::info!(guild_id = %guild_id, id, "the song to remove is no longer waiting")
+                    }
+                }
+                None
+            }
+            dashboard::Edit::Shift(shift) => match queue.shift(id, shift) {
+                Some(position) => {
+                    tracing::info!(guild_id = %guild_id, id, ?shift, position, "moved in the queue");
+                    // Kept picked, so pressing up again moves it again.
+                    Some(id)
+                }
+                None => {
+                    tracing::info!(guild_id = %guild_id, id, "the song to move is no longer waiting");
+                    None
+                }
+            },
+        };
+        self.pick_in_queue(ctx, config, guild_id, selected).await;
     }
 
     /// Goes back from the queue view to the now-playing one.
@@ -2419,7 +2480,7 @@ async fn paint(
         _ => None,
     };
     let view = match page {
-        Page::Queue => dashboard::queue_view(&queue.pending_songs()),
+        Page::Queue { selected } => dashboard::queue_view(&queue.waiting(), selected),
         Page::NowPlaying => match &current {
             Some(song) => dashboard::dashboard(
                 song,
@@ -2532,8 +2593,9 @@ mod tests {
 
         assert_eq!(dashboards.page(guild), Page::NowPlaying);
 
-        dashboards.set(guild, ChannelId::new(1), MessageId::new(2), Page::Queue);
-        assert_eq!(dashboards.page(guild), Page::Queue);
+        let queue = Page::Queue { selected: Some(3) };
+        dashboards.set(guild, ChannelId::new(1), MessageId::new(2), queue);
+        assert_eq!(dashboards.page(guild), queue, "and the song picked in it");
 
         // Forgetting the dashboard is what happens when a message is deleted;
         // the next post starts on now-playing rather than inheriting a page
@@ -2548,7 +2610,10 @@ mod tests {
     fn only_a_moving_progress_bar_is_refreshed() {
         assert!(worth_refreshing(Page::NowPlaying, true, false));
         assert!(!worth_refreshing(Page::NowPlaying, true, true), "paused");
-        assert!(!worth_refreshing(Page::Queue, true, false), "queue view");
+        assert!(
+            !worth_refreshing(Page::Queue { selected: None }, true, false),
+            "queue view"
+        );
         assert!(
             !worth_refreshing(Page::NowPlaying, false, false),
             "nothing playing, or a song of unknown length"

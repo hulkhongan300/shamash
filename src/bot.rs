@@ -17,7 +17,8 @@ use serenity::builder::{
     CreateInteractionResponseFollowup, CreateInteractionResponseMessage, EditInteractionResponse,
 };
 use serenity::model::application::{
-    CommandInteraction, CommandOptionType, ComponentInteraction, Interaction, ResolvedValue,
+    CommandInteraction, CommandOptionType, ComponentInteraction, ComponentInteractionDataKind,
+    Interaction, ResolvedValue,
 };
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
@@ -684,10 +685,21 @@ impl Handler {
     /// interaction that goes unanswered within three seconds and a skip may
     /// have to download nothing but still waits on the voice lock.
     async fn dashboard_button(&self, ctx: &Context, button: ComponentInteraction) {
-        let Some(action) = dashboard::action_from_id(&button.data.custom_id) else {
+        let id = button.data.custom_id.as_str();
+        let press = if let Some(action) = dashboard::action_from_id(id) {
+            Press::Action(action)
+        } else if dashboard::is_pick(id) {
+            Press::Pick(match &button.data.kind {
+                ComponentInteractionDataKind::StringSelect { values } => dashboard::picked(values),
+                _ => None,
+            })
+        } else if let Some((edit, song)) = dashboard::edit_from_id(id) {
+            Press::Edit(edit, song)
+        } else {
             // Some other component's press; not ours to answer.
             return;
         };
+        let action = id.to_string();
         let Some(guild_id) = button.guild_id else {
             return;
         };
@@ -695,7 +707,7 @@ impl Handler {
             tracing::info!(
                 guild_id = %guild_id,
                 user = %button.user.id,
-                action = action,
+                action = %action,
                 "a dashboard button was pressed from outside the voice channel"
             );
             refuse(ctx, button).await;
@@ -719,6 +731,15 @@ impl Handler {
             return;
         };
 
+        let action = match press {
+            Press::Action(action) => action,
+            Press::Pick(selected) => {
+                return player.pick_in_queue(ctx, &config, guild_id, selected).await;
+            }
+            Press::Edit(edit, song) => {
+                return player.edit_queue(ctx, &config, guild_id, edit, song).await;
+            }
+        };
         match action {
             dashboard::ACTION_PAUSE | dashboard::ACTION_RESUME => {
                 match player.toggle_pause(guild_id).await {
@@ -763,6 +784,14 @@ async fn drop_question(
     if let Err(e) = ctx.http.delete_message(channel_id, message_id, None).await {
         tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not clear the song choice");
     }
+}
+
+/// A press on the dashboard: one of its buttons, a song picked from the queue
+/// view's menu, or a change to the queue from the buttons under it.
+enum Press<'a> {
+    Action(&'a str),
+    Pick(Option<u64>),
+    Edit(dashboard::Edit, u64),
 }
 
 /// What a press on a `/play` chooser means.

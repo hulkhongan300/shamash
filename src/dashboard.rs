@@ -3,10 +3,11 @@
 //! An embed plus buttons. Discord echoes a button's `custom_id` back on every
 //! press, which is how the press is matched to [`action_from_id`].
 
-use crate::queue::{Origin, Queued};
+use crate::queue::{Origin, Queued, Shift, Waiting};
 use serenity::all::ReactionType;
 use serenity::builder::{
-    CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, CreateMessage, EditMessage,
+    CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, CreateMessage, CreateSelectMenu,
+    CreateSelectMenuKind, CreateSelectMenuOption, EditMessage,
 };
 use serenity::model::application::ButtonStyle;
 
@@ -38,6 +39,39 @@ pub const ACTION_NEXT: &str = "next";
 
 /// Throws away a `/play` search.
 pub const ACTION_NOTHING: &str = "nothing";
+
+/// The queue view's song picker: a select menu rather than a button per song,
+/// because Discord fits five rows of five buttons in a message and the queue
+/// holds twenty songs plus the controls.
+const PICK: &str = "pick";
+
+/// Marks a custom id as one of the queue view's edit buttons, which carries
+/// the id of the song it acts on.
+const EDIT_PREFIX: &str = "edit";
+
+/// A change to the queue, made from the queue view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edit {
+    /// Take the song out of the queue.
+    Remove,
+    /// Move the song to another place in the queue.
+    Shift(Shift),
+}
+
+impl Edit {
+    /// The word in the custom id.
+    fn word(self) -> &'static str {
+        match self {
+            Edit::Remove => "remove",
+            Edit::Shift(Shift::Up) => "up",
+            Edit::Shift(Shift::Down) => "down",
+            Edit::Shift(Shift::Front) => "front",
+        }
+    }
+}
+
+/// Discord's limit on a select option's label and description.
+const MAX_OPTION: usize = 100;
 
 /// Marks a custom id as a `/play` song button, which names a position in the
 /// guild's outstanding search rather than an action.
@@ -74,6 +108,39 @@ pub fn action_from_id(custom_id: &str) -> Option<&str> {
         | ACTION_REPEAT | ACTION_NEXT | ACTION_NOTHING => Some(action),
         _ => None,
     }
+}
+
+/// Whether a custom id is the queue view's song picker.
+pub fn is_pick(custom_id: &str) -> bool {
+    custom_id == button_id(PICK)
+}
+
+/// The waiting song the picker chose, from the values Discord sent back.
+pub fn picked(values: &[String]) -> Option<u64> {
+    values.first()?.parse().ok()
+}
+
+/// Builds the custom id for an edit button acting on the waiting song `id`.
+///
+/// The song is named by its queue id rather than its position, so a press
+/// still acts on the song that was picked after the queue has moved on.
+fn edit_id(edit: Edit, id: u64) -> String {
+    format!("{PREFIX}:{EDIT_PREFIX}:{}:{id}", edit.word())
+}
+
+/// Recovers the change and the song from an edit button's custom id.
+pub fn edit_from_id(custom_id: &str) -> Option<(Edit, u64)> {
+    let rest = custom_id.strip_prefix(&format!("{PREFIX}:{EDIT_PREFIX}:"))?;
+    let (word, id) = rest.split_once(':')?;
+    let edit = [
+        Edit::Remove,
+        Edit::Shift(Shift::Up),
+        Edit::Shift(Shift::Down),
+        Edit::Shift(Shift::Front),
+    ]
+    .into_iter()
+    .find(|edit| edit.word() == word)?;
+    Some((edit, id.parse().ok()?))
 }
 
 /// Builds the custom id for a `/play` song button.
@@ -314,12 +381,26 @@ pub fn dashboard(
     }
 }
 
-/// The dashboard showing what is waiting, with the way back to now-playing.
+/// The dashboard showing what is waiting, with the controls to change it and
+/// the way back to now-playing.
 ///
 /// One line per song, numbered, under a summary of how many and how long: the
 /// queue holds up to twenty songs, and a block per song made it taller than the
 /// screen.
-pub fn queue_view(pending: &[Queued]) -> View {
+///
+/// A song is changed by picking it from the menu and then pressing one of the
+/// buttons under it, which act on `selected`. The buttons stay greyed out until
+/// a song is picked, and a move that would go nowhere is greyed out too.
+pub fn queue_view(waiting: &[Waiting], selected: Option<u64>) -> View {
+    // A pick whose song has since started or been removed picks nothing.
+    let selected = selected.and_then(|id| {
+        waiting
+            .iter()
+            .position(|w| w.id == id)
+            .map(|index| (index, id))
+    });
+    let pending: Vec<&Queued> = waiting.iter().map(|w| &w.song).collect();
+
     let mut embed = CreateEmbed::new().title("📜 Up next").color(PLAYING);
 
     if pending.is_empty() {
@@ -347,19 +428,87 @@ pub fn queue_view(pending: &[Queued]) -> View {
             if let Some(duration) = song.duration_secs {
                 line.push_str(&format!(" · {}", clock(duration)));
             }
+            if selected.is_some_and(|(at, _)| at == index) {
+                line.push_str(" ◀️");
+            }
             line
         }));
         embed = embed.description(trim(&lines.join("\n"), MAX_DESCRIPTION));
     }
 
+    let back = CreateActionRow::Buttons(vec![button(
+        ACTION_BACK,
+        "Back",
+        "◀️",
+        ButtonStyle::Secondary,
+    )]);
+    if waiting.is_empty() {
+        // Discord rejects a menu with no options, and there is nothing to edit.
+        return View {
+            embed,
+            buttons: vec![back],
+        };
+    }
+
+    let options = waiting
+        .iter()
+        .enumerate()
+        .map(|(index, w)| {
+            let label = trim(&format!("{}. {}", index + 1, w.song.title), MAX_OPTION);
+            let mut option = CreateSelectMenuOption::new(label, w.id.to_string())
+                .default_selection(selected.is_some_and(|(_, id)| id == w.id));
+            if !w.song.artist.is_empty() {
+                option = option.description(trim(&w.song.artist, MAX_OPTION));
+            }
+            option
+        })
+        .collect();
+    let picker = CreateSelectMenu::new(button_id(PICK), CreateSelectMenuKind::String { options })
+        .placeholder("Pick a song to move or remove");
+
+    let last = waiting.len() - 1;
+    let edit = |edit: Edit, label: &str, emoji: &str, style: ButtonStyle, useful: bool| {
+        // With nothing picked the id is left off: a greyed-out button still
+        // needs an id, and one that names no song can never act.
+        let id = match selected {
+            Some((_, id)) => edit_id(edit, id),
+            None => format!("{PREFIX}:{EDIT_PREFIX}:{}", edit.word()),
+        };
+        CreateButton::new(id)
+            .label(label)
+            .emoji(ReactionType::Unicode(emoji.to_string()))
+            .style(style)
+            .disabled(selected.is_none() || !useful)
+    };
+    let at = selected.map(|(index, _)| index);
+    let controls = CreateActionRow::Buttons(vec![
+        edit(
+            Edit::Shift(Shift::Front),
+            "Play next",
+            "⏫",
+            ButtonStyle::Primary,
+            at != Some(0),
+        ),
+        edit(
+            Edit::Shift(Shift::Up),
+            "Up",
+            "🔼",
+            ButtonStyle::Secondary,
+            at != Some(0),
+        ),
+        edit(
+            Edit::Shift(Shift::Down),
+            "Down",
+            "🔽",
+            ButtonStyle::Secondary,
+            at != Some(last),
+        ),
+        edit(Edit::Remove, "Remove", "🗑️", ButtonStyle::Danger, true),
+    ]);
+
     View {
         embed,
-        buttons: vec![CreateActionRow::Buttons(vec![button(
-            ACTION_BACK,
-            "Back",
-            "◀️",
-            ButtonStyle::Secondary,
-        )])],
+        buttons: vec![CreateActionRow::SelectMenu(picker), controls, back],
     }
 }
 
@@ -690,6 +839,143 @@ mod tests {
         assert_eq!(action_from_id(""), None);
     }
 
+    /// Songs as the queue hands them to the queue view, numbered from 0.
+    fn waiting(songs: &[Queued]) -> Vec<Waiting> {
+        songs
+            .iter()
+            .cloned()
+            .zip(0..)
+            .map(|(song, id)| Waiting { id, song })
+            .collect()
+    }
+
+    /// The queue view's components as JSON.
+    fn queue_rows(waiting: &[Waiting], selected: Option<u64>) -> Vec<serde_json::Value> {
+        serde_json::to_value(&queue_view(waiting, selected).buttons)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    /// The edit buttons' (custom id, disabled) in the order shown.
+    fn edit_buttons(waiting: &[Waiting], selected: Option<u64>) -> Vec<(String, bool)> {
+        queue_rows(waiting, selected)[1]["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                (
+                    b["custom_id"].as_str().unwrap().to_string(),
+                    b["disabled"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect()
+    }
+
+    /// A long queue cannot have a button per song, so songs are picked from
+    /// one menu, and the controls and Back fit under it.
+    #[test]
+    fn the_queue_view_picks_a_song_from_a_menu() {
+        let queue = waiting(&vec![song(); crate::queue::MAX_QUEUE]);
+        let rows = queue_rows(&queue, None);
+        assert_eq!(rows.len(), 3, "menu, controls, back: {rows:?}");
+        let menu = &rows[0]["components"][0];
+        assert_eq!(menu["custom_id"], "shamash:pick");
+        let options = menu["options"].as_array().unwrap();
+        assert_eq!(options.len(), crate::queue::MAX_QUEUE);
+        assert_eq!(options[0]["label"], "1. A Song");
+        assert_eq!(options[0]["value"], "0");
+        assert_eq!(options[0]["description"], "An Artist");
+        assert_eq!(rows[2]["components"][0]["custom_id"], "shamash:back");
+    }
+
+    /// Until a song is picked, there is nothing for the buttons to act on.
+    #[test]
+    fn the_edit_buttons_wait_for_a_pick() {
+        let queue = waiting(&[song(), song()]);
+        for (id, disabled) in edit_buttons(&queue, None) {
+            assert!(disabled, "{id} must be greyed out with nothing picked");
+            assert!(edit_from_id(&id).is_none(), "{id} must not name a song");
+        }
+    }
+
+    /// The buttons carry the picked song's id, so they act on it even after
+    /// the queue has shifted under the view.
+    #[test]
+    fn the_edit_buttons_name_the_picked_song() {
+        let queue = waiting(&[song(), song(), song()]);
+        let buttons = edit_buttons(&queue, Some(1));
+        let edits: Vec<_> = buttons
+            .iter()
+            .map(|(id, _)| edit_from_id(id).expect("names a song"))
+            .collect();
+        assert_eq!(
+            edits,
+            [
+                (Edit::Shift(Shift::Front), 1),
+                (Edit::Shift(Shift::Up), 1),
+                (Edit::Shift(Shift::Down), 1),
+                (Edit::Remove, 1),
+            ]
+        );
+        assert!(buttons.iter().all(|(_, disabled)| !disabled), "{buttons:?}");
+
+        let menu = &queue_rows(&queue, Some(1))[0]["components"][0];
+        assert_eq!(menu["options"][1]["default"], true, "the pick stays shown");
+        assert_eq!(menu["options"][0]["default"], false);
+    }
+
+    /// A move that would go nowhere is greyed out rather than doing nothing.
+    #[test]
+    fn a_song_at_either_end_cannot_move_past_it() {
+        let queue = waiting(&[song(), song()]);
+        let disabled = |selected| -> Vec<bool> {
+            edit_buttons(&queue, Some(selected))
+                .into_iter()
+                .map(|(_, disabled)| disabled)
+                .collect()
+        };
+        // Play next, up, down, remove.
+        assert_eq!(disabled(0), [true, true, false, false]);
+        assert_eq!(disabled(1), [false, false, true, false]);
+    }
+
+    /// A pick whose song has since started playing is no pick at all.
+    #[test]
+    fn a_pick_that_is_no_longer_waiting_picks_nothing() {
+        let queue = waiting(&[song()]);
+        assert!(edit_buttons(&queue, Some(7)).iter().all(|(_, d)| *d));
+    }
+
+    /// An empty queue has nothing to pick, and Discord rejects an empty menu.
+    #[test]
+    fn an_empty_queue_has_only_the_way_back() {
+        let rows = queue_rows(&[], None);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["components"][0]["custom_id"], "shamash:back");
+    }
+
+    #[test]
+    fn an_edit_id_round_trips_and_strangers_are_ignored() {
+        for edit in [
+            Edit::Remove,
+            Edit::Shift(Shift::Up),
+            Edit::Shift(Shift::Down),
+            Edit::Shift(Shift::Front),
+        ] {
+            assert_eq!(edit_from_id(&edit_id(edit, 42)), Some((edit, 42)));
+        }
+        assert_eq!(edit_from_id("shamash:edit:explode:1"), None);
+        assert_eq!(edit_from_id("shamash:edit:remove:x"), None);
+        assert_eq!(edit_from_id("shamash:remove"), None);
+        assert_eq!(action_from_id("shamash:edit:remove:1"), None);
+        assert!(is_pick("shamash:pick"));
+        assert!(!is_pick("shamash:pause"));
+        assert_eq!(picked(&["12".to_string()]), Some(12));
+        assert_eq!(picked(&[]), None);
+    }
+
     /// The view as Discord would receive it, for asserting on its contents.
     fn rendered(view: &View) -> String {
         serde_json::to_string(&(&view.embed, &view.buttons)).expect("view serialises")
@@ -852,7 +1138,7 @@ mod tests {
         assert!(now_playing.contains("Queue"), "{now_playing}");
         assert!(!now_playing.contains("Back"), "{now_playing}");
 
-        let queue = rendered(&queue_view(&[song()]));
+        let queue = rendered(&queue_view(&waiting(&[song()]), None));
         assert!(queue.contains("Back"), "{queue}");
         // Back is the only way off, so a queue view without it is a dead end.
         assert!(!queue.contains("Stop"), "{queue}");
@@ -862,10 +1148,13 @@ mod tests {
     /// named, soonest first.
     #[test]
     fn the_queue_view_lists_every_waiting_song_in_order() {
-        let view = queue_view(&[
-            named("Rhymes Like Dimes", "MF DOOM", Some(259.0)),
-            named("All Caps", "Madvillain", Some(130.0)),
-        ]);
+        let view = queue_view(
+            &waiting(&[
+                named("Rhymes Like Dimes", "MF DOOM", Some(259.0)),
+                named("All Caps", "Madvillain", Some(130.0)),
+            ]),
+            None,
+        );
         let description = description_of(view);
         assert!(
             description.starts_with("**2 songs · 6 min**"),
@@ -880,7 +1169,10 @@ mod tests {
     /// A song of unknown length makes the total a lower bound.
     #[test]
     fn a_queue_with_an_unknown_length_says_over() {
-        let view = queue_view(&[named("A", "", Some(600.0)), named("B", "", None)]);
+        let view = queue_view(
+            &waiting(&[named("A", "", Some(600.0)), named("B", "", None)]),
+            None,
+        );
         assert!(description_of(view).starts_with("**2 songs · over 10 min**"));
     }
 
@@ -888,7 +1180,7 @@ mod tests {
     fn the_queue_view_keeps_the_order_and_artist() {
         let mut second = song();
         second.title = "Second Song".to_string();
-        let view = queue_view(&[song(), second]);
+        let view = queue_view(&waiting(&[song(), second]), None);
         let json = serde_json::to_string(&view.embed).expect("embed serialises");
         let first_at = json.find("A Song").expect("the first song is listed");
         let second_at = json.find("Second Song").expect("the second song is listed");
@@ -900,7 +1192,7 @@ mod tests {
     /// an embed with nothing in it.
     #[test]
     fn an_empty_queue_says_so() {
-        let view = queue_view(&[]);
+        let view = queue_view(&[], None);
         assert!(
             rendered(&view).contains("Nothing is queued"),
             "{}",
@@ -973,7 +1265,7 @@ mod tests {
         long.title = "x".repeat(400);
         let mut queue = vec![long; crate::queue::MAX_QUEUE];
         queue[0].artist = "y".repeat(400);
-        let description = description_of(queue_view(&queue));
+        let description = description_of(queue_view(&waiting(&queue), None));
         assert!(
             description.chars().count() <= MAX_DESCRIPTION,
             "{} chars",
