@@ -277,7 +277,7 @@ enum Offer {
 }
 
 /// How a chosen song was asked for: shown on the dashboard, and, for a pick
-/// from a spoken request's chooser, the words to remember it by.
+/// from a chooser, the words to remember it by.
 #[derive(Debug, Clone, Copy)]
 struct Via<'a> {
     said: Option<&'a str>,
@@ -312,6 +312,10 @@ struct Ask {
     /// The words that were typed or heard, echoed in the message and used for
     /// the upload search of whichever song gets picked.
     query: String,
+    /// The words a pick from this chooser is remembered by, cleaned the way a
+    /// spoken request is (see [`crate::parser::typed_request`]). Absent when
+    /// there is nothing to remember it by, such as a link.
+    said: Option<String>,
     /// Everything on offer, in rank order.
     offers: Vec<Offer>,
     /// Which window is on screen.
@@ -583,6 +587,45 @@ fn picked_track(
             video_id,
         },
     })
+}
+
+/// The words a pick from a typed `/play` search is remembered by.
+///
+/// Cleaned exactly the way a spoken request is, so a phrase taught by typing is
+/// found when spoken, and the other way round. A link is never remembered: it
+/// names one video already, and its cleaned-up letters mean nothing to say.
+fn remembered_as(typed: &str) -> Option<String> {
+    let is_link = typed.split_whitespace().any(|word| {
+        let word = word.to_ascii_lowercase();
+        word.contains("://") || word.starts_with("www.")
+    }) || crate::playlist::video_id(typed).is_some()
+        || crate::playlist::playlist_url(typed).is_some();
+    if is_link {
+        return None;
+    }
+    crate::parser::typed_request(typed).map(|request| request.query)
+}
+
+/// Moves `song` to the front of `tracks`, adding it when the catalog did not
+/// find it this time.
+fn put_first(tracks: &mut Vec<resolve::CatalogTrack>, song: resolve::CatalogTrack) {
+    let same = |track: &resolve::CatalogTrack| {
+        crate::matcher::normalize(&track.artist) == crate::matcher::normalize(&song.artist)
+            && crate::matcher::normalize(&track.title) == crate::matcher::normalize(&song.title)
+    };
+    let song = match tracks.iter().position(same) {
+        // The remembered video wins over the catalog's own: it is the one that
+        // was picked and played.
+        Some(at) => {
+            let found = tracks.remove(at);
+            resolve::CatalogTrack {
+                video_id: song.video_id.or(found.video_id),
+                ..found
+            }
+        }
+        None => song,
+    };
+    tracks.insert(0, song);
 }
 
 /// The songs waiting to be judged, by video URL.
@@ -1529,7 +1572,7 @@ impl Player {
                 .filter_map(|(title, artist)| Some((title?, artist?)))
                 .collect(),
         };
-        let tracks: Vec<resolve::CatalogTrack> = timing
+        let mut tracks: Vec<resolve::CatalogTrack> = timing
             .stage(
                 "catalog.hits",
                 self.catalog.hits(&resolve::Target::from_request(&request)),
@@ -1538,6 +1581,19 @@ impl Player {
             .iter()
             .map(|hit| hit.to_track())
             .collect();
+
+        // Words a pick was remembered for, typed or said, put that song first.
+        // Still a question rather than playing it: whoever typed `/play` asked
+        // to choose.
+        let said = remembered_as(query);
+        let recalled = said
+            .as_deref()
+            .zip(self.library.as_deref())
+            .and_then(|(said, library)| library.recall(said));
+        if let Some(track) = recalled {
+            tracing::info!(guild_id = %guild_id, said = ?said, track = %track.label(), "recalled from the song library");
+            put_first(&mut tracks, track.to_catalog_track());
+        }
 
         let total = tracks.len();
         if total == 0 {
@@ -1554,6 +1610,7 @@ impl Player {
                 })
                 .collect(),
             query: query.to_string(),
+            said,
             page: 0,
             owner: Owner::User(asker),
             posted: None,
@@ -1660,9 +1717,8 @@ impl Player {
             .cloned()
             .with_context(|| "that song is not in the search")?;
         self.asks.clear(guild_id);
-        // A spoken request's pick is remembered for those words. A typed
-        // `/play` search is not, yet.
-        let said = matches!(ask.owner, Owner::Voice).then_some(ask.query.as_str());
+        // A pick is remembered for the words that asked, typed or spoken.
+        let said = ask.said.as_deref();
         let origin = match ask.owner {
             Owner::Voice => crate::queue::Origin::Voice,
             Owner::User(_) => crate::queue::Origin::Slash,
@@ -1698,6 +1754,7 @@ impl Player {
         }
         let ask = Ask {
             query: query.to_string(),
+            said: Some(query.to_string()),
             offers,
             page: 0,
             owner: Owner::Voice,
@@ -2690,6 +2747,80 @@ mod tests {
         assert_eq!(picked_track(None, &upload(None, None, "playedvideo")), None);
     }
 
+    /// A typed search is remembered under the same words a spoken one is, so
+    /// one taught by typing is found when spoken, and the other way round.
+    #[test]
+    fn a_typed_search_is_remembered_like_the_same_words_spoken() {
+        let parser = crate::parser::CommandParser::new(["bot".to_string()]);
+        for (typed, spoken) in [
+            ("Don't Stop Me Now", "Bot, play don't stop me now."),
+            ("All Caps by MF DOOM", "bot play all caps by mf doom"),
+            ("  AC/DC — Thunderstruck!  ", "bot play acdc thunderstruck"),
+        ] {
+            let heard = parser.parse(spoken).expect("a request").query;
+            assert_eq!(remembered_as(typed), Some(heard), "for {typed:?}");
+        }
+        assert_eq!(remembered_as("!!!"), None);
+    }
+
+    /// Links are never remembered, YouTube or otherwise.
+    #[test]
+    fn a_link_is_never_remembered() {
+        for link in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://music.youtube.com/playlist?list=OLAK5uy_abcdefghijk",
+            "www.example.com/song",
+            "https://soundcloud.com/artist/song",
+        ] {
+            assert_eq!(remembered_as(link), None, "for {link:?}");
+        }
+    }
+
+    fn catalog(artist: &str, title: &str, video_id: Option<&str>) -> resolve::CatalogTrack {
+        resolve::CatalogTrack {
+            artist: artist.to_string(),
+            title: title.to_string(),
+            duration_secs: Some(130.0),
+            popularity: None,
+            video_id: video_id.map(str::to_string),
+        }
+    }
+
+    /// A remembered song already in the results moves to the top, once, and
+    /// keeps the video that was picked last time.
+    #[test]
+    fn a_recalled_song_found_again_moves_to_the_front() {
+        let mut tracks = vec![
+            catalog("MF DOOM", "All Caps (Remix)", None),
+            catalog("Madvillain", "All Caps", Some("catalogsown")),
+        ];
+        put_first(
+            &mut tracks,
+            catalog("madvillain", "ALL CAPS", Some("playedvideo")),
+        );
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].artist, "Madvillain");
+        assert_eq!(tracks[0].video_id.as_deref(), Some("playedvideo"));
+        assert_eq!(tracks[1].title, "All Caps (Remix)");
+    }
+
+    /// A remembered song the catalog did not find this time is offered anyway.
+    #[test]
+    fn a_recalled_song_missing_from_the_results_is_added_first() {
+        let mut tracks = vec![catalog("MF DOOM", "Rhymes Like Dimes", None)];
+        put_first(
+            &mut tracks,
+            catalog("Stones Throw", "Madvillain - All Caps", Some("playedvideo")),
+        );
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].title, "Madvillain - All Caps");
+
+        let mut empty = Vec::new();
+        put_first(&mut empty, catalog("Madvillain", "All Caps", None));
+        assert_eq!(empty.len(), 1);
+    }
+
     /// A song already in hand, as `commit` receives one.
     fn queued(title: &str) -> Queued {
         Queued {
@@ -3021,6 +3152,7 @@ mod tests {
     fn ask_with(count: usize, owner: Owner) -> Ask {
         Ask {
             query: "dracula".to_string(),
+            said: Some("dracula".to_string()),
             offers: (0..count)
                 .map(|i| song_offer("Tame Impala", &format!("Song {i}")))
                 .collect(),
