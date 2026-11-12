@@ -763,6 +763,9 @@ impl Handler {
                 let repeat = player.toggle_repeat(ctx, &config, guild_id).await;
                 tracing::info!(guild_id = %guild_id, repeat, "toggled repeat");
             }
+            dashboard::ACTION_WRONG if !player.wrong_song(ctx, &config, guild_id).await => {
+                tracing::info!(guild_id = %guild_id, "wrong song pressed, but nothing remembered is playing");
+            }
             // `action_from_id` covers every live action above.
             _ => {}
         }

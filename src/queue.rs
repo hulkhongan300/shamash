@@ -79,6 +79,10 @@ pub struct Queued {
     pub duration_secs: Option<f64>,
     /// How it was asked for, shown on the dashboard.
     pub origin: Origin,
+    /// The words the song memory recalled this for, when it played because it
+    /// was remembered rather than looked up. The dashboard says so and offers
+    /// a Wrong song button, which needs these words to forget them.
+    pub remembered: Option<String>,
 }
 
 /// How a song came to be queued.
@@ -413,6 +417,7 @@ mod tests {
             video_id: title.to_string(),
             duration_secs: None,
             origin: Origin::Voice,
+            remembered: None,
         }
     }
 
@@ -433,6 +438,7 @@ mod tests {
             video_id: title.to_string(),
             duration_secs: None,
             origin: Origin::Voice,
+            remembered: None,
         }
     }
 

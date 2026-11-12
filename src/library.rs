@@ -340,15 +340,26 @@ impl Library {
         dropped
     }
 
-    /// Forgets an alias outright.
-    pub fn forget(&self, said: &str) {
+    /// Forgets an alias outright, and returns the song it meant.
+    ///
+    /// The Wrong song button's job: the listener has said, in one press, what
+    /// two quick skips would otherwise have to show.
+    pub fn forget(&self, said: &str) -> Option<Track> {
         let said = phrase_key(said);
         let mut state = self.lock();
-        state
+        let index = state
             .file
             .aliases
-            .retain(|alias| phrase_key(&alias.said) != said);
+            .iter()
+            .position(|alias| phrase_key(&alias.said) == said)?;
+        let forgotten = state.file.aliases.remove(index);
+        tracing::info!(
+            said = %forgotten.said,
+            track = %forgotten.track.label(),
+            "told it was the wrong song; forgetting that phrase"
+        );
         self.schedule(&mut state);
+        Some(forgotten.track)
     }
 
     /// How many aliases are remembered, for the startup log and the tests.
@@ -998,10 +1009,16 @@ mod tests {
     fn a_phrase_can_be_forgotten_by_hand() {
         let (_dir, library) = scratch("forget");
         library.remember(1, "dracula", &track("Tame Impala", "Dracula"), false);
-        library.forget("DRACULA!");
+        assert_eq!(
+            library.forget("DRACULA!"),
+            Some(track("Tame Impala", "Dracula")),
+            "it says which song it forgot"
+        );
         assert!(
             library.is_empty(),
             "forgotten through the same normalisation"
         );
+        assert_eq!(library.recall("dracula"), None);
+        assert_eq!(library.forget("dracula"), None, "nothing left to forget");
     }
 }
