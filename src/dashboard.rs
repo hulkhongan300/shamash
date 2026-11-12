@@ -158,6 +158,31 @@ fn clock(secs: f64) -> String {
     }
 }
 
+/// How many segments the progress bar is drawn with, the knob included.
+const BAR_WIDTH: usize = 12;
+
+/// "▬▬▬🔘▬▬▬▬ 1:12 / 3:26": how far into the song it is.
+///
+/// The position is clamped to the song, because songbird's clock can run a
+/// fraction past a length YouTube rounded down.
+fn progress_bar(position: f64, duration: f64) -> String {
+    let duration = duration.max(0.0);
+    let position = position.clamp(0.0, duration);
+    let fraction = if duration > 0.0 {
+        position / duration
+    } else {
+        0.0
+    };
+    let knob = ((fraction * (BAR_WIDTH - 1) as f64).round() as usize).min(BAR_WIDTH - 1);
+    format!(
+        "{}🔘{} {} / {}",
+        "▬".repeat(knob),
+        "▬".repeat(BAR_WIDTH - 1 - knob),
+        clock(position),
+        clock(duration)
+    )
+}
+
 /// "23 min", or "1 h 05 min" past an hour.
 fn total_time(secs: f64) -> String {
     let minutes = (secs.max(0.0) / 60.0).round() as u64;
@@ -197,7 +222,17 @@ fn song_line(title: &str, artist: &str) -> String {
 /// glance. `repeat` is stated on the button and in the embed, because a toggle
 /// whose state is only visible by its effect is one nobody trusts. `up_next` is
 /// the queue behind this song, of which the first is named.
-pub fn dashboard(song: &Queued, paused: bool, up_next: &[Queued], repeat: bool) -> View {
+///
+/// `position` is how far into the song playback is, in seconds. With a known
+/// length it is drawn as a progress bar in place of the bare length; without
+/// either, the dashboard says only what it knows.
+pub fn dashboard(
+    song: &Queued,
+    position: Option<f64>,
+    paused: bool,
+    up_next: &[Queued],
+    repeat: bool,
+) -> View {
     let mut embed = CreateEmbed::new()
         .title(trim(&song.title, MAX_TITLE))
         .url(&song.url)
@@ -212,13 +247,21 @@ pub fn dashboard(song: &Queued, paused: bool, up_next: &[Queued], repeat: bool) 
     if paused {
         lines.push("⏸️ **Paused**".to_string());
     }
-    let about: Vec<String> = song
-        .duration_secs
-        .map(clock)
-        .into_iter()
-        .chain([origin_label(song.origin).to_string()])
-        .collect();
-    lines.push(about.join(" · "));
+    match (position, song.duration_secs) {
+        (Some(position), Some(duration)) => {
+            lines.push(progress_bar(position, duration));
+            lines.push(origin_label(song.origin).to_string());
+        }
+        _ => {
+            let about: Vec<String> = song
+                .duration_secs
+                .map(clock)
+                .into_iter()
+                .chain([origin_label(song.origin).to_string()])
+                .collect();
+            lines.push(about.join(" · "));
+        }
+    }
     if repeat {
         lines.push("🔂 Repeating this song".to_string());
     }
@@ -654,7 +697,7 @@ mod tests {
 
     #[test]
     fn the_dashboard_carries_the_title_artist_and_thumbnail() {
-        let view = dashboard(&song(), false, &[], false);
+        let view = dashboard(&song(), None, false, &[], false);
         let json = serde_json::to_string(&view.embed).expect("embed serialises");
         assert!(json.contains("A Song"), "the title must be shown: {json}");
         assert!(
@@ -673,11 +716,11 @@ mod tests {
 
     #[test]
     fn a_playing_song_offers_pause_and_a_paused_one_offers_resume() {
-        let playing = rendered(&dashboard(&song(), false, &[], false));
+        let playing = rendered(&dashboard(&song(), None, false, &[], false));
         assert!(playing.contains("Pause"), "{playing}");
         assert!(!playing.contains("Resume"), "{playing}");
 
-        let paused = rendered(&dashboard(&song(), true, &[], false));
+        let paused = rendered(&dashboard(&song(), None, true, &[], false));
         assert!(paused.contains("Resume"), "{paused}");
         assert!(
             paused.contains("Paused"),
@@ -696,17 +739,17 @@ mod tests {
     /// The next song is named rather than counted, and the rest are summed up.
     #[test]
     fn the_next_song_is_named() {
-        let empty = rendered(&dashboard(&song(), false, &[], false));
+        let empty = rendered(&dashboard(&song(), None, false, &[], false));
         assert!(empty.contains("Nothing queued"), "{empty}");
 
         let next = [named("Rhymes Like Dimes", "MF DOOM", None)];
-        let one = rendered(&dashboard(&song(), false, &next, false));
+        let one = rendered(&dashboard(&song(), None, false, &next, false));
         assert!(one.contains("**Rhymes Like Dimes** — MF DOOM"), "{one}");
         assert!(!one.contains("more"), "{one}");
         assert!(one.contains("Queue (1)"), "{one}");
 
         let three = [next[0].clone(), song(), song()];
-        let many = rendered(&dashboard(&song(), false, &three, false));
+        let many = rendered(&dashboard(&song(), None, false, &three, false));
         assert!(many.contains("Rhymes Like Dimes"), "{many}");
         assert!(many.contains("+2 more"), "{many}");
         assert!(many.contains("Queue (3)"), "{many}");
@@ -715,14 +758,14 @@ mod tests {
     /// The length and how the song was asked for are shown under the title.
     #[test]
     fn the_dashboard_says_how_long_and_how_it_was_asked_for() {
-        let voice = description_of(dashboard(&song(), false, &[], false));
+        let voice = description_of(dashboard(&song(), None, false, &[], false));
         assert_eq!(voice, "3:26 · 🎤 asked by voice");
 
         let mut typed = song();
         typed.origin = Origin::Playlist;
         typed.duration_secs = None;
         assert_eq!(
-            description_of(dashboard(&typed, false, &[], false)),
+            description_of(dashboard(&typed, None, false, &[], false)),
             "💿 from a playlist"
         );
     }
@@ -731,8 +774,8 @@ mod tests {
     #[test]
     fn paused_and_repeat_are_visible_at_a_glance() {
         let colour = |view: &View| serde_json::to_value(&view.embed).unwrap()["color"].clone();
-        let playing = dashboard(&song(), false, &[], false);
-        let paused = dashboard(&song(), true, &[], true);
+        let playing = dashboard(&song(), None, false, &[], false);
+        let paused = dashboard(&song(), None, true, &[], true);
         assert_ne!(colour(&playing), colour(&paused));
         let description = description_of(paused);
         assert!(description.starts_with("⏸️ **Paused**"), "{description}");
@@ -768,8 +811,8 @@ mod tests {
         // lose the whole dashboard.
         let mut long = song();
         long.title = "x".repeat(400);
-        let json =
-            serde_json::to_string(&dashboard(&long, false, &[], false).embed).expect("serialises");
+        let json = serde_json::to_string(&dashboard(&long, None, false, &[], false).embed)
+            .expect("serialises");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         let title = value["title"].as_str().expect("a title");
         assert!(
@@ -805,7 +848,7 @@ mod tests {
     /// is unreachable.
     #[test]
     fn the_dashboard_offers_the_queue_and_the_queue_offers_the_way_back() {
-        let now_playing = rendered(&dashboard(&song(), false, &[song()], false));
+        let now_playing = rendered(&dashboard(&song(), None, false, &[song()], false));
         assert!(now_playing.contains("Queue"), "{now_playing}");
         assert!(!now_playing.contains("Back"), "{now_playing}");
 
@@ -869,11 +912,11 @@ mod tests {
     /// so the button has to say which way it is set.
     #[test]
     fn the_repeat_button_says_whether_repeat_is_on() {
-        let off = rendered(&dashboard(&song(), false, &[], false));
+        let off = rendered(&dashboard(&song(), None, false, &[], false));
         assert!(off.contains("Repeat"), "{off}");
         assert!(!off.contains("Repeat: on"), "off by default: {off}");
 
-        let on = rendered(&dashboard(&song(), false, &[], true));
+        let on = rendered(&dashboard(&song(), None, false, &[], true));
         assert!(on.contains("Repeat: on"), "{on}");
     }
 
@@ -881,7 +924,8 @@ mod tests {
     /// not pressed by accident, and every button has an icon.
     #[test]
     fn stop_has_a_row_of_its_own_and_nothing_was_lost() {
-        let value = serde_json::to_value(&dashboard(&song(), false, &[], false).buttons).unwrap();
+        let value =
+            serde_json::to_value(&dashboard(&song(), None, false, &[], false).buttons).unwrap();
         let rows = value.as_array().expect("rows");
         assert_eq!(rows.len(), 2, "{value}");
         let ids = |row: &serde_json::Value| -> Vec<String> {
@@ -913,7 +957,7 @@ mod tests {
     #[test]
     fn the_repeat_button_is_green_when_on() {
         let style = |repeat| {
-            serde_json::to_value(&dashboard(&song(), false, &[], repeat).buttons).unwrap()[0]
+            serde_json::to_value(&dashboard(&song(), None, false, &[], repeat).buttons).unwrap()[0]
                 ["components"][3]["style"]
                 .clone()
         };
@@ -1095,5 +1139,56 @@ mod tests {
         let json = description_of(ask("dracula", &offers(9), 1, 20));
         assert!(json.contains("Page 2 of 3"), "{json}");
         assert!(json.contains("dracula"), "the query is echoed: {json}");
+    }
+
+    #[test]
+    fn the_progress_bar_shows_how_far_into_the_song_it_is() {
+        assert_eq!(progress_bar(0.0, 206.0), "🔘▬▬▬▬▬▬▬▬▬▬▬ 0:00 / 3:26");
+        assert_eq!(progress_bar(206.0, 206.0), "▬▬▬▬▬▬▬▬▬▬▬🔘 3:26 / 3:26");
+        assert_eq!(progress_bar(72.0, 206.0), "▬▬▬▬🔘▬▬▬▬▬▬▬ 1:12 / 3:26");
+    }
+
+    /// Songbird's clock can pass a length YouTube rounded down, and a bar must
+    /// never be drawn longer than itself or say it is past the end.
+    #[test]
+    fn the_progress_bar_stays_within_the_song() {
+        assert_eq!(progress_bar(210.0, 206.0), progress_bar(206.0, 206.0));
+        assert_eq!(progress_bar(-3.0, 206.0), progress_bar(0.0, 206.0));
+        assert_eq!(progress_bar(5.0, 0.0), "🔘▬▬▬▬▬▬▬▬▬▬▬ 0:00 / 0:00");
+        for position in [0.0, 1.0, 50.5, 100.0, 205.9, 206.0] {
+            let bar = progress_bar(position, 206.0);
+            let segments = bar.chars().filter(|c| matches!(c, '▬' | '🔘')).count();
+            assert_eq!(segments, BAR_WIDTH, "{bar}");
+            assert_eq!(bar.matches('🔘').count(), 1, "{bar}");
+        }
+    }
+
+    #[test]
+    fn a_known_position_is_drawn_as_a_bar_in_place_of_the_length() {
+        let description = description_of(dashboard(&song(), Some(72.0), false, &[], false));
+        assert!(description.contains("🔘"), "{description}");
+        assert!(description.contains("1:12 / 3:26"), "{description}");
+        assert!(
+            description.contains("asked by voice"),
+            "how it was asked for is still said: {description}"
+        );
+
+        // Without a position, or without a length to measure it against, there
+        // is no bar, and the length is shown as before.
+        let unknown = description_of(dashboard(&song(), None, false, &[], false));
+        assert!(!unknown.contains("🔘"), "{unknown}");
+        assert!(unknown.contains("3:26"), "{unknown}");
+        let mut endless = song();
+        endless.duration_secs = None;
+        let endless = description_of(dashboard(&endless, Some(72.0), false, &[], false));
+        assert!(!endless.contains("🔘"), "{endless}");
+    }
+
+    /// Pausing stops the clock, so the paused dashboard shows where it stopped.
+    #[test]
+    fn a_paused_song_keeps_its_place_on_the_bar() {
+        let paused = description_of(dashboard(&song(), Some(72.0), true, &[], false));
+        assert!(paused.contains("Paused"), "{paused}");
+        assert!(paused.contains("1:12 / 3:26"), "{paused}");
     }
 }

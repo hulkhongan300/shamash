@@ -21,6 +21,7 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::OwnedMutexGuard;
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 
 /// Length of the acknowledgement tone.
 const BEEP_DURATION: Duration = Duration::from_millis(150);
@@ -161,6 +162,8 @@ pub struct Player {
     /// Where each guild's dashboard lives, so a new song edits the existing
     /// message instead of posting another one beside it.
     dashboards: Dashboards,
+    /// The timer per guild that moves the dashboard's progress bar along.
+    refreshes: Refreshes,
     /// Resolves a spoken request to a real song before YouTube is searched.
     catalog: Arc<resolve::Catalog>,
     /// The "which one did you mean" buttons currently on offer.
@@ -849,7 +852,70 @@ impl Dashboards {
     }
 }
 
+/// How often the dashboard of a playing song is redrawn to move its progress
+/// bar along.
+///
+/// Discord does not update a message by itself, and every redraw is an edit
+/// against the channel's rate limit, so the bar steps rather than glides.
+const REFRESH_EVERY: Duration = Duration::from_secs(15);
+
+/// The progress bar timer running for each guild.
+///
+/// At most one per guild: every redraw replaces it, so the next step is always
+/// a whole interval after the last edit, whoever made it.
+#[derive(Debug, Clone, Default)]
+struct Refreshes(Arc<Mutex<HashMap<GuildId, AbortHandle>>>);
+
+impl Refreshes {
+    /// Stops the guild's timer, if it has one.
+    fn stop(&self, guild_id: GuildId) {
+        if let Some(timer) = self.lock().remove(&guild_id) {
+            timer.abort();
+        }
+    }
+
+    /// Makes `timer` the guild's timer, stopping any it had before.
+    fn set(&self, guild_id: GuildId, timer: AbortHandle) {
+        if let Some(old) = self.lock().insert(guild_id, timer) {
+            old.abort();
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<GuildId, AbortHandle>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Whether a dashboard just drawn is worth redrawing for its progress bar.
+///
+/// Only the now-playing view of a song that is moving has a bar that moves: a
+/// paused song's bar is frozen until resume redraws it, and the queue view and
+/// the idle dashboard have no bar at all.
+fn worth_refreshing(page: Page, has_bar: bool, paused: bool) -> bool {
+    page == Page::NowPlaying && has_bar && !paused
+}
+
+/// What drawing a dashboard reads and keeps, owned so a refresh timer can
+/// outlive the call that started it.
+#[derive(Clone)]
+struct Board {
+    dashboards: Dashboards,
+    queues: Queues,
+    tracks: Tracks,
+    refreshes: Refreshes,
+}
+
 impl Player {
+    /// The parts of the player drawing a dashboard needs.
+    fn board(&self) -> Board {
+        Board {
+            dashboards: self.dashboards.clone(),
+            queues: self.queues.clone(),
+            tracks: self.tracks.clone(),
+            refreshes: self.refreshes.clone(),
+        }
+    }
+
     pub fn new(manager: Arc<Songbird>, catalog: Arc<resolve::Catalog>) -> Self {
         Self {
             manager,
@@ -857,6 +923,7 @@ impl Player {
             coordination: Coordination::default(),
             tracks: Tracks::default(),
             dashboards: Dashboards::default(),
+            refreshes: Refreshes::default(),
             catalog,
             asks: Asks::default(),
             ducks: Ducks::default(),
@@ -1416,7 +1483,7 @@ impl Player {
             manager: Arc::clone(&self.manager),
             queues: self.queues.clone(),
             tracks: self.tracks.clone(),
-            dashboards: self.dashboards.clone(),
+            board: self.board(),
             coordination: self.coordination.clone(),
             ctx: ctx.clone(),
             config: config.clone(),
@@ -1479,20 +1546,12 @@ impl Player {
     /// Safe to call when no channel is available; feedback is then skipped
     /// rather than failing the command.
     pub async fn draw_dashboard(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
-        draw(&self.dashboards, &self.queues, ctx, config, guild_id, None).await;
+        draw(&self.board(), ctx, config, guild_id, None).await;
     }
 
     /// Shows what is waiting in the queue instead of the now-playing view.
     pub async fn show_queue(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
-        draw(
-            &self.dashboards,
-            &self.queues,
-            ctx,
-            config,
-            guild_id,
-            Some(Page::Queue),
-        )
-        .await;
+        draw(&self.board(), ctx, config, guild_id, Some(Page::Queue)).await;
     }
 
     /// Goes back from the queue view to the now-playing one.
@@ -1502,15 +1561,7 @@ impl Player {
         config: &Config,
         guild_id: GuildId,
     ) {
-        draw(
-            &self.dashboards,
-            &self.queues,
-            ctx,
-            config,
-            guild_id,
-            Some(Page::NowPlaying),
-        )
-        .await;
+        draw(&self.board(), ctx, config, guild_id, Some(Page::NowPlaying)).await;
     }
 
     /// Turns repeat-one on or off and redraws, so the button says which way it
@@ -2144,7 +2195,7 @@ struct Follower {
     manager: Arc<Songbird>,
     queues: Queues,
     tracks: Tracks,
-    dashboards: Dashboards,
+    board: Board,
     coordination: Coordination,
     ctx: SerenityContext,
     config: Config,
@@ -2154,15 +2205,7 @@ struct Follower {
 impl Follower {
     /// Draws or updates this guild's dashboard.
     async fn draw_dashboard(&self) {
-        draw(
-            &self.dashboards,
-            &self.queues,
-            &self.ctx,
-            &self.config,
-            self.guild_id,
-            None,
-        )
-        .await;
+        draw(&self.board, &self.ctx, &self.config, self.guild_id, None).await;
     }
 }
 
@@ -2306,31 +2349,77 @@ impl EventHandler for FirstAudio {
     }
 }
 
-/// Draws or updates a guild's dashboard message.
+/// Draws or updates a guild's dashboard message, and keeps its progress bar
+/// moving while a song plays.
 ///
 /// `page` is None to keep whichever page the dashboard is already on, which is
 /// what every ordinary redraw wants: a song ending should not pull someone out
 /// of the queue they opened.
+///
+/// Any refresh timer is stopped before drawing, so it cannot paint an older
+/// state over this one, and a new one is started only when the bar drawn is
+/// one that moves. That is what stops the refreshing on pause, on the queue
+/// view, and when nothing is playing.
 async fn draw(
-    dashboards: &Dashboards,
-    queues: &Queues,
+    board: &Board,
     ctx: &SerenityContext,
     config: &Config,
     guild_id: GuildId,
     page: Option<Page>,
 ) {
-    let Some(channel) = resolve_alert_channel(ctx, config, guild_id) else {
+    board.refreshes.stop(guild_id);
+    if !paint(board, ctx, config, guild_id, page).await {
         return;
+    }
+    let (timer_board, ctx, config) = (board.clone(), ctx.clone(), config.clone());
+    let timer = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(REFRESH_EVERY).await;
+            if !paint(&timer_board, &ctx, &config, guild_id, None).await {
+                break;
+            }
+        }
+    });
+    board.refreshes.set(guild_id, timer.abort_handle());
+}
+
+/// Draws or updates a guild's dashboard message once.
+///
+/// Returns whether what it drew is worth redrawing later for its progress bar.
+async fn paint(
+    board: &Board,
+    ctx: &SerenityContext,
+    config: &Config,
+    guild_id: GuildId,
+    page: Option<Page>,
+) -> bool {
+    let Some(channel) = resolve_alert_channel(ctx, config, guild_id) else {
+        return false;
     };
+    let dashboards = &board.dashboards;
     let page = page.unwrap_or_else(|| dashboards.page(guild_id));
-    let queue = queues.get(guild_id);
+    let queue = board.queues.get(guild_id);
     let current = queue.current();
+    let paused = queue.is_paused();
+    // Asked of songbird rather than worked out from when the song started,
+    // because songbird's clock stops while the song is paused.
+    let position = match (&current, board.tracks.get(guild_id)) {
+        (Some(song), Some(track)) if page == Page::NowPlaying && song.duration_secs.is_some() => {
+            track
+                .get_info()
+                .await
+                .ok()
+                .map(|state| state.position.as_secs_f64())
+        }
+        _ => None,
+    };
     let view = match page {
         Page::Queue => dashboard::queue_view(&queue.pending_songs()),
         Page::NowPlaying => match &current {
             Some(song) => dashboard::dashboard(
                 song,
-                queue.is_paused(),
+                position,
+                paused,
                 &queue.pending_songs(),
                 queue.is_repeat(),
             ),
@@ -2349,18 +2438,21 @@ async fn draw(
                 // session.
                 tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "failed to update the dashboard");
                 dashboards.forget(guild_id);
-                if let Ok(sent) = channel.send_message(&ctx.http, view.into_message()).await {
-                    dashboards.set(guild_id, channel, sent.id, page);
+                match channel.send_message(&ctx.http, view.into_message()).await {
+                    Ok(sent) => dashboards.set(guild_id, channel, sent.id, page),
+                    Err(_) => return false,
                 }
             }
         }
         None => match channel.send_message(&ctx.http, view.into_message()).await {
             Ok(sent) => dashboards.set(guild_id, channel, sent.id, page),
             Err(e) => {
-                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "failed to post the dashboard")
+                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "failed to post the dashboard");
+                return false;
             }
         },
     }
+    worth_refreshing(page, position.is_some(), paused)
 }
 
 /// Builds the acknowledgement tone as an in-memory 16-bit PCM WAV.
@@ -2443,6 +2535,43 @@ mod tests {
         // whose message no longer exists.
         dashboards.forget(guild);
         assert_eq!(dashboards.page(guild), Page::NowPlaying);
+    }
+
+    /// The bar only needs redrawing while it moves: not while paused, not
+    /// behind the queue view, and not when there is no bar to move.
+    #[test]
+    fn only_a_moving_progress_bar_is_refreshed() {
+        assert!(worth_refreshing(Page::NowPlaying, true, false));
+        assert!(!worth_refreshing(Page::NowPlaying, true, true), "paused");
+        assert!(!worth_refreshing(Page::Queue, true, false), "queue view");
+        assert!(
+            !worth_refreshing(Page::NowPlaying, false, false),
+            "nothing playing, or a song of unknown length"
+        );
+    }
+
+    /// A redraw replaces the guild's timer rather than adding a second one, so
+    /// the edits never come faster than one per interval.
+    #[tokio::test]
+    async fn a_new_refresh_timer_stops_the_old_one() {
+        let refreshes = Refreshes::default();
+        let (one, two) = (GuildId::new(1), GuildId::new(2));
+        let forever = || tokio::spawn(std::future::pending::<()>());
+
+        let first = forever();
+        refreshes.set(one, first.abort_handle());
+        let other = forever();
+        refreshes.set(two, other.abort_handle());
+        let second = forever();
+        refreshes.set(one, second.abort_handle());
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(!other.is_finished(), "another guild's timer is left alone");
+
+        refreshes.stop(one);
+        assert!(second.await.unwrap_err().is_cancelled());
+        refreshes.stop(one);
+        refreshes.stop(two);
+        assert!(other.await.unwrap_err().is_cancelled());
     }
 
     /// The bug this commit exists for: `play` held the playback lock across the
