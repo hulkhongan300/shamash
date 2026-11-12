@@ -7,8 +7,11 @@
 //!
 //! Two things are stored:
 //!
-//! - **Aliases.** `normalize(transcript)` → the song it meant. An exact alias
-//!   hit skips the catalog entirely. It is written only when a listener picks
+//! - **Aliases.** [`phrase_key`]`(transcript)` → the song it meant. An alias
+//!   hit skips the catalog entirely. The same words hit, and so do the same
+//!   words said a little differently (a close mishearing, initials spelled
+//!   out) or the title alone of a song only one alias means; see
+//!   [`find_alias`] for how strict that is. It is written only when a listener picks
 //!   a song from the chooser for a spoken request: a song the bot chose by
 //!   itself is never remembered, however long it plays, because putting up with
 //!   a guess is not the same as asking for it.
@@ -115,9 +118,10 @@ impl Track {
 /// A phrase, and what it turned out to mean.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Alias {
-    /// [`matcher::normalize`] of the transcript. The raw text is not kept: the
-    /// whole point is that "billy eyelash bad guy" and "billy eilish bad guy"
-    /// reach the same entry once normalized.
+    /// [`phrase_key`] of the transcript. The raw text is not kept: the whole
+    /// point is that "M.F. DOOM" and "mf doom" reach the same entry. A file
+    /// written before the key glued letters still reads, because stored phrases
+    /// are keyed again when compared.
     pub said: String,
     pub track: Track,
     /// Unix seconds. Read once, so entries can be dropped oldest-first.
@@ -211,31 +215,22 @@ impl Library {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The song this exact phrase has meant before.
+    /// The song this phrase has meant before.
+    ///
+    /// Found by [`find_alias`]: the same words, the same words said a little
+    /// differently, or the title of exactly one remembered song.
     pub fn recall(&self, transcript: &str) -> Option<Track> {
-        let said = matcher::normalize(transcript);
+        let said = phrase_key(transcript);
         if said.is_empty() {
             return None;
         }
         let mut state = self.lock();
-        let found = state
-            .file
-            .aliases
-            .iter()
-            .find(|alias| alias.said == said)
-            .map(|alias| alias.track.clone());
-        if let Some(track) = &found {
-            if let Some(alias) = state
-                .file
-                .aliases
-                .iter_mut()
-                .find(|alias| &alias.track == track)
-            {
-                alias.last_used = now_seconds();
-            }
-            self.schedule(&mut state);
-        }
-        found
+        let at = find_alias(&state.file.aliases, &said)?;
+        let alias = &mut state.file.aliases[at];
+        alias.last_used = now_seconds();
+        let track = alias.track.clone();
+        self.schedule(&mut state);
+        Some(track)
     }
 
     /// Songs this guild has played that the request plausibly names.
@@ -260,7 +255,7 @@ impl Library {
     /// immediately: the listener chose it, so there is nothing to wait for.
     /// Everything else waits for [`KEPT_SECS`] -- see [`Self::finished`].
     pub fn remember(&self, guild: u64, said: &str, track: &Track, from_chooser: bool) {
-        let said = matcher::normalize(said);
+        let said = phrase_key(said);
         if said.is_empty() || track.title.trim().is_empty() {
             return;
         }
@@ -270,7 +265,7 @@ impl Library {
             .file
             .aliases
             .iter_mut()
-            .find(|alias| alias.said == said)
+            .find(|alias| phrase_key(&alias.said) == said)
         {
             Some(alias) => {
                 alias.track = track.clone();
@@ -315,17 +310,17 @@ impl Library {
     ///
     /// Returns whether this was the second such skip, in which case the alias is
     /// dropped: the bot has been taught the wrong thing twice.
+    ///
+    /// The alias is found the same way [`Self::recall`] found it, so a song
+    /// recalled by words said a little differently still counts against the
+    /// phrase that recalled it.
     pub fn quick_skip(&self, said: &str, track: &Track) -> bool {
-        let said = matcher::normalize(said);
+        let said = phrase_key(said);
         let mut state = self.lock();
-        let Some(alias) = state
-            .file
-            .aliases
-            .iter_mut()
-            .find(|alias| alias.said == said)
-        else {
+        let Some(at) = find_alias(&state.file.aliases, &said) else {
             return false;
         };
+        let alias = &mut state.file.aliases[at];
         if &alias.track != track {
             // The request resolved to a different song this time, so a quick
             // skip is about that song, not about this alias.
@@ -339,7 +334,7 @@ impl Library {
                 track = %alias.track.label(),
                 "skipped twice as fast as any song lasts; forgetting that phrase"
             );
-            state.file.aliases.retain(|kept| kept.said != said);
+            state.file.aliases.remove(at);
         }
         self.schedule(&mut state);
         dropped
@@ -347,9 +342,12 @@ impl Library {
 
     /// Forgets an alias outright.
     pub fn forget(&self, said: &str) {
-        let said = matcher::normalize(said);
+        let said = phrase_key(said);
         let mut state = self.lock();
-        state.file.aliases.retain(|alias| alias.said != said);
+        state
+            .file
+            .aliases
+            .retain(|alias| phrase_key(&alias.said) != said);
         self.schedule(&mut state);
     }
 
@@ -382,6 +380,109 @@ impl Library {
         let mut state = self.lock();
         write(&mut state);
     }
+}
+
+/// How close a phrase has to be to a remembered one to be taken for it.
+///
+/// Measured by [`matcher::sim`], so a mishearing that sounds the same ("mf
+/// dume" for "mf doom") reaches its phonetic floor of 0.92, and a one-letter
+/// slip in a phrase of any length clears it. "Lover" for "Love Story" scores
+/// about 0.82 and does not: a different song is worse than asking again.
+pub const CLOSE_PHRASE: f32 = 0.88;
+
+/// How far the closest remembered phrase has to be ahead of the closest one
+/// that means a different song. Two remembered songs both near what was said
+/// is exactly the case where guessing goes wrong.
+pub const CLOSE_MARGIN: f32 = matcher::MARGIN;
+
+/// The shortest phrase, in letters, that is matched by closeness at all.
+///
+/// One edit is a large part of a short phrase: "hey" and "hay" are a letter
+/// apart and nothing alike. Short phrases are only ever found exactly.
+const CLOSE_MIN_LETTERS: usize = 8;
+
+/// A phrase as it is compared: [`matcher::normalize`], with runs of single
+/// letters glued back into a word.
+///
+/// Transcription spells initials out: "M.F. DOOM" comes back as "m f doom",
+/// "A$AP" as "a ap". Gluing makes "m f doom" and "mf doom" one phrase. Digits
+/// are left alone, since "2 4 6" is not a word.
+pub fn phrase_key(text: &str) -> String {
+    let normalized = matcher::normalize(text);
+    let mut words: Vec<String> = Vec::new();
+    let mut glued = false;
+    for word in normalized.split_whitespace() {
+        let letter = word.chars().count() == 1 && word.chars().all(char::is_alphabetic);
+        match words.last_mut() {
+            Some(last) if letter && glued => last.push_str(word),
+            _ => words.push(word.to_string()),
+        }
+        glued = letter;
+    }
+    words.join(" ")
+}
+
+/// The numbers in a phrase. Two phrases that differ in a number name different
+/// songs ("Part 1", "Part 2"), however close the rest is.
+fn numbers(key: &str) -> Vec<&str> {
+    key.split_whitespace()
+        .filter(|word| word.chars().all(|c| c.is_ascii_digit()))
+        .collect()
+}
+
+/// Which remembered phrase `said` (a [`phrase_key`]) stands for, if any.
+///
+/// In order:
+///
+/// 1. The same phrase.
+/// 2. The title alone, when exactly one remembered song has that title. With
+///    two ("Hello" by Adele and by Lionel Richie) the title says nothing about
+///    which, so neither is taken.
+/// 3. A close phrase: at least [`CLOSE_PHRASE`] alike, with the same numbers,
+///    and [`CLOSE_MARGIN`] ahead of any phrase that means a different song.
+fn find_alias(aliases: &[Alias], said: &str) -> Option<usize> {
+    if said.is_empty() {
+        return None;
+    }
+    let keys: Vec<String> = aliases
+        .iter()
+        .map(|alias| phrase_key(&alias.said))
+        .collect();
+    if let Some(at) = keys.iter().position(|key| key == said) {
+        return Some(at);
+    }
+
+    let titled: Vec<usize> = (0..aliases.len())
+        .filter(|&at| phrase_key(&aliases[at].track.title) == said)
+        .collect();
+    if let Some(&first) = titled.first()
+        && titled
+            .iter()
+            .all(|&at| aliases[at].track == aliases[first].track)
+    {
+        return Some(first);
+    }
+
+    if said.chars().filter(|c| c.is_alphabetic()).count() < CLOSE_MIN_LETTERS {
+        return None;
+    }
+    let said_numbers = numbers(said);
+    let scored: Vec<(usize, f32)> = keys
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| numbers(key) == said_numbers)
+        .map(|(at, key)| (at, matcher::sim(said, key)))
+        .collect();
+    let &(best, score) = scored.iter().max_by(|a, b| a.1.total_cmp(&b.1))?;
+    if score < CLOSE_PHRASE {
+        return None;
+    }
+    let rival = scored
+        .iter()
+        .filter(|(at, _)| aliases[*at].track != aliases[best].track)
+        .map(|&(_, score)| score)
+        .fold(0.0_f32, f32::max);
+    (score - rival >= CLOSE_MARGIN).then_some(best)
 }
 
 /// Keeps the files bounded, dropping the least recently used first.
@@ -478,6 +579,128 @@ mod tests {
         assert_eq!(reopened.recall("all caps by mf doom!"), Some(picked));
         assert_eq!(reopened.recall("all caps by madvillain"), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The table from issue #33: the same request, transcribed a little
+    /// differently each time, finds the song that was picked.
+    #[test]
+    fn a_pick_is_found_when_said_a_little_differently() {
+        let (_dir, library) = scratch("said-differently");
+        let picked = track("Madvillain", "All Caps");
+        library.remember(1, "All Caps by MF DOOM", &picked, true);
+        for said in [
+            "All Caps by MF DOOM",
+            "All Caps by M.F. DOOM",
+            "all caps by m f doom",
+            "All Caps by MF Dume",
+            "All Caps",
+        ] {
+            assert_eq!(library.recall(said), Some(picked.clone()), "for {said:?}");
+        }
+    }
+
+    /// Spelled-out initials are glued back into a word; digits are not.
+    #[test]
+    fn single_letters_are_glued_back_together() {
+        assert_eq!(phrase_key("All Caps by M.F. DOOM"), "all caps by mf doom");
+        assert_eq!(phrase_key("a b c by the jackson 5"), "abc by the jackson 5");
+        assert_eq!(phrase_key("i want it that way"), "i want it that way");
+        assert_eq!(phrase_key("2 4 6 8"), "2 4 6 8");
+        assert_eq!(phrase_key(""), "");
+    }
+
+    /// The phrase is stored glued, so the two spellings are one entry.
+    #[test]
+    fn initials_spelled_out_are_the_same_entry() {
+        let (_dir, library) = scratch("glued-entry");
+        library.remember(
+            1,
+            "all caps by mf doom",
+            &track("Madvillain", "All Caps"),
+            true,
+        );
+        library.remember(
+            1,
+            "all caps by m f doom",
+            &track("Madvillain", "All Caps"),
+            true,
+        );
+        assert_eq!(library.len(), 1);
+    }
+
+    /// Close is not enough when a different song is about as close, or when
+    /// the difference is a word that changes the song.
+    #[test]
+    fn a_different_song_is_not_replaced_by_a_remembered_one() {
+        let (_dir, library) = scratch("strict");
+        library.remember(
+            1,
+            "lover by taylor swift",
+            &track("Taylor Swift", "Lover"),
+            true,
+        );
+        library.remember(
+            1,
+            "part 1 by some band",
+            &track("Some Band", "Part 1"),
+            true,
+        );
+        // One word apart, and a different song.
+        assert!(library.recall("love story by taylor swift").is_none());
+        // A different number is a different song, however close the rest.
+        assert!(library.recall("part 2 by some band").is_none());
+        // A short phrase is only ever found exactly.
+        library.remember(1, "hey", &track("Pixies", "Hey"), true);
+        assert!(library.recall("hay").is_none());
+    }
+
+    /// Two remembered songs both near what was said: neither is taken.
+    #[test]
+    fn a_close_phrase_needs_to_be_clearly_the_closest() {
+        let (_dir, library) = scratch("ambiguous");
+        library.remember(
+            1,
+            "dancing queen abba",
+            &track("ABBA", "Dancing Queen"),
+            true,
+        );
+        library.remember(
+            1,
+            "dancing green abba",
+            &track("Someone", "Dancing Green"),
+            true,
+        );
+        assert!(library.recall("dancing qween abba").is_none());
+    }
+
+    /// A title alone is used only when exactly one remembered song has it.
+    #[test]
+    fn a_title_alone_needs_exactly_one_song_with_it() {
+        let (_dir, library) = scratch("title-alone");
+        library.remember(1, "hello by adele", &track("Adele", "Hello"), true);
+        // Two phrases for the same song are still one song.
+        library.remember(1, "adele hello", &track("Adele", "Hello"), true);
+        assert_eq!(library.recall("hello"), Some(track("Adele", "Hello")));
+
+        library.remember(
+            1,
+            "hello lionel richie",
+            &track("Lionel Richie", "Hello"),
+            true,
+        );
+        assert!(library.recall("hello").is_none(), "which Hello?");
+    }
+
+    /// A song recalled by a close phrase still counts its quick skips against
+    /// the phrase that recalled it.
+    #[test]
+    fn quick_skips_reach_a_phrase_recalled_by_a_close_one() {
+        let (_dir, library) = scratch("close-skips");
+        let song = track("Madvillain", "All Caps");
+        library.remember(1, "all caps by mf doom", &song, true);
+        assert!(!library.quick_skip("all caps by m f doom", &song));
+        assert!(library.quick_skip("all caps by mf dume", &song));
+        assert!(library.is_empty());
     }
 
     /// The whole point: the same misheard phrase costs one lookup the first
