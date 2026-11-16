@@ -10,11 +10,11 @@
 //!
 //! That is what fixes the two ways this used to lose requests. The old gate
 //! started recording only after the wake word was recognised, so the words
-//! said in the same breath ("bot, play Drac…") were already gone; and it kept
+//! said in the same breath ("groovy, play Drac…") were already gone; and it kept
 //! only frames above a loudness gate, so what it did record had its quiet parts
 //! spliced out.
 //!
-//! A wake word said on its own ("bot", pause) leaves the speaker *armed*: the
+//! A wake word said on its own ("groovy", pause) leaves the speaker *armed*: the
 //! pipeline plays the ready tone, and the speaker's next utterance is taken as
 //! the request without needing the wake word again. See [`Armed`].
 
@@ -253,7 +253,7 @@ impl WakeGate {
         closing: Option<Vec<f32>>,
     ) -> Vec<Heard> {
         tracing::debug!(ssrc, transcript = %transcript, "wake model heard");
-        if !self.parser.contains_wake_word(transcript) {
+        if !self.parser.wakes_on(transcript) {
             return Vec::new();
         }
         match closing {
@@ -430,7 +430,7 @@ mod tests {
     }
 
     fn parser() -> CommandParser {
-        CommandParser::new(["shamash".to_string(), "bot".to_string()])
+        CommandParser::new(["shamash".to_string(), "groovy".to_string()])
     }
 
     fn gate(armed: &Armed) -> WakeGate {
@@ -477,7 +477,7 @@ mod tests {
         let armed = Armed::default();
         let mut gate = gate(&armed);
         gate.push(1, &voice(40));
-        let heard = gate.transcribed(1, "bot play dracula", None);
+        let heard = gate.transcribed(1, "groovy play dracula", None);
         assert!(matches!(heard[..], [Heard::Wake { ssrc: 1 }]));
 
         gate.push(1, &voice(100));
@@ -517,6 +517,18 @@ mod tests {
         );
     }
 
+    /// No tone, and the music is not lowered, for a wake word that is only
+    /// part of what someone is saying.
+    #[test]
+    fn a_wake_word_in_conversation_does_not_wake() {
+        let armed = Armed::default();
+        let mut gate = gate(&armed);
+        gate.push(1, &voice(40));
+        assert!(gate.transcribed(1, "that is so groovy", None).is_empty());
+        assert!(gate.transcribed(1, "i told groovy to", None).is_empty());
+        assert!(gate.transcribed(1, "but play it again", None).is_empty());
+    }
+
     #[test]
     fn a_wake_word_at_the_very_end_is_caught_by_the_closing_check() {
         let armed = Armed::default();
@@ -530,7 +542,7 @@ mod tests {
         else {
             panic!("expected a closing check");
         };
-        let heard = gate.transcribed(1, "okay then shamash", Some(audio));
+        let heard = gate.transcribed(1, "okay shamash", Some(audio));
         assert!(matches!(
             heard[..],
             [
@@ -549,8 +561,8 @@ mod tests {
         let armed = Armed::default();
         let mut gate = gate(&armed);
         gate.push(1, &voice(40));
-        assert_eq!(gate.transcribed(1, "bot", None).len(), 1);
-        assert!(gate.transcribed(1, "bot", None).is_empty());
+        assert_eq!(gate.transcribed(1, "groovy", None).len(), 1);
+        assert!(gate.transcribed(1, "groovy", None).is_empty());
         // And no more rolling checks once woken.
         assert_eq!(checks(&gate.push(1, &voice(100))), 0);
     }
@@ -580,7 +592,7 @@ mod tests {
         let mut gate = gate(&armed);
         gate.push(1, &voice(40));
         gate.push(2, &voice(40));
-        gate.transcribed(1, "bot", None);
+        gate.transcribed(1, "groovy", None);
         let other = gate.push(2, &quiet(50));
         assert!(
             other
@@ -615,7 +627,7 @@ mod tests {
         let seen = Arc::clone(&heard);
         let armed = Armed::default();
         let gate = WakeGate::with_detector(
-            Arc::new(FixedText("bot play dracula")),
+            Arc::new(FixedText("groovy play dracula")),
             parser(),
             armed,
             || Box::new(Marked),
@@ -639,7 +651,7 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&order);
         let gate = WakeGate::with_detector(
-            Arc::new(FixedText("bot play dracula")),
+            Arc::new(FixedText("groovy play dracula")),
             parser(),
             Armed::default(),
             || Box::new(Marked),

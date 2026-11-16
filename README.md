@@ -5,7 +5,7 @@ A wake-word Discord music bot written in Rust.
 Shamash sits in one voice channel, listens for its name, and plays the song
 that is asked for:
 
-> **"bot, play Dracula by Tame Impala"**
+> **"groovy, play Dracula by Tame Impala"**
 
 Speech recognition runs on your own machine through
 [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), so no audio

@@ -9,8 +9,8 @@ loaded:
 
 ```
 INFO shamash::direct: loaded ASR model model=... backend=Vulkan0 device=Vulkan0
-INFO shamash::bot: Shamash starting up request_model=... wake_model=... wake_words=bot, shamash
-INFO shamash::pipeline: request heard guild_id=... user=... transcript="Bot, play Dracula by Tame Impala."
+INFO shamash::bot: Shamash starting up request_model=... wake_model=... wake_words=groovy, shamash
+INFO shamash::pipeline: request heard guild_id=... user=... transcript="Groovy, play Dracula by Tame Impala."
 INFO shamash::pipeline: playing a request guild_id=... request="dracula by tame impala"
 ```
 
@@ -18,7 +18,7 @@ Set `RUST_LOG=shamash=debug` to also see what the wake model heard on each
 check, the catalog match, and the scores of the winner and the runner-up:
 
 ```
-wake model heard: "shamash play dracula"
+wake model heard: "groovy play dracula"
 resolved against the catalog provider=ytmusic catalog=Dracula — Tame Impala
   duration=Some(206.0) confidence=0.94 query=Tame Impala Dracula
 chose a video heard=drakula tame impala picked=Dracula channel=Tame Impala
@@ -34,12 +34,34 @@ bot has no key for, so it fires constantly on a working connection. The
 similar `RTP decryption failed` and `Decode error for SSRC` are kept, because
 they mean the bot has stopped hearing.
 
+### Counting false wakes
+
+Every time the tone played but what was said turned out not to be a request,
+the bot logs it with what it heard and why it was not a request:
+
+```
+INFO shamash::pipeline: woke, but heard no request guild_id=... user=...
+  transcript="I mean the whole set was groovy, man." armed=false reason=no "play" after the wake word
+```
+
+Count those against the `playing a request` lines over a few days of normal
+use to see how often the bot wakes when nobody was talking to it:
+
+```sh
+docker compose logs shamash | grep -c 'woke, but heard no request'
+docker compose logs shamash | grep -c 'playing a request'
+```
+
+The transcripts show which words set it off. A wake word that keeps showing
+up in conversation is a reason to change `WAKE_WORDS`.
+
 ## Common problems
 
 | Symptom | Likely cause |
 | --- | --- |
 | No tone at all | Listening is locked (`/unlock`), or the wake word is not recognised. Check the debug log for what the wake model heard, and adjust `WAKE_WORDS` |
 | A tone, then nothing plays | Look in the text channel: there is either a chooser or a message saying what was heard |
+| It wakes when nobody was talking to it | See [Counting false wakes](#counting-false-wakes). Then change `WAKE_WORDS` to something nobody says in conversation |
 | The wrong song plays | Press **Wrong song** if the dashboard says it was remembered. Otherwise name the artist, and check `RUST_LOG=shamash=debug` for the scores |
 | The first request after startup is slow | The request model loads on the first wake word. Later requests are fast |
 | Requests take many seconds | The model is running on the CPU. Check the `backend=` in the startup log |
@@ -59,14 +81,14 @@ real voice detector and wake gate. Then it transcribes every utterance the gate
 hands over with the request model, and applies the bot's grammar:
 
 ```
-  [  5.42s] wake model heard: "Bart play."
-  [  5.92s] wake model heard: "But play draccupy."
+  [  5.42s] wake model heard: "Grew."
+  [  5.92s] wake model heard: "Groovy play draccupy."
 >>> [  5.92s] wake word heard (tone 1)
 larger model ready in 2.86s
->>> utterance of 2.58 s transcribed in 1.17s: "Bot, play Dracula by Tame Impala."
+>>> utterance of 2.58 s transcribed in 1.17s: "Groovy, play Dracula by Tame Impala."
 play: dracula by tame impala
 >>> [  9.26s] wake word heard (tone 1)
->>> utterance of 0.87 s transcribed in 1.09s: "But,"
+>>> utterance of 0.87 s transcribed in 1.09s: "Groovy."
 wake word on its own: waiting for the request (tone 2)
 >>> utterance of 2.21 s transcribed in 1.08s: "Bohemian Rhapsody by Queen."
 play: bohemian rhapsody by queen

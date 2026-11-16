@@ -44,7 +44,7 @@ pub const SMALL_MODEL_ID: &str =
 /// biases it towards transcribing one: names capitalised as names, "by"
 /// between title and artist.
 pub const REQUEST_PROMPT: &str =
-    "Bot, play Dracula by Tame Impala. Play Bohemian Rhapsody by Queen.";
+    "Groovy, play Dracula by Tame Impala. Play Bohemian Rhapsody by Queen.";
 
 /// Turns a model spec into a path this process can open.
 ///
