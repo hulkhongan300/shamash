@@ -19,6 +19,9 @@ leaves the host.
 
 - **Hands-free requests.** Say the wake word and a song, in one breath or in
   two. The music ducks to 20% while you speak.
+- **Whole albums.** "Groovy, play the album 17 by XXXTENTACION" queues every
+  track. Without "album", the bot plays the album when no song has that name,
+  and asks when one does. See [Albums](docs/usage.md#albums).
 - **Always on, and cheap.** Only a voice detector runs continuously. The small
   wake model runs while someone is talking, and the large model only on an
   utterance that had the wake word in it.

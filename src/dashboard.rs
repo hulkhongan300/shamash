@@ -568,6 +568,19 @@ pub fn action_id(action: &str) -> String {
 ///
 /// Not an embed and not a button row: it is a sentence to read, it has to say
 /// what was heard, and nothing about it is actionable from Discord.
+/// A short message that something worked, such as an album being queued.
+///
+/// `markdown` is shown as written, so a name in it has to go through
+/// [`markdown_escape`] first.
+pub fn info(markdown: &str) -> View {
+    View {
+        embed: CreateEmbed::new()
+            .description(trim(markdown, MAX_DESCRIPTION))
+            .color(PLAYING),
+        buttons: Vec::new(),
+    }
+}
+
 pub fn notice(text: &str) -> View {
     View {
         embed: CreateEmbed::new()
@@ -662,14 +675,32 @@ pub struct ChoiceOption<'a> {
     pub duration_secs: Option<f64>,
     /// YouTube Music plays, or the upload's view count, when known.
     pub plays: Option<u64>,
+    /// "Album", "EP" or "Single" for a whole release, which plays every
+    /// track; `None` for a song.
+    pub release: Option<&'static str>,
+    /// The release's year, when known.
+    pub year: Option<u16>,
 }
 
 impl ChoiceOption<'_> {
-    /// The line shown under the title: who uploaded it, and how long it runs.
+    /// The line shown under the title: what kind of release it is, if it is
+    /// one, who uploaded it, and how long it runs.
     fn detail(&self) -> String {
         let mut detail = String::new();
+        if let Some(release) = self.release {
+            detail.push_str(release);
+        }
         if !self.channel.is_empty() {
+            if !detail.is_empty() {
+                detail.push_str(" \u{2022} ");
+            }
             detail.push_str(&trim(self.channel, MAX_FIELD_NAME));
+        }
+        if let Some(year) = self.year {
+            if !detail.is_empty() {
+                detail.push_str(" \u{2022} ");
+            }
+            detail.push_str(&year.to_string());
         }
         if let Some(duration) = self.duration_secs {
             if !detail.is_empty() {
@@ -718,7 +749,7 @@ fn plays_label(plays: u64) -> String {
 ///
 /// `requested` is speech-to-text output echoed back, so it can contain anything
 /// the person said, and unescaped `*` or `_` would reformat the message.
-fn markdown_escape(text: &str) -> String {
+pub(crate) fn markdown_escape(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for c in text.chars() {
         if matches!(c, '*' | '_' | '~' | '`' | '|' | '>' | '\\') {
@@ -802,7 +833,20 @@ mod tests {
             channel: Box::leak(channel.to_string().into_boxed_str()),
             duration_secs: duration,
             plays: None,
+            release: None,
+            year: None,
         }
+    }
+
+    /// An album says it is one, so it is not mistaken for a song of that name.
+    #[test]
+    fn an_album_option_says_it_is_an_album() {
+        let album = ChoiceOption {
+            release: Some("Album"),
+            year: Some(2017),
+            ..option("17", "XXXTENTACION", None)
+        };
+        assert_eq!(album.detail(), "Album \u{2022} XXXTENTACION \u{2022} 2017");
     }
 
     /// A candidate with no reported length still has to render as a field.

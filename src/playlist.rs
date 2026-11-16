@@ -1,8 +1,7 @@
 //! Links pasted into `/play`: one video, or a whole playlist or album.
 //!
-//! Only `/play` reads these. A spoken request never queues a playlist: the
-//! bot cannot show what it is about to queue, and an album nobody meant to ask
-//! for is twenty songs to skip.
+//! A spoken request never names a link, but it can name an album, and the
+//! album is then listed from here too: see [`crate::album`].
 
 use anyhow::Context as _;
 use std::time::Duration;

@@ -397,6 +397,66 @@ pub fn typed_request(text: &str) -> Option<PlayRequest> {
     build_request(&normalize(text))
 }
 
+/// Words that, said before the title, ask for a whole album: "play the album
+/// 17". Longest first, so "the full album" is not read as "the" + "full album".
+const ALBUM_LEADS: &[&[&str]] = &[
+    &["the", "full", "album"],
+    &["the", "whole", "album"],
+    &["the", "album"],
+    &["full", "album"],
+    &["whole", "album"],
+    &["album"],
+];
+
+/// The album a request asks for by saying "album", if it does.
+///
+/// The speaker said what they want, so nothing has to be guessed: the bot goes
+/// straight to the albums. Three ways of saying it:
+///
+/// - before the title: "the album 17 by xxxtentacion", "the full album 17",
+///   "album called 17";
+/// - after the title: "the 17 album by xxxtentacion", "the slow rush album";
+/// - at the very end: "17 by xxxtentacion album".
+///
+/// `None` for anything else, including "the album" with no title after it,
+/// which is left to be searched for as words, and "the album version of …",
+/// which is a song.
+pub fn album_request(request: &PlayRequest) -> Option<PlayRequest> {
+    let words: Vec<&str> = request.query.split(' ').filter(|w| !w.is_empty()).collect();
+    if let Some(lead) = ALBUM_LEADS.iter().find(|lead| words.starts_with(lead)) {
+        let mut rest = &words[lead.len()..];
+        // "the album version of Dracula" is a song.
+        if rest.first() == Some(&"version") {
+            return None;
+        }
+        if rest
+            .first()
+            .is_some_and(|w| matches!(*w, "called" | "named"))
+        {
+            rest = &rest[1..];
+        }
+        return build_request(&rest.join(" "));
+    }
+    let at = words.iter().rposition(|w| *w == "album")?;
+    let title = match words[..at] {
+        ["the", ref title @ ..] => title,
+        ref title => title,
+    };
+    if title.is_empty() {
+        return None;
+    }
+    let artist = match words.get(at + 1) {
+        None => None,
+        Some(&"by") if words.len() > at + 2 => Some(&words[at + 2..]),
+        Some(_) => return None,
+    };
+    let phrase = match artist {
+        Some(artist) => format!("{} by {}", title.join(" "), artist.join(" ")),
+        None => title.join(" "),
+    };
+    build_request(&phrase)
+}
+
 /// Words that may come before a wake word without making it mid-sentence.
 const GREETINGS: &[&str] = &["hey", "hi", "ok", "okay", "yo", "oi", "hello"];
 
@@ -1203,6 +1263,56 @@ mod tests {
             "you belong with me"
         );
         assert!(p.armed_request("groovy").is_none());
+    }
+
+    fn album_of(spoken: &str) -> Option<String> {
+        let request = parser().command(spoken).ok()?;
+        album_request(&request).map(|album| album.query)
+    }
+
+    /// Saying "album" asks for the album, wherever it is said.
+    #[test]
+    fn saying_album_names_the_album() {
+        for (spoken, album) in [
+            (
+                "groovy play the album 17 by xxxtentacion",
+                "17 by xxxtentacion",
+            ),
+            ("groovy play album 17 by xxxtentacion", "17 by xxxtentacion"),
+            ("groovy play the full album 17", "17"),
+            (
+                "groovy play the whole album currents by tame impala",
+                "currents by tame impala",
+            ),
+            ("groovy play the album called blonde", "blonde"),
+            (
+                "groovy play the 17 album by xxxtentacion",
+                "17 by xxxtentacion",
+            ),
+            ("groovy play the slow rush album", "slow rush"),
+            ("groovy play 17 by xxxtentacion album", "17 by xxxtentacion"),
+            (
+                "Groovy, the album Thriller by Michael Jackson.",
+                "thriller by michael jackson",
+            ),
+        ] {
+            assert_eq!(album_of(spoken).as_deref(), Some(album), "for {spoken:?}");
+        }
+    }
+
+    /// Without "album", it is a request like any other, and whether it is an
+    /// album is for the catalog to say.
+    #[test]
+    fn a_request_without_album_is_not_named_as_one() {
+        for spoken in [
+            "groovy play 17 by xxxtentacion",
+            "groovy play the album",
+            "groovy play album",
+            "groovy play an album nobody likes",
+            "groovy play the album version of dracula",
+        ] {
+            assert_eq!(album_of(spoken), None, "for {spoken:?}");
+        }
     }
 
     /// Typed words come out as the same query the same words spoken do.

@@ -168,6 +168,8 @@ fn best_window(tokens: &[String], target: &str) -> (f32, usize, usize) {
 pub struct Score {
     /// The title, discounted for spoken words it does not explain.
     pub title: f32,
+    /// How well the request named the artist: zero unless it did.
+    pub artist: f32,
     /// What [`decide`] sorts on: 0.8 title + 0.2 artist.
     pub combined: f32,
 }
@@ -208,6 +210,7 @@ pub fn score(transcript: &str, artist: &str, title: &str) -> Score {
     let artist_score = if a_s >= 0.75 { a_s } else { 0.0 };
     Score {
         title: title_score,
+        artist: artist_score,
         combined: 0.8 * title_score + 0.2 * artist_score,
     }
 }
