@@ -203,6 +203,9 @@ async fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .user_agent(crate::config::HTTP_USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(20))
+        // Per read, not for the whole transfer: a model is gigabytes, but a
+        // connection that goes quiet must fail rather than hang startup.
+        .read_timeout(std::time::Duration::from_secs(60))
         .build()?;
     let mut response = client
         .get(url)
