@@ -72,14 +72,14 @@ pub fn to_f32(frame: &[i16]) -> Vec<f32> {
 /// A speaker the call knows about who sent nothing this tick gets a frame of
 /// silence. Discord only sends audio while somebody transmits, so silence
 /// never arrives on its own, and without it an utterance could never end.
-pub fn split_tick(
-    speaking: impl IntoIterator<Item = (Ssrc, Option<Vec<i16>>)>,
+pub fn split_tick<'a>(
+    speaking: impl IntoIterator<Item = (Ssrc, Option<&'a [i16]>)>,
     silent: impl IntoIterator<Item = Ssrc>,
 ) -> Tick {
     let mut tick: Tick = speaking
         .into_iter()
         .map(|(ssrc, decoded)| match decoded {
-            Some(pcm) if !pcm.is_empty() => (ssrc, to_f32(&pcm)),
+            Some(pcm) if !pcm.is_empty() => (ssrc, to_f32(pcm)),
             _ => (ssrc, vec![0.0; FRAME_SAMPLES]),
         })
         .collect();
@@ -231,7 +231,7 @@ impl EventHandler for VoiceTickHandler {
             let split = split_tick(
                 tick.speaking
                     .iter()
-                    .map(|(ssrc, data)| (*ssrc, data.decoded_voice.clone())),
+                    .map(|(ssrc, data)| (*ssrc, data.decoded_voice.as_deref())),
                 tick.silent.iter().copied(),
             );
             self.record(&split, voiced);
@@ -258,8 +258,8 @@ mod tests {
     fn speakers_are_kept_apart_rather_than_mixed() {
         let tick = split_tick(
             [
-                (1, Some(vec![1000i16; 320])),
-                (2, Some(vec![-2000i16; 320])),
+                (1, Some(&[1000i16; 320][..])),
+                (2, Some(&[-2000i16; 320][..])),
             ],
             [],
         );
@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn a_lost_packet_is_silence_not_nothing() {
-        let tick = split_tick([(4, None), (5, Some(Vec::new()))], []);
+        let tick = split_tick([(4, None), (5, Some(&[][..]))], []);
         assert!(tick.iter().all(|(_, a)| a.len() == FRAME_SAMPLES));
     }
 
@@ -313,12 +313,12 @@ mod tests {
         assert!(report.contains("carry no audio"), "{report}");
 
         let mut diag = TickDiag::new(start);
-        diag.observe(&split_tick([(1, Some(vec![30i16; 320]))], []), 1);
+        diag.observe(&split_tick([(1, Some(&[30i16; 320][..]))], []), 1);
         let report = diag.report(start + DIAG_INTERVAL, DIAG_INTERVAL).unwrap();
         assert!(report.contains("very quietly"), "{report}");
 
         let mut diag = TickDiag::new(start);
-        diag.observe(&split_tick([(1, Some(vec![6000i16; 320]))], []), 1);
+        diag.observe(&split_tick([(1, Some(&[6000i16; 320][..]))], []), 1);
         let report = diag.report(start + DIAG_INTERVAL, DIAG_INTERVAL).unwrap();
         assert!(
             !report.contains("quietly") && !report.contains("no audio"),
