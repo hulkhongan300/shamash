@@ -37,7 +37,7 @@ pub struct DirectTranscriber {
     /// return empty text without it). `None` leaves detection to the model.
     language: Option<String>,
     /// A decoding prompt, for the models that take one (Whisper). Biasing the
-    /// decoder towards "bot, play <title> by <artist>" is what makes it spell
+    /// decoder towards "groovy, play <title> by <artist>" is what makes it spell
     /// song and artist names as names instead of as the nearest common words.
     /// `None` for models that do not accept a prompt.
     prompt: Option<String>,

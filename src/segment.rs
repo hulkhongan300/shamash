@@ -30,7 +30,7 @@ const ONSET_FRAMES: usize = 3;
 
 /// Consecutive unvoiced frames that end an utterance: 40 x 16 ms = 640 ms.
 ///
-/// Long enough to survive the pause between "bot, play" and the title, short
+/// Long enough to survive the pause between "groovy, play" and the title, short
 /// enough that the request is acted on promptly once the speaker stops.
 const HANGOVER_FRAMES: usize = 40;
 

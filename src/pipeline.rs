@@ -178,7 +178,10 @@ impl ListenerPipeline {
                 return true;
             }
             Understood::Nothing(miss) => {
-                tracing::debug!(guild_id = %guild_id, reason = ?miss, "not a play command");
+                // The tone played and the music dropped for nothing, so this is
+                // the line to count when the bot wakes when it should not.
+                let reason = miss.map_or_else(|| "no request".to_string(), |m| m.to_string());
+                tracing::info!(guild_id = %guild_id, user, transcript = %transcript, armed, reason, "woke, but heard no request");
                 return false;
             }
         };
@@ -290,13 +293,13 @@ mod tests {
     use super::*;
 
     fn parser() -> CommandParser {
-        CommandParser::new(["bot".to_string(), "shamash".to_string()])
+        CommandParser::new(["groovy".to_string(), "shamash".to_string()])
     }
 
     #[test]
     fn a_request_in_the_same_breath_is_understood() {
         let Understood::Request(r) =
-            understand(&parser(), "Bot, play Dracula by Tame Impala.", false)
+            understand(&parser(), "Groovy, play Dracula by Tame Impala.", false)
         else {
             panic!("expected a request");
         };
@@ -313,7 +316,10 @@ mod tests {
 
     #[test]
     fn a_bare_wake_word_waits_for_the_request() {
-        assert_eq!(understand(&parser(), "Bot.", false), Understood::WakeOnly);
+        assert_eq!(
+            understand(&parser(), "Groovy.", false),
+            Understood::WakeOnly
+        );
     }
 
     #[test]
@@ -322,6 +328,22 @@ mod tests {
             panic!("expected a request");
         };
         assert_eq!(r.artist.as_deref(), Some("tame impala"));
+    }
+
+    /// Things said in conversation that used to be taken as requests.
+    #[test]
+    fn conversation_is_not_a_request() {
+        for heard in [
+            "But I think we should go now",
+            "Okay but what about lunch",
+            "I told groovy to play something",
+            "That's so groovy.",
+        ] {
+            assert!(
+                matches!(understand(&parser(), heard, false), Understood::Nothing(_)),
+                "{heard:?} is not a request"
+            );
+        }
     }
 
     #[test]

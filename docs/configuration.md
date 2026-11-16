@@ -20,7 +20,7 @@ the bot at startup instead of silently falling back to a default.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `WAKE_WORDS` | `bot,shamash` | Comma-separated wake words |
+| `WAKE_WORDS` | `groovy,shamash` | Comma-separated wake words. See [Choosing wake words](#choosing-wake-words) |
 | `WAKE_MODEL` | Parakeet TDT+CTC 110M | The small, always-loaded model. A `.gguf` path or a Hugging Face model id |
 | `REQUEST_MODEL` | Whisper large-v3-turbo | The large model, loaded on the first wake word. A `.gguf` path or a Hugging Face model id. `PARAKEET_MODEL` is the old name and still works |
 | `ASR_PROMPT` | an example request | Example text for models that take a prompt (Whisper does). `off` disables it |
@@ -70,7 +70,7 @@ is visible. Whisper large-v3-turbo takes about 1 s per short request on a GPU
 and about 17 s on a CPU.
 
 **The prompt.** Whisper is given an example request as a prompt (`ASR_PROMPT`,
-by default "Bot, play Dracula by Tame Impala. Play Bohemian Rhapsody by
+by default "Groovy, play Dracula by Tame Impala. Play Bohemian Rhapsody by
 Queen."). It continues in the style of its prompt, so names come back spelled
 as names. On five synthesised requests for artists not in the prompt, it got
 all five right. With `ASR_PROMPT=off` it wrote "Taman Pala" for Tame Impala.
@@ -95,13 +95,22 @@ set one for those.
 
 ## Choosing wake words
 
-Wake words longer than four letters tolerate one misheard character, so
-"shamash" also answers to "shemash" and "shammash". Shorter ones must be heard
-exactly, apart from one swapped vowel ("bot" heard as "but", which the small
-model often does). Otherwise ordinary words like "not" or "boy" would wake it.
+Pick a word of two or more syllables that nobody in the channel says to each
+other. A one-syllable word is too short for the speech models to tell apart
+from ordinary speech. `bot` used to be a default. The small model often wrote
+it as "but", so it had to answer to "but" too, and then every sentence that
+opened with "but" was a song request.
+
+Wake words of four letters or fewer must be heard exactly. Longer ones also
+answer to one misheard letter ("shemash", "shammash" for "shamash"), but only
+with "play" straight after it: one letter off is also how ordinary words look,
+and "groove" is one letter from "groovy".
 
 Avoid common words. "Play" as a wake word would make "let's play a game" a song
-request.
+request. A real word such as "groovy" is fine as long as it is rare: it only
+wakes the bot when it opens the sentence or is followed by "play". "That's so
+groovy" is left alone, but "Groovy, see you tomorrow" is a request for "see you
+tomorrow".
 
 ## The rewrite stage
 
