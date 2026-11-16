@@ -64,6 +64,65 @@ impl CatalogTrack {
     }
 }
 
+/// What kind of release an album search row is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseKind {
+    Album,
+    Ep,
+    /// One song, sometimes with a B-side or an instrumental. YouTube Music
+    /// lists most songs as a single of their own, so a single is only ever
+    /// played as an album when it was asked for as one.
+    Single,
+}
+
+impl ReleaseKind {
+    /// The kind as YouTube Music writes it in a row, or `None` for anything
+    /// that is not a music release (an audiobook, a podcast).
+    fn from_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "Album" => Some(Self::Album),
+            "EP" => Some(Self::Ep),
+            "Single" => Some(Self::Single),
+            _ => None,
+        }
+    }
+
+    /// How the kind is shown in the chooser.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Album => "Album",
+            Self::Ep => "EP",
+            Self::Single => "Single",
+        }
+    }
+}
+
+/// An album, EP or single as the catalog knows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogAlbum {
+    pub title: String,
+    pub artist: String,
+    pub kind: ReleaseKind,
+    pub year: Option<u16>,
+    /// The playlist that holds its tracks in order (`OLAK5uy_…`).
+    pub playlist_id: String,
+}
+
+impl CatalogAlbum {
+    /// A short label for logs and messages.
+    pub fn label(&self) -> String {
+        format!("{} — {}", self.artist, self.title)
+    }
+
+    /// The link its tracks are listed from.
+    pub fn url(&self) -> String {
+        format!(
+            "https://music.youtube.com/playlist?list={}",
+            self.playlist_id
+        )
+    }
+}
+
 /// One way of asking the catalog about a request.
 ///
 /// Free text is what YouTube Music takes, and free text is also what survives a
@@ -288,6 +347,12 @@ pub trait CatalogProvider: Send + Sync {
     /// them; [`crate::matcher::decide`] reorders them by how well they explain
     /// what was heard.
     async fn search(&self, query: &CatalogQuery) -> Result<Vec<CatalogTrack>, ProviderError>;
+
+    /// Asks which releases (albums, EPs, singles) answer to a query, best
+    /// first. A provider that knows no albums has none.
+    async fn albums(&self, _query: &str) -> Result<Vec<CatalogAlbum>, ProviderError> {
+        Ok(Vec::new())
+    }
 }
 
 /// YouTube Music's own songs search: a *catalog* that is also the *source* of
@@ -331,6 +396,10 @@ const YTMUSIC_CLIENT_VERSION: &str = "1.20240101.00.00";
 /// the thing this provider exists to avoid.
 const YTMUSIC_SONGS_FILTER: &str = "EgWKAQIIAWoSEAQQAxAKEAUQCRAREBAQFRAO";
 
+/// The `params` blob that asks for albums, EPs and singles. Read out of the
+/// "Albums" filter chip of a search response, the same way as the songs one.
+const YTMUSIC_ALBUMS_FILTER: &str = "EgWKAQIYAWoQEAkQBRADEAQQEBAVEBEQCg==";
+
 impl YtMusic {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
@@ -355,14 +424,27 @@ impl CatalogProvider for YtMusic {
     async fn search(&self, query: &CatalogQuery) -> Result<Vec<CatalogTrack>, ProviderError> {
         // Free text only. YouTube Music has one field for a query and no
         // artist-only mode worth spending a request on.
+        let body = self.post(&query.text(), YTMUSIC_SONGS_FILTER).await?;
+        Ok(parse_songs(&body))
+    }
+
+    async fn albums(&self, query: &str) -> Result<Vec<CatalogAlbum>, ProviderError> {
+        let body = self.post(query, YTMUSIC_ALBUMS_FILTER).await?;
+        Ok(parse_albums(&body))
+    }
+}
+
+impl YtMusic {
+    /// One filtered search, as the response tree.
+    async fn post(&self, query: &str, filter: &str) -> Result<serde_json::Value, ProviderError> {
         let body = serde_json::json!({
             "context": { "client": {
                 "clientName": YTMUSIC_CLIENT,
                 "clientVersion": YTMUSIC_CLIENT_VERSION,
                 "hl": "en",
             }},
-            "query": query.text(),
-            "params": YTMUSIC_SONGS_FILTER,
+            "query": query,
+            "params": filter,
         });
         let response = self
             .client
@@ -386,11 +468,10 @@ impl CatalogProvider for YtMusic {
         // renderer tree whose shape changes with the site's experiments, and a
         // hand-written struct would reject the whole response the first time a
         // field moved rather than reading the songs still in there.
-        let body: serde_json::Value = response
+        response
             .json()
             .await
-            .map_err(|_| ProviderError::BadResponse)?;
-        Ok(parse_songs(&body))
+            .map_err(|_| ProviderError::BadResponse)
     }
 }
 
@@ -403,7 +484,19 @@ impl CatalogProvider for YtMusic {
 /// walked rather than addressed. The walk is linear in a ~600 kB response, which
 /// is nothing next to the HTTP round trip it replaces.
 pub(crate) fn parse_songs(body: &serde_json::Value) -> Vec<CatalogTrack> {
-    fn walk(node: &serde_json::Value, out: &mut Vec<CatalogTrack>) {
+    rows(body).into_iter().filter_map(song).collect()
+}
+
+/// Every album, EP and single in an albums-filtered InnerTube response, in the
+/// order YouTube ranked them. Rows that are not music (audiobooks) or have no
+/// playlist to play are left out.
+pub(crate) fn parse_albums(body: &serde_json::Value) -> Vec<CatalogAlbum> {
+    rows(body).into_iter().filter_map(album).collect()
+}
+
+/// Every `musicResponsiveListItemRenderer` in a response, in order.
+fn rows(body: &serde_json::Value) -> Vec<&serde_json::Value> {
+    fn walk<'a>(node: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
         // A response is a tree of objects *and* arrays: the shelf that holds
         // the rows is an array, so a walk that only descends into objects
         // finds nothing at all.
@@ -418,9 +511,7 @@ pub(crate) fn parse_songs(body: &serde_json::Value) -> Vec<CatalogTrack> {
         };
         for (key, value) in fields {
             if key == "musicResponsiveListItemRenderer" {
-                if let Some(track) = song(value) {
-                    out.push(track);
-                }
+                out.push(value);
                 continue;
             }
             walk(value, out);
@@ -429,6 +520,39 @@ pub(crate) fn parse_songs(body: &serde_json::Value) -> Vec<CatalogTrack> {
     let mut out = Vec::new();
     walk(body, &mut out);
     out
+}
+
+/// One album search row as a release.
+///
+/// The subtitle reads "Album • XXXTENTACION • 2017": the kind, the artist (or
+/// several, "A & B"), and the year. It is split on the separator rather than
+/// read run by run, because a list of artists is several runs of its own.
+fn album(row: &serde_json::Value) -> Option<CatalogAlbum> {
+    let title = column(row, 0)?;
+    let subtitle: String = row
+        .pointer("/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text/runs")?
+        .as_array()?
+        .iter()
+        .filter_map(|run| run.get("text").and_then(serde_json::Value::as_str))
+        .collect();
+    let parts: Vec<&str> = subtitle.split('\u{2022}').map(str::trim).collect();
+    let kind = ReleaseKind::from_label(parts.first()?)?;
+    let artist = parts.get(1).filter(|a| !a.is_empty())?.to_string();
+    let year = parts.get(2).and_then(|y| y.parse().ok());
+    let playlist_id = row
+        .pointer(
+            "/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer\
+             /playNavigationEndpoint/watchPlaylistEndpoint/playlistId",
+        )?
+        .as_str()?
+        .to_string();
+    Some(CatalogAlbum {
+        title,
+        artist,
+        kind,
+        year,
+        playlist_id,
+    })
 }
 
 /// One `musicResponsiveListItemRenderer` as a track, when it is a song.
@@ -849,59 +973,103 @@ impl Catalog {
         query: &CatalogQuery,
         deadline: tokio::time::Instant,
     ) -> Vec<CatalogTrack> {
-        if deadline <= TokioInstant::now() {
-            tracing::debug!(
-                provider = guarded.provider.name(),
-                "out of catalog budget; skipping this query"
-            );
-            return Vec::new();
-        }
-        if !guarded.guard.take(deadline).await {
-            tracing::debug!(
-                provider = guarded.provider.name(),
-                kind = query.kind(),
-                "no rate-limit token before the deadline; skipping this query"
-            );
-            return Vec::new();
-        }
+        let text = query.text();
+        guarded_call(
+            guarded,
+            query.kind(),
+            &text,
+            deadline,
+            guarded.provider.search(query),
+        )
+        .await
+    }
 
-        let started = TokioInstant::now();
-        let outcome = timeout_at(deadline, guarded.provider.search(query)).await;
-        match outcome {
-            Ok(Ok(tracks)) => {
-                guarded.guard.record(Ok(())).await;
-                tracing::debug!(
-                    provider = guarded.provider.name(),
-                    kind = query.kind(),
-                    query = %query.text(),
-                    hits = tracks.len(),
-                    took_ms = started.elapsed().as_millis() as u64,
-                    "catalog answered"
-                );
-                tracks
+    /// Every release whose title or artist answers to `query`, in the order the
+    /// provider ranked them.
+    ///
+    /// One query per provider, under the same budget and the same rate limit as
+    /// a song lookup, so asking about albums alongside songs costs no extra
+    /// wait. Never fails: a provider that errors or stalls has no albums.
+    pub async fn albums(&self, query: &str) -> Vec<CatalogAlbum> {
+        let deadline = TokioInstant::now() + self.budget;
+        let mut found = Vec::new();
+        for guarded in &self.providers {
+            if guarded.guard.is_open().await {
+                continue;
             }
-            Ok(Err(e)) => {
-                guarded.guard.record(Err(e)).await;
-                tracing::warn!(
-                    provider = guarded.provider.name(),
-                    kind = query.kind(),
-                    query = %query.text(),
-                    problem = %e,
-                    "this provider had nothing; carrying on with the others"
-                );
-                Vec::new()
-            }
-            Err(_) => {
-                let e = ProviderError::Unavailable;
-                guarded.guard.record(Err(e)).await;
-                tracing::debug!(
-                    provider = guarded.provider.name(),
-                    kind = query.kind(),
-                    query = %query.text(),
-                    "the catalog budget ran out before this answer arrived"
-                );
-                Vec::new()
-            }
+            found.extend(
+                guarded_call(
+                    guarded,
+                    "albums",
+                    query,
+                    deadline,
+                    guarded.provider.albums(query),
+                )
+                .await,
+            );
+        }
+        found
+    }
+}
+
+/// Runs one call to a provider under its rate limit and the request's budget,
+/// recording how it went for the provider's breaker. Whatever goes wrong comes
+/// back as nothing at all: one provider failing is one fewer opinion.
+async fn guarded_call<T>(
+    guarded: &Guarded,
+    kind: &str,
+    query: &str,
+    deadline: tokio::time::Instant,
+    call: impl std::future::Future<Output = Result<Vec<T>, ProviderError>>,
+) -> Vec<T> {
+    let provider = guarded.provider.name();
+    if deadline <= TokioInstant::now() {
+        tracing::debug!(provider, "out of catalog budget; skipping this query");
+        return Vec::new();
+    }
+    if !guarded.guard.take(deadline).await {
+        tracing::debug!(
+            provider,
+            kind,
+            "no rate-limit token before the deadline; skipping this query"
+        );
+        return Vec::new();
+    }
+
+    let started = TokioInstant::now();
+    match timeout_at(deadline, call).await {
+        Ok(Ok(found)) => {
+            guarded.guard.record(Ok(())).await;
+            tracing::debug!(
+                provider,
+                kind,
+                query,
+                hits = found.len(),
+                took_ms = started.elapsed().as_millis() as u64,
+                "catalog answered"
+            );
+            found
+        }
+        Ok(Err(e)) => {
+            guarded.guard.record(Err(e)).await;
+            tracing::warn!(
+                provider,
+                kind,
+                query,
+                problem = %e,
+                "this provider had nothing; carrying on with the others"
+            );
+            Vec::new()
+        }
+        Err(_) => {
+            guarded.guard.record(Err(ProviderError::Unavailable)).await;
+            tracing::debug!(
+                provider,
+                kind,
+                query,
+                "the catalog budget ran out before this answer arrived"
+            );
+            Vec::new()
         }
     }
 }
@@ -1024,6 +1192,39 @@ mod tests {
         assert!(dracula.artist.contains("Tame Impala"), "{}", dracula.artist);
         assert!(dracula.video_id.is_some());
         assert!(dracula.duration_secs.is_some());
+    }
+
+    /// A trimmed copy of a real albums-search response for "17 xxxtentacion",
+    /// with an audiobook row from another search added to it.
+    #[test]
+    fn albums_are_read_from_a_real_youtube_music_response() {
+        let body: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ytmusic_albums_17.json")).unwrap();
+        let albums = parse_albums(&body);
+        assert_eq!(
+            albums[0],
+            CatalogAlbum {
+                title: "17".to_string(),
+                artist: "XXXTENTACION".to_string(),
+                kind: ReleaseKind::Album,
+                year: Some(2017),
+                playlist_id: "OLAK5uy_kW9hN-oBmekJ06jhhfStpwRd5pcRKIztY".to_string(),
+            }
+        );
+        assert_eq!(
+            albums[0].url(),
+            "https://music.youtube.com/playlist?list=OLAK5uy_kW9hN-oBmekJ06jhhfStpwRd5pcRKIztY"
+        );
+        assert!(
+            albums
+                .iter()
+                .any(|a| a.kind == ReleaseKind::Single && a.artist == "Young Taylor"),
+            "{albums:?}"
+        );
+        // The audiobook is not music, and has no playlist to play anyway.
+        assert_eq!(albums.len(), 5, "{albums:?}");
+        // And none of it is a song: there is no video to play on its own.
+        assert!(parse_songs(&body).is_empty());
     }
 
     fn track(artist: &str, title: &str, duration: Option<f64>) -> CatalogTrack {
@@ -1231,6 +1432,53 @@ mod tests {
         async fn search(&self, _q: &CatalogQuery) -> Result<Vec<CatalogTrack>, ProviderError> {
             Ok(Vec::new())
         }
+    }
+
+    /// Albums come from the providers that know some; a provider that knows
+    /// none (the trait's default) adds nothing, and a failing one costs
+    /// nothing either.
+    #[tokio::test]
+    async fn albums_come_from_the_providers_that_know_them() {
+        struct Albums;
+        #[async_trait]
+        impl CatalogProvider for Albums {
+            fn name(&self) -> &'static str {
+                "albums"
+            }
+            async fn search(&self, _q: &CatalogQuery) -> Result<Vec<CatalogTrack>, ProviderError> {
+                Ok(Vec::new())
+            }
+            async fn albums(&self, query: &str) -> Result<Vec<CatalogAlbum>, ProviderError> {
+                assert_eq!(query, "17 xxxtentacion");
+                Ok(vec![CatalogAlbum {
+                    title: "17".to_string(),
+                    artist: "XXXTENTACION".to_string(),
+                    kind: ReleaseKind::Album,
+                    year: Some(2017),
+                    playlist_id: "OLAK5uy_x".to_string(),
+                }])
+            }
+        }
+        struct Failing;
+        #[async_trait]
+        impl CatalogProvider for Failing {
+            fn name(&self) -> &'static str {
+                "failing"
+            }
+            async fn search(&self, _q: &CatalogQuery) -> Result<Vec<CatalogTrack>, ProviderError> {
+                Err(ProviderError::Unavailable)
+            }
+            async fn albums(&self, _query: &str) -> Result<Vec<CatalogAlbum>, ProviderError> {
+                Err(ProviderError::Unavailable)
+            }
+        }
+        let catalog = Catalog::with_budget(
+            vec![Box::new(Nothing), Box::new(Failing), Box::new(Albums)],
+            1_000,
+        );
+        let albums = catalog.albums("17 xxxtentacion").await;
+        assert_eq!(albums.len(), 1, "{albums:?}");
+        assert_eq!(albums[0].title, "17");
     }
 
     /// The whole point of the fan-out: one dead provider must not cost the

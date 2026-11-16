@@ -89,6 +89,30 @@ the catalog nothing to choose by. By default the bot offers the choices instead 
 artist nobody asked for. `AMBIGUOUS_POLICY=auto` plays the most-played one
 instead.
 
+## Albums
+
+Every spoken request is also looked up in YouTube Music's album search, at the
+same time as the song search, so it adds no wait. The album and the song are
+then weighed against each other:
+
+| Song found | Artist named | Result |
+| --- | --- | --- |
+| none | yes | the album plays |
+| none | no | the album is offered in a chooser |
+| several | either | a chooser, with the album first |
+| one | yes | a chooser: the song or the album |
+| one | no | the song plays |
+
+An album only counts when its title is what was said, near enough to survive
+a mishearing ("blond" for *Blonde*). So "Look at Me by XXXTENTACION" stays the
+song, and the album *LOOK AT ME: THE ALBUM* never makes it a question.
+YouTube Music lists most songs as a single of their own, so singles never count
+either: "Dracula by Tame Impala" is the song, not the two-track single. Saying
+"album" changes both: only albums are searched, and a single counts.
+
+An album plays from its own playlist on YouTube Music, listed with `yt-dlp`
+and queued in order, the same way a pasted album link is.
+
 ## Choosing the upload
 
 Ranking YouTube results by views picks the official video when the album track

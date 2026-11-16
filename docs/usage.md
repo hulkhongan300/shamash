@@ -26,6 +26,28 @@ A wake word misheard by a letter ("shemash" for "shamash") is only taken with
 "play" straight after it, because one letter off is also how ordinary words
 look ("groove" for "groovy").
 
+### Albums
+
+Ask for an album the way you ask for a song:
+
+- **"Groovy, play 17 by XXXTENTACION"**. No song is called *17*, but an album
+  by the artist you named is, so the whole album is queued.
+- **"Groovy, play the album 17 by XXXTENTACION"**. Saying "album" skips the
+  guessing: only albums are searched. "The full album 17", "album called 17",
+  "the 17 album" and "17 by XXXTENTACION album" all work too.
+
+When the name fits a song and an album, the bot asks instead of guessing.
+"Thriller by Michael Jackson" offers the album *Thriller* first and the song
+*Thriller* after it. Pick the song once and [song memory](#song-memory) plays
+it straight away next time. Name the artist, or say "album", to make a request
+for an album unmistakable: with no artist named, an album is only ever offered,
+never played on its own.
+
+An album is queued the way a pasted album link is (see [`/play`](#play)): the
+first track straight away and the rest behind it, up to the 20-song queue.
+A message in the text channel says how many songs are coming. Stop drops the
+ones not queued yet.
+
 The bot answers with tones:
 
 | Tone | Meaning |
@@ -71,9 +93,8 @@ Iuly Neamtu — Dracula (Frappula) (2:17)
   deleted ones are skipped. The reply says how many of each. Pressing Stop
   drops whatever has not been queued yet.
 
-  Only `/play` does this. Saying a playlist or album to the bot is not
-  supported: it cannot show what it is about to queue, and an album nobody
-  meant to ask for is a lot of songs to skip.
+  An album can be asked for by voice too (see [Albums](#albums)). A
+  playlist only plays from its link.
 - **Press Enter on your own text** without picking a suggestion, and the bot
   searches the catalog and replies with a numbered list, nine to a page:
 
@@ -182,7 +203,8 @@ The memory is kept in `LIBRARY_PATH` (see
 
 When the bot is not confident which song or upload was meant, it plays nothing.
 Instead it posts the closest results in the text channel as the same paged
-chooser `/play` uses. A spoken request's chooser belongs to anyone in the voice
+chooser `/play` uses. An album that answers to the words too is listed first,
+marked "Album", and pressing it queues the whole album. A spoken request's chooser belongs to anyone in the voice
 channel, because the bot hears a voice and cannot tell who spoke.
 
 If no catalog knows the song, the YouTube results are offered as *unverified*

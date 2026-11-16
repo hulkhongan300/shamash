@@ -75,8 +75,14 @@ pub enum Outcome {
     /// The song joined the queue. `starting` says whether nothing was playing,
     /// in which case playback begins now rather than when the queue reaches it.
     Played { starting: bool },
-    /// Nothing was convincing enough to play; the caller should offer these.
-    Asked { tracks: Vec<resolve::CatalogTrack> },
+    /// Nothing was convincing enough to play; the caller should offer these,
+    /// after the album when the words also named one.
+    Asked {
+        tracks: Vec<resolve::CatalogTrack>,
+        album: Option<resolve::CatalogAlbum>,
+    },
+    /// The words named an album and no song: every track of it is queued.
+    Album(resolve::CatalogAlbum),
     /// Uploads of one known song, none of which the scorer was sure enough
     /// about. Offering them is a choice between *recordings*, not between songs.
     Uploads(search::Choice),
@@ -100,6 +106,8 @@ pub enum Problem {
     FetchFailed,
     /// The queue had no room.
     QueueFull,
+    /// "Album" was said, and no album answered to the rest.
+    NoAlbum,
 }
 
 /// A failure, and what to tell the listener about it.
@@ -140,6 +148,10 @@ impl Failure {
             Problem::QueueFull => format!(
                 "The queue is full, so “{heard}” wasn’t added. \
                  Skip or stop something first, then ask again."
+            ),
+            Problem::NoAlbum => format!(
+                "I heard “{heard}”, but couldn’t find an album by that name. \
+                 Try “play the album <title> by <artist>”."
             ),
         }
     }
@@ -279,6 +291,8 @@ enum Offer {
         track: resolve::CatalogTrack,
         requested: String,
     },
+    /// A whole album, EP or single: pressing it queues every track.
+    Album(resolve::CatalogAlbum),
 }
 
 /// How a chosen song was asked for: shown on the dashboard, and, for a pick
@@ -366,12 +380,24 @@ impl Offer {
                 channel: candidate.channel(),
                 duration_secs: candidate.duration,
                 plays: candidate.view_count,
+                release: None,
+                year: None,
             },
             Offer::Song { track, .. } => dashboard::ChoiceOption {
                 title: &track.title,
                 channel: &track.artist,
                 duration_secs: track.duration_secs,
                 plays: track.popularity.map(u64::from),
+                release: None,
+                year: None,
+            },
+            Offer::Album(album) => dashboard::ChoiceOption {
+                title: &album.title,
+                channel: &album.artist,
+                duration_secs: None,
+                plays: None,
+                release: Some(album.kind.label()),
+                year: album.year,
             },
         }
     }
@@ -528,6 +554,43 @@ pub struct PlaylistQueued {
     pub left_out: usize,
     /// Tracks that could not be played: private, deleted, or failed to load.
     pub unavailable: usize,
+}
+
+impl PlaylistQueued {
+    /// What was queued, in a sentence or three: the reply to `/play`, and the
+    /// notice a spoken album request posts.
+    pub fn summary(&self) -> String {
+        let others = self.queued - 1;
+        let first = dashboard::markdown_escape(&self.first);
+        let title = dashboard::markdown_escape(&self.title);
+        let mut text = if self.starting {
+            format!("Playing **{first}** from **{title}**")
+        } else {
+            format!("Queued **{first}** from **{title}**")
+        };
+        if others > 0 {
+            text.push_str(&format!(
+                ", and adding the other {others} song{} behind it.",
+                if others == 1 { "" } else { "s" }
+            ));
+        } else {
+            text.push('.');
+        }
+        if self.left_out > 0 {
+            text.push_str(&format!(
+                "\n{} more didn't fit: the queue holds {} songs.",
+                self.left_out,
+                crate::queue::MAX_QUEUE
+            ));
+        }
+        if self.unavailable > 0 {
+            text.push_str(&format!(
+                "\n{} couldn't be played (private, deleted or unavailable).",
+                self.unavailable
+            ));
+        }
+        text
+    }
 }
 
 /// What adding a downloaded song to the queue did.
@@ -1029,7 +1092,7 @@ impl Player {
     /// few in the alert channel and plays nothing, rather than picking a song
     /// the listener did not ask for.
     pub async fn play(
-        &self,
+        self: &Arc<Self>,
         ctx: &SerenityContext,
         config: &Config,
         guild_id: GuildId,
@@ -1041,13 +1104,24 @@ impl Player {
             .get(guild_id)
             .context("bot is not in a voice channel")?;
 
+        // "Play the album …" says what it wants, so only albums are searched.
+        if let Some(named) = crate::parser::album_request(request) {
+            self.play_named_album(ctx, config, guild_id, &named, timing)
+                .await;
+            return Ok(());
+        }
+
         let heard = request.query.clone();
         match self
             .resolve_and_queue(config, guild_id, request, rewrite, timing)
             .await
         {
-            Ok(Outcome::Asked { tracks }) => {
-                self.offer_songs(ctx, config, guild_id, request, &tracks)
+            Ok(Outcome::Asked { tracks, album }) => {
+                self.offer_songs(ctx, config, guild_id, request, &tracks, album)
+                    .await
+            }
+            Ok(Outcome::Album(album)) => {
+                self.play_album(ctx, config, guild_id, &request.query, &album)
                     .await
             }
             // Nothing was verified. Say so, and offer unverified results only if
@@ -1107,22 +1181,35 @@ impl Player {
             tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "the miss tone failed");
         }
 
+        self.post_notice(
+            ctx,
+            config,
+            guild_id,
+            dashboard::notice(&failure.message(heard)),
+        )
+        .await;
+    }
+
+    /// Posts a short message in the text channel, which takes itself away
+    /// after [`NOTICE_TTL`]: it is worth reading once, not keeping as a record.
+    async fn post_notice(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        view: dashboard::View,
+    ) {
         let Some(channel_id) = resolve_alert_channel(ctx, config, guild_id) else {
             tracing::debug!(
                 guild_id = %guild_id,
-                "no alert channel, so there was nowhere to report the failure"
+                "no alert channel, so there was nowhere to post the notice"
             );
             return;
         };
-        let sent = channel_id
-            .send_message(
-                &ctx.http,
-                dashboard::notice(&failure.message(heard)).into_message(),
-            )
-            .await;
-        match sent {
-            // The miss is worth reading once, not leaving in the channel as a
-            // record, so it takes itself away after NOTICE_TTL.
+        match channel_id
+            .send_message(&ctx.http, view.into_message())
+            .await
+        {
             Ok(sent) => {
                 let http = ctx.http.clone();
                 tokio::spawn(async move {
@@ -1140,8 +1227,85 @@ impl Player {
                 tracing::warn!(
                     guild_id = %guild_id,
                     error = %format!("{e:#}"),
-                    "could not report the failed request"
+                    "could not post the notice"
                 );
+            }
+        }
+    }
+
+    /// Plays the album a request named as one ("play the album 17 by
+    /// xxxtentacion"), or asks which one when several answer to it.
+    async fn play_named_album(
+        self: &Arc<Self>,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        request: &PlayRequest,
+        timing: &Timing,
+    ) {
+        let heard = request.query.clone();
+        let albums = timing
+            .stage(
+                "catalog.albums",
+                self.catalog.albums(&crate::album::query(request)),
+            )
+            .await;
+        match crate::album::find(&heard, &albums, true) {
+            crate::album::Found::One(album) => {
+                self.play_album(ctx, config, guild_id, &heard, &album).await
+            }
+            crate::album::Found::Several(albums) => {
+                let offers = albums.into_iter().map(Offer::Album).collect();
+                self.offer_choices(ctx, config, guild_id, &heard, offers)
+                    .await;
+            }
+            crate::album::Found::Nothing => {
+                let failure = Failure::new(
+                    Problem::NoAlbum,
+                    anyhow::anyhow!("no album in the catalog matched '{heard}'"),
+                );
+                self.report(ctx, config, guild_id, &heard, &failure).await;
+            }
+        }
+    }
+
+    /// Queues every track of `album` and says so in the text channel.
+    ///
+    /// The tracks are listed and queued exactly as a pasted album link is: the
+    /// first now, the rest in the background, and a Stop drops whatever has
+    /// not been queued yet.
+    async fn play_album(
+        self: &Arc<Self>,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        heard: &str,
+        album: &resolve::CatalogAlbum,
+    ) {
+        tracing::info!(guild_id = %guild_id, heard = %heard, album = %album.label(), "playing an album");
+        if self.queues.get(guild_id).is_full() {
+            let failure = Failure::new(
+                Problem::QueueFull,
+                anyhow::anyhow!("the queue is full, so the album was not added"),
+            );
+            self.report(ctx, config, guild_id, &album.label(), &failure)
+                .await;
+            return;
+        }
+        match self
+            .play_playlist(ctx, config, guild_id, &album.url())
+            .await
+        {
+            Ok(mut queued) => {
+                // The listing calls it "Album - 17"; the catalog knows better.
+                queued.title = album.label();
+                self.post_notice(ctx, config, guild_id, dashboard::info(&queued.summary()))
+                    .await;
+            }
+            Err(e) => {
+                let failure = Failure::new(Problem::FetchFailed, e);
+                self.report(ctx, config, guild_id, &album.label(), &failure)
+                    .await;
             }
         }
     }
@@ -1186,22 +1350,41 @@ impl Player {
         let resolved = match remembered {
             Some(resolved) => resolved,
             None => {
-                search::resolve_request(
-                    request,
-                    &self.catalog,
-                    rewrite,
-                    self.library.as_deref(),
-                    guild_id,
-                    timing,
-                )
-                .await
+                // Looked up as a song and as an album at once, so asking about
+                // albums adds no wait. See `crate::album` for which one wins.
+                let album_query = crate::album::query(request);
+                let (resolved, albums) = tokio::join!(
+                    search::resolve_request(
+                        request,
+                        &self.catalog,
+                        rewrite,
+                        self.library.as_deref(),
+                        guild_id,
+                        timing,
+                    ),
+                    timing.stage("catalog.albums", self.catalog.albums(&album_query)),
+                );
+                let album = crate::album::find(&request.query, &albums, false);
+                match crate::album::settle(&request.query, &resolved, album) {
+                    crate::album::Settle::Song => resolved,
+                    crate::album::Settle::Album(album) => return Ok(Outcome::Album(album)),
+                    crate::album::Settle::Ask { album, songs } => {
+                        return Ok(Outcome::Asked {
+                            tracks: songs,
+                            album: Some(album),
+                        });
+                    }
+                }
             }
         };
         if matches!(resolved, search::Resolved::Unknown) {
             return Ok(Outcome::Unknown);
         }
         if let search::Resolved::Ask(tracks) = resolved {
-            return Ok(Outcome::Asked { tracks });
+            return Ok(Outcome::Asked {
+                tracks,
+                album: None,
+            });
         }
 
         let label = resolved
@@ -1303,13 +1486,15 @@ impl Player {
         guild_id: GuildId,
         request: &PlayRequest,
         tracks: &[resolve::CatalogTrack],
+        album: Option<resolve::CatalogAlbum>,
     ) {
-        let offers = tracks
-            .iter()
-            .map(|track| Offer::Song {
+        let offers = album
+            .into_iter()
+            .map(Offer::Album)
+            .chain(tracks.iter().map(|track| Offer::Song {
                 track: track.clone(),
                 requested: request.query.clone(),
-            })
+            }))
             .collect();
         self.offer_choices(ctx, config, guild_id, &request.query, offers)
             .await;
@@ -1504,7 +1689,7 @@ impl Player {
             }
             return;
         }
-        self.offer_songs(ctx, config, guild_id, &request, &tracks)
+        self.offer_songs(ctx, config, guild_id, &request, &tracks, None)
             .await;
     }
 
@@ -1941,7 +2126,7 @@ impl Player {
 
     /// Plays the song a `/play` search put at `index`.
     pub async fn play_asked(
-        &self,
+        self: &Arc<Self>,
         ctx: &SerenityContext,
         config: &Config,
         guild_id: GuildId,
@@ -1956,6 +2141,11 @@ impl Player {
             .cloned()
             .with_context(|| "that song is not in the search")?;
         self.asks.clear(guild_id);
+        if let Offer::Album(album) = &offer {
+            self.play_album(ctx, config, guild_id, &ask.query, album)
+                .await;
+            return Ok(());
+        }
         // A pick is remembered for the words that asked, typed or spoken.
         let said = ask.said.as_deref();
         let origin = match ask.owner {
@@ -2065,6 +2255,9 @@ impl Player {
                     .map(|scored| scored.candidate.clone())
                     .context("YouTube returned nothing for that song")?;
                 (candidate, Some(track))
+            }
+            Offer::Album(album) => {
+                anyhow::bail!("{} is an album, which plays as one", album.label())
             }
         };
 
@@ -3524,6 +3717,7 @@ mod tests {
         match offer {
             Offer::Video(candidate) => candidate.title(),
             Offer::Song { track, .. } => &track.title,
+            Offer::Album(album) => &album.title,
         }
     }
 
