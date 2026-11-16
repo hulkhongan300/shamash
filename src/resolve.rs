@@ -923,11 +923,13 @@ impl Catalog {
     /// so the slowest of them does not set the wait.
     pub async fn hits(&self, target: &Target) -> Vec<Hit> {
         let deadline = TokioInstant::now() + self.budget;
-        let mut found = Vec::new();
-        for guarded in &self.providers {
-            self.ask(guarded, target, deadline, &mut found).await;
-        }
-        merge(found)
+        let answers = futures::future::join_all(
+            self.providers
+                .iter()
+                .map(|guarded| self.ask(guarded, target, deadline)),
+        )
+        .await;
+        merge(answers.into_iter().flatten().collect())
     }
 
     /// Runs one provider's queries, adding whatever it returned.
@@ -945,14 +947,13 @@ impl Catalog {
         guarded: &Guarded,
         target: &Target,
         deadline: tokio::time::Instant,
-        found: &mut Vec<CatalogTrack>,
-    ) {
+    ) -> Vec<CatalogTrack> {
         if guarded.guard.is_open().await {
             tracing::debug!(
                 provider = guarded.provider.name(),
                 "the breaker is open; skipping"
             );
-            return;
+            return Vec::new();
         }
         let queries = self.plan(target);
         let answers = futures::future::join_all(
@@ -961,9 +962,7 @@ impl Catalog {
                 .map(|query| self.ask_one(guarded, query, deadline)),
         )
         .await;
-        for tracks in answers {
-            found.extend(tracks);
-        }
+        answers.into_iter().flatten().collect()
     }
 
     /// Runs one query, or reports nothing for it.
@@ -992,23 +991,21 @@ impl Catalog {
     /// wait. Never fails: a provider that errors or stalls has no albums.
     pub async fn albums(&self, query: &str) -> Vec<CatalogAlbum> {
         let deadline = TokioInstant::now() + self.budget;
-        let mut found = Vec::new();
-        for guarded in &self.providers {
+        let answers = futures::future::join_all(self.providers.iter().map(|guarded| async move {
             if guarded.guard.is_open().await {
-                continue;
+                return Vec::new();
             }
-            found.extend(
-                guarded_call(
-                    guarded,
-                    "albums",
-                    query,
-                    deadline,
-                    guarded.provider.albums(query),
-                )
-                .await,
-            );
-        }
-        found
+            guarded_call(
+                guarded,
+                "albums",
+                query,
+                deadline,
+                guarded.provider.albums(query),
+            )
+            .await
+        }))
+        .await;
+        answers.into_iter().flatten().collect()
     }
 }
 
@@ -1543,6 +1540,34 @@ mod tests {
         .await
         .expect("the fan-out must not wait for a straggler");
         assert!(hits.is_empty(), "a straggler is dropped, not used");
+    }
+
+    /// Providers are asked at the same time, so two slow ones cost one wait,
+    /// not two.
+    #[tokio::test(start_paused = true)]
+    async fn providers_are_asked_concurrently() {
+        struct Slow;
+        #[async_trait]
+        impl CatalogProvider for Slow {
+            fn name(&self) -> &'static str {
+                "slow"
+            }
+            async fn search(&self, _q: &CatalogQuery) -> Result<Vec<CatalogTrack>, ProviderError> {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(vec![track("Tame Impala", "Dracula", Some(205.0))])
+            }
+            async fn albums(&self, _query: &str) -> Result<Vec<CatalogAlbum>, ProviderError> {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(Vec::new())
+            }
+        }
+        let catalog = Catalog::with_budget(vec![Box::new(Slow), Box::new(Slow)], 10_000);
+        let started = TokioInstant::now();
+        assert_eq!(catalog.hits(&heard("dracula")).await.len(), 1);
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        let started = TokioInstant::now();
+        catalog.albums("dracula").await;
+        assert!(started.elapsed() < Duration::from_millis(1500));
     }
 
     /// A provider that never answers must not hold the request open.
