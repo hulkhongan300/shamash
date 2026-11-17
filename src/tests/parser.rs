@@ -37,8 +37,6 @@ fn only_the_wake_word_then_play_is_a_command() {
         "groovy late look at me",
         "groovy plate dracula",
         "groovy lay dracula",
-        "groove play dracula",
-        "shemash play despacito",
         "play dracula",
     ] {
         assert!(parser.command(heard).is_err(), "{heard:?} is not a command");
@@ -47,6 +45,64 @@ fn only_the_wake_word_then_play_is_a_command() {
             "the gate should not wake on {heard:?}"
         );
     }
+}
+
+/// How the wake model wrote "groovy play" for synthetic voices.
+#[test]
+fn the_gate_wakes_however_the_wake_model_spells_groovy_play() {
+    let parser = parser();
+    for heard in [
+        "Ruby play Bohemian Rhapsody",
+        "Rove, play Dracula by",
+        "Groovey played Dracula.",
+        "Provey play seventeen",
+        "Review play blinding lights",
+        "shemash play despacito",
+    ] {
+        assert!(parser.wakes_on(heard), "the gate missed {heard:?}");
+    }
+}
+
+/// How the request model wrote it; there, "Ruby" is a name, not "groovy".
+#[test]
+fn a_command_is_heard_however_the_request_model_spells_groovy_play() {
+    let parser = parser();
+    for (heard, query) in [
+        (
+            "Roovy, play Dracula by Tame Impala.",
+            "dracula by tame impala",
+        ),
+        ("Ruvie played Dracula.", "dracula"),
+        ("Groovy played Blinding Lights.", "blinding lights"),
+        ("Rovie play seventeen", "seventeen"),
+    ] {
+        assert!(parser.wakes_on(heard), "the gate missed {heard:?}");
+        assert_eq!(parser.command(heard).map(|r| r.query).as_deref(), Ok(query));
+    }
+    for heard in ["Ruby, play your card.", "Robbie played the drums."] {
+        assert!(parser.command(heard).is_err(), "{heard:?} is not a command");
+    }
+}
+
+/// Rhymes that end differently, or lose "play"; a short wake word stays exact.
+#[test]
+fn conversation_that_rhymes_is_not_a_command() {
+    let parser = parser();
+    for heard in [
+        "Rob played really well",
+        "The group played at the festival",
+        "Ruby plays the violin",
+        "can you replay that part",
+        "grab a plate and sit down",
+        "I love that movie play it again",
+        "make a groovy playlist",
+    ] {
+        assert!(!parser.wakes_on(heard), "the gate woke on {heard:?}");
+        assert!(parser.command(heard).is_err(), "{heard:?} is not a command");
+    }
+    let bot = CommandParser::new(["bot".to_string()]);
+    assert!(!bot.wakes_on("but play it again"));
+    assert!(bot.wakes_on("bot play it again"));
 }
 
 #[test]
