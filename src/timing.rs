@@ -1,13 +1,6 @@
-//! Per-request stage timings.
+//! Per-request stage timings, logged as one summary line so "the bot was slow" says which stage.
 //!
-//! One request crosses a speech model, three catalog providers, a YouTube
-//! search and a yt-dlp download, and "the bot was slow" does not say which.
-//! A [`Timing`] is created once per request and passed down the stages, so
-//! each stage's cost is attributed rather than guessed at, and one summary
-//! line per request says where the time went.
-//!
-//! Cloning is a handle copy, so a stage deep in the pipeline can be timed
-//! without taking ownership of the stages around it.
+//! Cloning is a handle copy, so nested stages share one request.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -22,7 +15,7 @@ pub struct Timing {
 }
 
 impl Default for Timing {
-    /// Starts timing a request. The total is measured from here.
+    /// Starts timing a request; the total is measured from here.
     fn default() -> Self {
         Self {
             started: Instant::now(),
@@ -33,11 +26,7 @@ impl Default for Timing {
 }
 
 impl Timing {
-    /// Records which way the audio was played: `stream` or `file`.
-    ///
-    /// Named in the summary line rather than as a stage, because it is not a
-    /// cost but a choice -- and it is the answer to "was this song fast because
-    /// it streamed or because it was already cached".
+    /// Records how the audio was played (`stream` or `file`); a choice, not a cost, so not a stage.
     pub fn set_route(&self, route: &str) {
         *self.route.lock().unwrap_or_else(PoisonError::into_inner) = Some(route.to_string());
     }
@@ -58,13 +47,7 @@ impl Timing {
         out
     }
 
-    /// The summary line, as it is logged.
-    ///
-    /// One line per request:
-    /// `time_to_first_audio total=4210ms [transcription=640 llm_rewrite=812 ...]`.
-    /// A stage that never ran is absent rather than reported as zero, because
-    /// "the stage cost nothing" and "the stage did not happen" are different
-    /// answers.
+    /// The logged summary line; stages that never ran are absent, not zero.
     fn summary(&self, path: &str) -> String {
         let total = self.started.elapsed();
         let stages = self.stages.lock().unwrap_or_else(PoisonError::into_inner);

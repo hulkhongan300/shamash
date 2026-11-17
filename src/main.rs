@@ -3,23 +3,13 @@ use shamash::config::Config;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-/// What to log when `RUST_LOG` says nothing.
-///
-/// `warn` is the floor, so every dependency's failures stay visible; the `info`
-/// lines on top are only the ones worth reading while the bot runs: the models
-/// it loaded and the requests it handled. Serenity and songbird log a line per
-/// connection and per packet at info, which drowns those out.
+/// Default filter: `warn` for everything, `info` only for our own modules
+/// (serenity and songbird log per packet at info).
 const DEFAULT_LOG: &str =
     "warn,shamash::pipeline=info,shamash::direct=info,shamash::bot=info,shamash::voice=info";
 
-/// Whether an event is the RTCP warning that cannot be acted on.
-///
-/// Songbird logs every RTCP packet it cannot decrypt at warn. Discord sends
-/// RTCP reports for streams the bot has no key for, so this fires continuously
-/// on a working connection, and there is no configuration to turn it off: it is
-/// a bare `warn!` inside the driver's receive task.
-///
-/// Matching the message rather than the target is deliberate.
+/// Drops songbird's "RTCP decryption failed" warning, which fires constantly on
+/// a healthy connection and has no config switch.
 #[derive(Clone)]
 struct WithoutRtcpNoise<S> {
     inner: S,
@@ -33,8 +23,7 @@ impl<S> WithoutRtcpNoise<S> {
 
 fn is_rtcp_noise(event: &tracing::Event<'_>) -> bool {
     use tracing::field::Visit;
-    // The message lives in the event's fields, not in the call site metadata
-    // `Layer::enabled` sees, which is why this cannot be a filter.
+    // The message is in event fields, invisible to `Layer::enabled`, so no filter.
     struct Message(String);
     impl Visit for Message {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
@@ -57,12 +46,7 @@ fn is_rtcp_noise(event: &tracing::Event<'_>) -> bool {
 impl<S: tracing::Subscriber, I: tracing_subscriber::Layer<S>> tracing_subscriber::Layer<S>
     for WithoutRtcpNoise<I>
 {
-    /// Drops the noise and hands everything else on untouched.
-    ///
-    /// Everything else here is forwarding. `RTP decryption failed` and
-    /// `Decode error for SSRC` are logged from this same module and both mean
-    /// the bot has stopped hearing, which is exactly the failure that must stay
-    /// loud -- so this cannot be done by filtering the module away.
+    /// Not a module filter: the same module logs RTP/decode failures that must stay loud.
     fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
         if !is_rtcp_noise(event) {
             self.inner.on_event(event, ctx);
@@ -104,15 +88,7 @@ impl<S: tracing::Subscriber, I: tracing_subscriber::Layer<S>> tracing_subscriber
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Songbird, serenity and reqwest all report through `tracing`. Without a
-    // subscriber their errors are discarded, and a bot that never finishes
-    // connecting to the voice server fails silently while looking healthy.
-    //
-    // RUST_LOG overrides the default: `RUST_LOG=info` for everything, or
-    // `RUST_LOG=debug` for songbird's per-packet detail.
-    // Load DISCORD_TOKEN and friends from a .env file, if present, before the
-    // log filter is built, so a RUST_LOG set there is honoured. Real
-    // environment variables take precedence over values in the file.
+    // Load .env before building the log filter so a RUST_LOG set there is honoured.
     let dotenv = dotenvy::dotenv();
 
     tracing_subscriber::registry()

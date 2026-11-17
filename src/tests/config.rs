@@ -80,8 +80,6 @@ fn asr_engine_names_are_case_insensitive() {
     );
 }
 
-/// The removed engine's name should point at the replacement rather than
-/// be reported as unknown.
 #[test]
 fn the_removed_whisper_engine_says_where_to_go() {
     let err = AsrEngine::parse("whisper").unwrap_err().to_string();

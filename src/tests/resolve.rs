@@ -1,9 +1,6 @@
 use super::*;
 
-/// A trimmed copy of a real songs-search response for "dracula tame
-/// impala". The shelf holding the rows is an array, which an earlier
-/// parser did not descend into, so it found no songs at all and the
-/// official upload never reached the ranking.
+/// Real songs-search response for "dracula tame impala"; its shelf is an array an old parser skipped.
 #[test]
 fn songs_are_read_from_a_real_youtube_music_response() {
     let body: serde_json::Value = serde_json::from_str(include_str!(
@@ -13,8 +10,7 @@ fn songs_are_read_from_a_real_youtube_music_response() {
     let songs = parse_songs(&body);
     assert!(!songs.is_empty(), "no songs parsed");
 
-    // YouTube Music lists the JENNIE feature first. It must not become the
-    // song: that is how a request for Dracula played the remix.
+    // The JENNIE remix is listed first and must not win.
     let hits = merge(songs.clone());
     let best = &hits[0];
     assert_eq!(best.title, "Dracula", "{hits:?}");
@@ -29,8 +25,7 @@ fn songs_are_read_from_a_real_youtube_music_response() {
     assert!(dracula.duration_secs.is_some());
 }
 
-/// A trimmed copy of a real albums-search response for "17 xxxtentacion",
-/// with an audiobook row from another search added to it.
+/// Real albums-search response for "17 xxxtentacion", plus an audiobook row.
 #[test]
 fn albums_are_read_from_a_real_youtube_music_response() {
     let body: serde_json::Value =
@@ -56,9 +51,9 @@ fn albums_are_read_from_a_real_youtube_music_response() {
             .any(|a| a.kind == ReleaseKind::Single && a.artist == "Young Taylor"),
         "{albums:?}"
     );
-    // The audiobook is not music, and has no playlist to play anyway.
+    // The audiobook is not music.
     assert_eq!(albums.len(), 5, "{albums:?}");
-    // And none of it is a song: there is no video to play on its own.
+    // Albums have no single video to play.
     assert!(parse_songs(&body).is_empty());
 }
 
@@ -111,8 +106,7 @@ fn normalisation_drops_parenthesised_asides() {
     assert_eq!(matcher::normalize("Song [Explicit]"), "song");
 }
 
-/// A bracket that *opens* the title is part of it. Dropping it reduced
-/// "(I Can't Get No) Satisfaction" to "satisfaction".
+/// A leading bracket is part of the title: "(I Can't Get No) Satisfaction".
 #[test]
 fn normalisation_keeps_a_leading_parenthetical() {
     assert_eq!(
@@ -159,8 +153,7 @@ fn normalisation_keeps_the_words_that_identify_a_song() {
 
 // ---- the query plan ----------------------------------------------------
 
-/// A correctly heard artist with a misheard title is rescued by asking for
-/// the artist's catalogue: that query does not need the title to be right.
+/// The artist-catalogue query rescues a misheard title.
 #[test]
 fn the_plan_asks_for_the_artists_own_tracks() {
     let catalog = Catalog::with_budget(vec![Box::new(Nothing)], 2_500);
@@ -172,7 +165,7 @@ fn the_plan_asks_for_the_artists_own_tracks() {
     assert_eq!(kinds, ["loose", "loose", "title"]);
 }
 
-/// Four requests is the whole budget, whatever the request looks like.
+/// Four requests is the whole budget.
 #[test]
 fn the_plan_never_exceeds_four_queries() {
     let catalog = Catalog::with_budget(vec![Box::new(Nothing)], 2_500);
@@ -189,7 +182,7 @@ fn the_plan_never_exceeds_four_queries() {
     assert!(catalog.plan(&Target::from_request(&request)).len() <= MAX_QUERIES_PER_PROVIDER);
 }
 
-/// Asking the same question twice costs a request for nothing.
+/// No duplicate queries.
 #[test]
 fn the_plan_never_repeats_a_query() {
     let catalog = Catalog::with_budget(vec![Box::new(Nothing)], 2_500);
@@ -223,9 +216,7 @@ fn merging_keeps_every_distinct_duration() {
     assert_eq!(dracula.duration_secs(), Some(205.0));
 }
 
-/// Providers that disagree about the length by more than the tolerance are
-/// not to be trusted for ranking uploads, and the hit says so rather than
-/// picking one.
+/// Providers disagreeing on length beyond tolerance mark the hit untrusted.
 #[test]
 fn a_length_nobody_agrees_on_is_marked_uncertain() {
     let hits = merge(vec![
@@ -269,9 +260,7 @@ impl CatalogProvider for Nothing {
     }
 }
 
-/// Albums come from the providers that know some; a provider that knows
-/// none (the trait's default) adds nothing, and a failing one costs
-/// nothing either.
+/// Providers without albums, or failing ones, add nothing.
 #[tokio::test]
 async fn albums_come_from_the_providers_that_know_them() {
     struct Albums;
@@ -316,8 +305,7 @@ async fn albums_come_from_the_providers_that_know_them() {
     assert_eq!(albums[0].title, "17");
 }
 
-/// The whole point of the fan-out: one dead provider must not cost the
-/// request. Before this, `?` on a provider error aborted the whole thing.
+/// One dead provider must not cost the request.
 #[tokio::test]
 async fn a_failing_provider_does_not_stop_the_others() {
     struct Broken;
@@ -351,8 +339,7 @@ async fn a_failing_provider_does_not_stop_the_others() {
     assert_eq!(hits[0].label(), "Tame Impala — Dracula");
 }
 
-/// The fan-out returns inside its budget however slow the providers are.
-/// A straggler is dropped, not waited for.
+/// The fan-out returns inside its budget; stragglers are dropped.
 #[tokio::test(start_paused = true)]
 async fn the_fan_out_returns_inside_its_budget() {
     struct Slow;
@@ -380,8 +367,7 @@ async fn the_fan_out_returns_inside_its_budget() {
     assert!(hits.is_empty(), "a straggler is dropped, not used");
 }
 
-/// Providers are asked at the same time, so two slow ones cost one wait,
-/// not two.
+/// Providers run concurrently: two slow ones cost one wait.
 #[tokio::test(start_paused = true)]
 async fn providers_are_asked_concurrently() {
     struct Slow;
@@ -428,8 +414,7 @@ async fn a_provider_that_never_answers_times_out_instead_of_hanging() {
     assert!(hits.is_empty());
 }
 
-/// Three failures in a row stop the bot asking that provider, and the
-/// recovery is a half-open: one request through, to see.
+/// Three failures open the breaker; recovery is half-open (one probe).
 #[tokio::test]
 async fn the_breaker_opens_after_repeated_failures_and_half_opens_afterwards() {
     let guard = Guard::new(Rate::new(10.0, 10.0));
@@ -449,8 +434,7 @@ async fn the_breaker_opens_after_repeated_failures_and_half_opens_afterwards() {
     );
 }
 
-/// A success closes it again, so one bad minute is not a permanent loss of
-/// a provider.
+/// A success closes it again.
 #[tokio::test]
 async fn one_success_resets_the_failure_count() {
     let guard = Guard::new(Rate::new(10.0, 10.0));
@@ -465,8 +449,7 @@ async fn one_success_resets_the_failure_count() {
     );
 }
 
-/// The limiter refuses a request it cannot serve in time rather than
-/// holding the whole fan-out for one token.
+/// The limiter refuses rather than stall the fan-out for one token.
 #[tokio::test(start_paused = true)]
 async fn the_limiter_refuses_rather_than_waiting_past_the_deadline() {
     let guard = Guard::new(Rate::new(1.0, 0.1));
@@ -487,9 +470,7 @@ async fn the_limiter_waits_when_there_is_time() {
     assert!(guard.take(deadline).await, "100 a second refills fast");
 }
 
-/// Innertube nests its rows inside arrays, and a walk that stops at the
-/// first array finds no songs at all. This is the shape a real songs search
-/// returns: contents -> tabs (array) -> section list -> shelf -> rows.
+/// Innertube nests rows in arrays: contents -> tabs (array) -> section list -> shelf -> rows.
 #[test]
 fn songs_are_found_inside_innertubes_arrays() {
     let body = serde_json::json!({
@@ -541,8 +522,7 @@ fn songs_are_found_inside_innertubes_arrays() {
     assert_eq!(tracks[0].video_id.as_deref(), Some("cuMuMnCRfqk"));
 }
 
-/// The site writes counts in four shapes; all of them are the same number
-/// to the chooser and to `AMBIGUOUS_POLICY=popular`.
+/// All four count formats parse to the same number.
 #[test]
 fn play_counts_are_parsed_in_every_shape_the_site_uses() {
     assert_eq!(parse_plays("217M plays"), Some(217_000_000));
@@ -555,8 +535,7 @@ fn play_counts_are_parsed_in_every_shape_the_site_uses() {
     assert_eq!(parse_plays(""), None);
 }
 
-/// The live endpoint moves without notice; this is how to notice. Ignored
-/// by default because it needs the network: run it with `--ignored`.
+/// Live endpoint check; needs the network, run with `--ignored`.
 #[tokio::test]
 #[ignore = "hits the live YouTube Music endpoint; run with --ignored"]
 async fn the_live_ytmusic_search_still_answers() {

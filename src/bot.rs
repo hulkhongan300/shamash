@@ -29,15 +29,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub async fn start(config: Config) -> anyhow::Result<()> {
-    // Two models, because they pay for being loaded differently. The wake model
-    // is resident from startup: it has to be ready before anyone speaks, and it
-    // runs on every window of speech, so a load per command would cost far more
-    // than it saves. The larger one is loaded on the first wake word instead,
-    // which is what lets the bot tell the speaker when it is ready for a request.
-    //
-    // Both are fetched now if they are not on disk yet, so a fresh install
-    // downloads them once at startup rather than the request model holding up
-    // the first wake word for a gigabyte download.
+    // The wake model runs on every utterance so stays resident; the request model
+    // loads on the first wake word. Both are downloaded now, not on first use.
     if config.asr_engine == AsrEngine::Direct {
         for spec in [&config.wake_model, &config.request_model] {
             crate::model::ensure(spec).await?;
@@ -83,11 +76,7 @@ fn build_transcriber(
     })
 }
 
-/// Logs the loaded settings so a misconfigured run is obvious at a glance.
-///
-/// One `info!` line per setting rather than a block of prints: `RUST_LOG` then
-/// controls this along with everything else, and the settings can be filtered
-/// out of a busy log.
+/// Logs the loaded settings, one `info!` per setting, so a misconfigured run is obvious.
 fn log_configuration(config: &Config, big_models: &BigModels) {
     let mut wake_words: Vec<&str> = config.wake_words.iter().map(String::as_str).collect();
     wake_words.sort_unstable();
@@ -155,16 +144,9 @@ fn commands() -> Vec<CreateCommand> {
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(user = %ready.user.name, "Shamash is online");
-        // Deliberately no global registration. `guild_create` registers per
-        // guild, which is both instant -- a global command takes up to an hour
-        // to reach a client -- and shadowed by the guild copy, so having both
-        // only ever showed the same command twice. A guild copy works in any
-        // guild the bot is invited to later, because GUILD_CREATE fires for
-        // each of them on connect.
+        // No global registration: per-guild in `guild_create` is instant, and both would show twice.
 
-        // One player for the whole process, so the voice listener and the
-        // dashboard buttons act on the same queue. Built here because that is
-        // the first point the songbird manager can be reached.
+        // One player shared by voice and dashboard; built here, where songbird is first reachable.
         let manager = match songbird::get(&ctx).await {
             Some(manager) => manager,
             None => {
@@ -172,10 +154,7 @@ impl EventHandler for Handler {
                 return;
             }
         };
-        // The catalog turns a spoken request into a real song's names and
-        // running time before anything is searched for. A failure here is worth
-        // reporting rather than working around: without it the bot still plays
-        // songs, but it will pick the wrong one much more often.
+        // Without the catalog the bot still plays, but picks the wrong song more often.
         let config = ctx.data.read().await.get::<ConfigKey>().cloned();
         let Some(config) = config else {
             tracing::error!("config unavailable, playback is disabled");
@@ -197,24 +176,14 @@ impl EventHandler for Handler {
         }
     }
 
-    /// Reconciles presence as each guild arrives.
-    ///
-    /// Without this the bot only ever joins in reaction to somebody moving, so
-    /// a channel that already had people in it when the bot started -- or a
-    /// guild it was already in -- is never noticed until someone else joins or
-    /// leaves. `GUILD_CREATE` is the first point at which that guild's voice
-    /// states are in the cache, so it is where the count can be trusted.
+    /// Reconciles presence as each guild arrives, so already-occupied channels are joined.
     async fn guild_create(
         &self,
         ctx: Context,
         guild: serenity::model::guild::Guild,
         _is_new: Option<bool>,
     ) {
-        // Global commands take up to an hour to reach a client, and a bot that
-        // has just registered `/play` looks broken for all of it. A guild copy
-        // appears at once, so anyone in the server can see what the bot offers
-        // the moment it starts. This is a PUT, so it replaces rather than
-        // duplicating.
+        // Guild commands appear at once (global ones take up to an hour); a PUT, so no duplicates.
         if let Err(e) = ctx.http.create_guild_commands(guild.id, &commands()).await {
             tracing::warn!(guild_id = %guild.id, error = %format!("{e:#}"), "failed to register the guild commands");
         }
@@ -237,8 +206,7 @@ impl EventHandler for Handler {
         let target = ChannelId::new(service.config.voice_channel_id);
         let me = ctx.cache.current_user().id;
         if new.user_id == me {
-            // Joining or leaving is the bot's own doing and needs no answer.
-            // Being dragged into another channel does: that one may be empty.
+            // Only being dragged elsewhere needs handling: that channel may be empty.
             if new.channel_id.is_none() || new.channel_id == Some(target) {
                 return;
             }
@@ -283,10 +251,7 @@ impl EventHandler for Handler {
     }
 }
 
-/// The reply a member outside the bot's voice channel gets.
-///
-/// Ephemeral, because it answers one person and would otherwise be a public
-/// message about someone else's failed button press.
+/// The (ephemeral) reply a member outside the bot's voice channel gets.
 pub const NOT_IN_VOICE: &str =
     "Join the voice channel I'm in first — that's where playback is controlled.";
 
@@ -306,13 +271,7 @@ const STARTING_UP: &str = "I'm still starting up — try again in a moment.";
 /// The reply to `/play` with no words in it.
 const NOT_A_SEARCH: &str = "Tell me what to search for: `/play dracula`.";
 
-/// Whether `user_id` may drive playback for this guild.
-///
-/// Everything that acts on playback — Skip, Stop, Pause/Resume, the "which song
-/// did you mean" buttons and `/stop` — is a control surface for the people in
-/// the channel the music is playing in, and for nobody else. The dashboard is a
-/// text-channel message, so without this anyone who can read it could stop
-/// someone else's music.
+/// Whether `user_id` may drive playback: only people in the bot's voice channel.
 async fn may_control(ctx: &Context, guild_id: GuildId, user_id: UserId) -> bool {
     match VoiceService::from_ctx(ctx).await {
         Ok(service) => service.is_in_bot_channel(ctx, guild_id, user_id),
@@ -323,14 +282,9 @@ async fn may_control(ctx: &Context, guild_id: GuildId, user_id: UserId) -> bool 
     }
 }
 
-/// The interaction handlers, split out of the [`EventHandler`] impl because
-/// they are plain methods rather than events.
+/// The interaction handlers, kept out of the [`EventHandler`] impl.
 impl Handler {
-    /// Handles a press of a `/play` chooser button, or of the dashboard's.
-    ///
-    /// The two are different lists with different owners and must not reach
-    /// each other: a `/play` chooser belongs to whoever typed it, while the
-    /// dashboard belongs to everyone in the voice channel.
+    /// Handles a press of a `/play` chooser button, or of the dashboard's; they have different owners.
     async fn component(&self, ctx: &Context, button: ComponentInteraction) {
         let id = button.data.custom_id.as_str();
         let action = dashboard::action_from_id(id).unwrap_or_default();
@@ -348,12 +302,7 @@ impl Handler {
 
     /// A press on the `/play` chooser: a song, the next page, or nothing.
     ///
-    /// Whether the press may be answered at all is settled before it is
-    /// acknowledged, the way the dashboard's buttons are: a refusal is the
-    /// press's one response. Anything that goes wrong after the acknowledgement
-    /// is said in a follow-up instead, because Discord rejects a second response
-    /// to the same press -- which is how a song that failed to play used to
-    /// leave the list in place with nothing said at all.
+    /// Refusals are the one response; later errors go in a follow-up (Discord rejects a second response).
     async fn asked_button(&self, ctx: &Context, button: ComponentInteraction, asked: Asked) {
         let Some(guild_id) = button.guild_id else {
             return;
@@ -364,9 +313,7 @@ impl Handler {
             return;
         };
 
-        // A chooser raised by speech belongs to the voice channel, so it keeps the
-        // channel's rule rather than a named person. `/play` is the other way
-        // round and is checked by `ask_belongs_to` below.
+        // A spoken chooser belongs to the voice channel; `/play` is checked by `ask_belongs_to`.
         let on_offer = player.has_ask(guild_id);
         let spoken = player.ask_is_spoken(guild_id);
         let may_answer = if spoken {
@@ -410,8 +357,7 @@ impl Handler {
             }
         }
     }
-    /// Handles `/play <song>`: searches the catalog and posts the results as a
-    /// paged chooser for the asker to pick from.
+    /// Handles `/play <song>`: searches the catalog and posts a paged chooser.
     async fn slash_play(
         &self,
         ctx: &Context,
@@ -435,17 +381,13 @@ impl Handler {
             return;
         };
 
-        // The bot has to be in the voice channel to play anything. Saying so
-        // before the search saves an API round trip and a wall of buttons that
-        // could not do anything.
+        // Check voice before searching, to skip a useless search.
         if !may_control(ctx, guild_id, command.user.id).await {
             reply(ctx, command, NOT_IN_VOICE).await;
             return;
         }
 
-        // A playlist or album link queues the whole thing. A spoken request
-        // can queue an album too, but only one the catalog names: see
-        // `crate::album`.
+        // A playlist or album link queues the whole thing.
         if let Some(url) = crate::playlist::playlist_url(&query) {
             let _ = command.defer_ephemeral(&ctx.http).await;
             let text = match player.play_playlist(ctx, &config, guild_id, &url).await {
@@ -459,8 +401,7 @@ impl Handler {
             return;
         }
 
-        // A link to one video, picked from autocomplete or pasted, plays that
-        // video without another chooser. Links only: a typed word is a search.
+        // A single-video link plays directly; typed words are a search.
         if let Some(video_id) = crate::playlist::video_id(&query) {
             let _ = command.defer_ephemeral(&ctx.http).await;
             match player
@@ -491,12 +432,7 @@ impl Handler {
             return;
         }
 
-        // Acknowledged before the search, not after it. Discord drops an
-        // interaction that is not answered within three seconds, and the
-        // catalog's rate limit is shared with spoken requests and autocomplete,
-        // so the search plus posting the chooser could run past it and the
-        // person who typed /play saw nothing at all. Deferred, it shows
-        // "thinking…" at once and the answer has 15 minutes.
+        // Defer first: the search can exceed Discord's 3 s answer deadline.
         if let Err(e) = command.defer_ephemeral(&ctx.http).await {
             tracing::warn!(error = %format!("{e:#}"), "could not acknowledge /play");
             return;
@@ -526,10 +462,7 @@ impl Handler {
             }
             Err(e) => {
                 tracing::info!(guild_id = %guild_id, query = %query, error = %format!("{e:#}"), "/play could not answer");
-                // The catalog may well have found something and the post may
-                // have been refused, which is what this used to report as
-                // "nothing in the catalog" -- true of the second, false of the
-                // first, and the two look identical from the outside.
+                // The post failed, not necessarily the search; don't report "nothing found".
                 finish(
                     ctx,
                     &command,
@@ -540,8 +473,7 @@ impl Handler {
         }
     }
 
-    /// Answers slash command autocomplete queries for `/play song:<query>`,
-    /// displaying catalog suggestions in the top popup menu for arrow-key selection.
+    /// Answers autocomplete for `/play song:<query>` with catalog suggestions.
     async fn slash_autocomplete_play(&self, ctx: &Context, command: CommandInteraction) {
         let query = command
             .data
@@ -594,12 +526,7 @@ impl Handler {
         }
     }
 
-    /// `/lock` and `/unlock`: switch voice listening off and on.
-    ///
-    /// Gated like every playback control: only someone in the bot's voice
-    /// channel may do it, since they are the ones being listened to. The reply
-    /// is public, so everyone in the channel can see whether the bot is
-    /// listening.
+    /// `/lock` and `/unlock`: switch voice listening off and on; gated and replied publicly.
     async fn slash_lock(&self, ctx: &Context, command: CommandInteraction, locked: bool) {
         let Some(guild_id) = command.guild_id else {
             reply(ctx, command, "This command only works in a server.").await;
@@ -680,11 +607,7 @@ impl Handler {
         }
     }
 
-    /// Handles a press of one of the dashboard's buttons.
-    ///
-    /// The press is acknowledged straight away, because Discord fails an
-    /// interaction that goes unanswered within three seconds and a skip may
-    /// have to download nothing but still waits on the voice lock.
+    /// Handles a dashboard button press, acknowledged at once to beat Discord's 3 s deadline.
     async fn dashboard_button(&self, ctx: &Context, button: ComponentInteraction) {
         let id = button.data.custom_id.as_str();
         let press = if let Some(action) = dashboard::action_from_id(id) {
@@ -760,8 +683,7 @@ impl Handler {
             dashboard::ACTION_STOP => {
                 player.stop(ctx, &config, guild_id).await;
             }
-            // Viewing pages. Neither plays anything, so neither needs the
-            // playback lock that Skip and Stop take.
+            // Viewing pages needs no playback lock.
             dashboard::ACTION_QUEUE => player.show_queue(ctx, &config, guild_id).await,
             dashboard::ACTION_BACK => player.show_now_playing(ctx, &config, guild_id).await,
             dashboard::ACTION_REPEAT => {
@@ -777,12 +699,7 @@ impl Handler {
     }
 }
 
-/// Takes the bot's own "which one did you mean" question out of the channel
-/// once it has been answered.
-///
-/// Only the question is ever passed here. The dashboard is edited in place and
-/// is meant to stay. A bot may delete its own messages without any extra
-/// permission, so nothing else is needed to clean up after itself.
+/// Deletes the bot's answered "which one did you mean" question (never the dashboard).
 async fn drop_question(
     ctx: &Context,
     channel_id: ChannelId,
@@ -794,8 +711,7 @@ async fn drop_question(
     }
 }
 
-/// A press on the dashboard: one of its buttons, a song picked from the queue
-/// view's menu, or a change to the queue from the buttons under it.
+/// A press on the dashboard: a button, a queue-menu pick, or a queue edit.
 enum Press<'a> {
     Action(&'a str),
     Pick(Option<u64>),
@@ -857,18 +773,11 @@ async fn reply(ctx: &Context, command: CommandInteraction, text: &str) {
 }
 
 /// Tells one person, privately, that they cannot drive playback from here.
-///
-/// Ephemeral rather than a public reply, so pressing Skip from the wrong
-/// channel does not announce itself to the room.
 async fn refuse(ctx: &Context, button: ComponentInteraction) {
     answer_privately(ctx, button, NOT_IN_VOICE).await;
 }
 
-/// Why a press on the chooser may not be answered, or `None` when it may.
-///
-/// `on_offer` is whether the guild still holds a search, `spoken` whether that
-/// search came from speech, and `may_answer` whether the presser passed the
-/// rule that applies to it.
+/// Why a chooser press may not be answered, or `None` when it may.
 fn chooser_refusal(on_offer: bool, spoken: bool, may_answer: bool) -> Option<&'static str> {
     if !on_offer {
         Some(NOT_ON_OFFER)
@@ -881,10 +790,7 @@ fn chooser_refusal(on_offer: bool, spoken: bool, may_answer: bool) -> Option<&'s
     }
 }
 
-/// Answers a button press privately, as its one response.
-///
-/// Only for a press that has not been acknowledged: after `defer`, Discord
-/// rejects this, and [`follow_up`] is the way to say anything.
+/// Answers an unacknowledged press privately; after `defer`, use [`follow_up`].
 async fn answer_privately(ctx: &Context, button: ComponentInteraction, text: &str) {
     let reply = CreateInteractionResponse::Message(
         CreateInteractionResponseMessage::new()
@@ -930,9 +836,6 @@ fn format_autocomplete_name(track: &resolve::CatalogTrack) -> String {
 }
 
 /// Gives the player its song memory, read from `LIBRARY_PATH`.
-///
-/// With the memory, a song picked from the "Which one?" list is played straight
-/// away the next time the same words are said.
 fn player_with_memory(mut player: Player, config: &Config) -> Player {
     match config.library_path.as_deref() {
         Some(path) => {

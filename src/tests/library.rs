@@ -21,10 +21,7 @@ fn path_of(dir: &Path) -> PathBuf {
     dir.join("library.json")
 }
 
-/// The case from the request: "All Caps by MF DOOM" is credited to
-/// Madvillain, the listener picks it from the list, and the same words play
-/// it next time, after a restart too. The artist that was said never has to
-/// match the one that is stored.
+/// "All Caps by MF DOOM" is credited to Madvillain; the said artist needn't match.
 #[test]
 fn a_pick_is_recalled_even_when_the_artist_said_is_another() {
     let (dir, library) = scratch("pick-other-artist");
@@ -39,8 +36,7 @@ fn a_pick_is_recalled_even_when_the_artist_said_is_another() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The table from issue #33: the same request, transcribed a little
-/// differently each time, finds the song that was picked.
+/// The table from issue #33.
 #[test]
 fn a_pick_is_found_when_said_a_little_differently() {
     let (_dir, library) = scratch("said-differently");
@@ -57,7 +53,6 @@ fn a_pick_is_found_when_said_a_little_differently() {
     }
 }
 
-/// Spelled-out initials are glued back into a word; digits are not.
 #[test]
 fn single_letters_are_glued_back_together() {
     assert_eq!(phrase_key("All Caps by M.F. DOOM"), "all caps by mf doom");
@@ -67,7 +62,6 @@ fn single_letters_are_glued_back_together() {
     assert_eq!(phrase_key(""), "");
 }
 
-/// The phrase is stored glued, so the two spellings are one entry.
 #[test]
 fn initials_spelled_out_are_the_same_entry() {
     let (_dir, library) = scratch("glued-entry");
@@ -86,8 +80,6 @@ fn initials_spelled_out_are_the_same_entry() {
     assert_eq!(library.len(), 1);
 }
 
-/// Close is not enough when a different song is about as close, or when
-/// the difference is a word that changes the song.
 #[test]
 fn a_different_song_is_not_replaced_by_a_remembered_one() {
     let (_dir, library) = scratch("strict");
@@ -112,7 +104,6 @@ fn a_different_song_is_not_replaced_by_a_remembered_one() {
     assert!(library.recall("hay").is_none());
 }
 
-/// Two remembered songs both near what was said: neither is taken.
 #[test]
 fn a_close_phrase_needs_to_be_clearly_the_closest() {
     let (_dir, library) = scratch("ambiguous");
@@ -131,7 +122,6 @@ fn a_close_phrase_needs_to_be_clearly_the_closest() {
     assert!(library.recall("dancing qween abba").is_none());
 }
 
-/// A title alone is used only when exactly one remembered song has it.
 #[test]
 fn a_title_alone_needs_exactly_one_song_with_it() {
     let (_dir, library) = scratch("title-alone");
@@ -149,8 +139,6 @@ fn a_title_alone_needs_exactly_one_song_with_it() {
     assert!(library.recall("hello").is_none(), "which Hello?");
 }
 
-/// A song recalled by a close phrase still counts its quick skips against
-/// the phrase that recalled it.
 #[test]
 fn quick_skips_reach_a_phrase_recalled_by_a_close_one() {
     let (_dir, library) = scratch("close-skips");
@@ -161,8 +149,6 @@ fn quick_skips_reach_a_phrase_recalled_by_a_close_one() {
     assert!(library.is_empty());
 }
 
-/// The whole point: the same misheard phrase costs one lookup the first
-/// time and none at all the second.
 #[test]
 fn a_learned_phrase_is_recalled_exactly() {
     let (_dir, library) = scratch("recall");
@@ -182,8 +168,6 @@ fn a_learned_phrase_is_recalled_exactly() {
         library.recall("dracula by tame impala"),
         Some(track("Tame Impala", "Dracula"))
     );
-    // Case, punctuation and decoration are not part of a phrase, so the
-    // same words reach the same entry however they were transcribed.
     for said in [
         "Dracula, by Tame Impala!",
         "dracula  BY  tame   impala",
@@ -195,12 +179,10 @@ fn a_learned_phrase_is_recalled_exactly() {
             "for {said:?}"
         );
     }
-    // A genuinely different mishearing is a different phrase and is not
-    // recalled, which is why the catalog and the rewrite still run for it.
+    // A different mishearing still goes to the catalog.
     assert!(library.recall("drakoola tame implala").is_none());
 }
 
-/// An unrelated phrase must not hit, however similar it looks.
 #[test]
 fn an_unrelated_phrase_is_not_recalled() {
     let (_dir, library) = scratch("unrelated");
@@ -214,7 +196,6 @@ fn an_unrelated_phrase_is_not_recalled() {
     assert!(library.recall("").is_none());
 }
 
-/// A song learned twice is one entry, not two.
 #[test]
 fn learning_the_same_phrase_twice_keeps_one_entry() {
     let (_dir, library) = scratch("twice");
@@ -233,8 +214,6 @@ fn learning_the_same_phrase_twice_keeps_one_entry() {
     assert_eq!(library.len(), 1);
 }
 
-/// A press of a chooser button is believed immediately and never
-/// downgraded by a later, weaker piece of evidence.
 #[test]
 fn a_pressed_choice_is_remembered_and_stays_pressed() {
     let (_dir, library) = scratch("pressed");
@@ -246,8 +225,7 @@ fn a_pressed_choice_is_remembered_and_stays_pressed() {
     );
 }
 
-/// Two quick skips and the bot forgets it was told. This is the only way an
-/// alias is removed, and it is the correction for a wrong lesson.
+/// The automatic correction for a wrong lesson.
 #[test]
 fn two_quick_skips_forget_the_phrase() {
     let (_dir, library) = scratch("skips");
@@ -267,8 +245,6 @@ fn two_quick_skips_forget_the_phrase() {
     assert!(library.recall("stand by me").is_none());
 }
 
-/// A quick skip is only feedback about the song it was asked for. Skipping
-/// some *other* song must not count against an alias.
 #[test]
 fn a_quick_skip_of_a_different_song_is_not_feedback() {
     let (_dir, library) = scratch("other-skip");
@@ -277,8 +253,6 @@ fn a_quick_skip_of_a_different_song_is_not_feedback() {
     assert_eq!(library.len(), 1);
 }
 
-/// History is fuzzy: a misheard request reaches a song this guild has played
-/// before, judged by the same matcher that judges catalog hits.
 #[test]
 fn history_is_matched_fuzzily_by_the_shared_matcher() {
     let (_dir, library) = scratch("history");
@@ -300,7 +274,6 @@ fn history_is_matched_fuzzily_by_the_shared_matcher() {
     );
 }
 
-/// History is per guild: another server's listener has heard nothing here.
 #[test]
 fn history_is_per_guild() {
     let (_dir, library) = scratch("guilds");
@@ -310,13 +283,10 @@ fn history_is_per_guild() {
         &track("Tame Impala", "Dracula"),
         false,
     );
-    // `remember` files history under whichever guild last played; the row
-    // exists, and it belongs to exactly one.
     let hits = library.history_hits(999);
     assert!(hits.is_empty(), "another guild has heard nothing here");
 }
 
-/// A file that is not there is the first run, not an error.
 #[test]
 fn a_missing_file_is_not_an_error() {
     let (dir, _) = scratch("missing");
@@ -324,7 +294,7 @@ fn a_missing_file_is_not_an_error() {
     assert!(library.is_empty());
 }
 
-/// A corrupt file must not stop the bot. A library is an optimisation.
+/// A library is an optimisation; corruption must not stop the bot.
 #[test]
 fn a_corrupt_file_starts_empty_rather_than_crashing() {
     let (dir, _) = scratch("corrupt");
@@ -333,7 +303,6 @@ fn a_corrupt_file_starts_empty_rather_than_crashing() {
 
     let library = Library::load(Some(&path_of(&dir)));
     assert!(library.is_empty());
-    // And it is still usable afterwards.
     library.remember(1, "dracula", &track("Tame Impala", "Dracula"), false);
     library.save();
     assert_eq!(
@@ -342,8 +311,6 @@ fn a_corrupt_file_starts_empty_rather_than_crashing() {
     );
 }
 
-/// The whole point of the atomic write: what is on disk is always a
-/// complete document, never half of one.
 #[test]
 fn the_file_is_written_atomically() {
     let (dir, library) = scratch("atomic");
@@ -364,7 +331,6 @@ fn the_file_is_written_atomically() {
     );
 }
 
-/// Everything survives a restart, which is the only thing a file is for.
 #[test]
 fn the_library_survives_a_restart() {
     let (dir, library) = scratch("restart");
@@ -379,7 +345,6 @@ fn the_library_survives_a_restart() {
     assert_eq!(reopened.len(), 1);
 }
 
-/// The caps exist so a long-running bot cannot grow the file without bound.
 #[test]
 fn the_file_is_capped_and_drops_the_least_recently_used() {
     let (dir, library) = scratch("capped");
@@ -396,7 +361,6 @@ fn the_file_is_capped_and_drops_the_least_recently_used() {
     assert_eq!(library.len(), MAX_ALIASES);
     let reopened = Library::load(Some(&path_of(&dir)));
     assert_eq!(reopened.len(), MAX_ALIASES);
-    // The newest survived; the oldest did not.
     assert!(
         reopened
             .recall(&format!("phrase {}", MAX_ALIASES + 49))
@@ -405,7 +369,6 @@ fn the_file_is_capped_and_drops_the_least_recently_used() {
     assert!(reopened.recall("phrase 0").is_none());
 }
 
-/// A burst of learns is one write, not one per learn.
 #[test]
 fn writes_are_debounced() {
     let (dir, library) = scratch("debounced");
@@ -416,11 +379,9 @@ fn writes_are_debounced() {
     library.save();
     assert!(path_of(&dir).exists());
     library.maybe_save();
-    // Nothing pending, so this is a no-op rather than an error.
     assert!(Library::load(Some(&path_of(&dir))).len() == 1);
 }
 
-/// No library configured is a working bot with no memory, not an error.
 #[test]
 fn no_path_means_no_memory_and_no_panics() {
     let library = Library::load(None);
@@ -430,8 +391,6 @@ fn no_path_means_no_memory_and_no_panics() {
     assert!(library.recall("dracula").is_some());
 }
 
-/// Nothing is learned from a request that named no song: an unknown has no
-/// track to remember.
 #[test]
 fn nothing_with_no_title_is_learned() {
     let (_dir, library) = scratch("no-title");
@@ -451,7 +410,6 @@ fn nothing_with_no_title_is_learned() {
     assert!(library.is_empty(), "an empty phrase is not a phrase");
 }
 
-/// `forget` is the manual correction.
 #[test]
 fn a_phrase_can_be_forgotten_by_hand() {
     let (_dir, library) = scratch("forget");

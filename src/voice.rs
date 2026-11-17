@@ -25,13 +25,11 @@ enum Presence {
 
 /// How many times a join is attempted before the failure is reported.
 const JOIN_ATTEMPTS: usize = 3;
-/// Pause between join attempts.
 const JOIN_RETRY_DELAY: Duration = Duration::from_secs(3);
 /// How long a channel must stay empty before the bot leaves it.
 const LEAVE_GRACE: Duration = Duration::from_secs(15);
 
-/// Builds the songbird driver config that decodes incoming voice to mono
-/// 16 kHz PCM, the format the voice detector and the models expect.
+/// Songbird config decoding voice to mono 16 kHz, the format the models expect.
 pub fn decode_config() -> songbird::Config {
     songbird::Config::default().decode_mode(DecodeMode::Decode(DecodeConfig::new(
         Channels::Mono,
@@ -39,8 +37,7 @@ pub fn decode_config() -> songbird::Config {
     )))
 }
 
-/// High-level voice-channel control: join/leave a target channel and keep a
-/// listener task running for the duration of the call.
+/// Joins/leaves the target channel and runs a listener for the call.
 pub struct VoiceService {
     pub manager: Arc<Songbird>,
     pub config: Config,
@@ -60,8 +57,6 @@ impl VoiceService {
         Ok(Self { manager, config })
     }
 
-    /// The shared player, so the dashboard buttons and the voice listener act
-    /// on the same queue.
     async fn player(&self, ctx: &SerenityContext) -> anyhow::Result<Arc<Player>> {
         let data = ctx.data.read().await;
         data.get::<PlayerKey>()
@@ -69,17 +64,14 @@ impl VoiceService {
             .context("player not present in type map")
     }
 
-    /// Joins `channel` and starts listening for speech. A fresh listener is
-    /// spawned per join; it exits automatically when the call is removed.
+    /// Joins `channel` and spawns a listener that exits when the call is removed.
     pub async fn join_and_listen(
         &self,
         ctx: &SerenityContext,
         guild_id: GuildId,
         channel: ChannelId,
     ) -> anyhow::Result<()> {
-        // Everything the listener needs is gathered before joining. Joining
-        // first and failing here used to leave the bot in the channel, deaf,
-        // and a retry then joined again on top of it.
+        // Gathered before joining, so a failure can't leave the bot in the channel deaf.
         let (wake_model, big_models, lock) = {
             let data = ctx.data.read().await;
             (
@@ -106,8 +98,7 @@ impl VoiceService {
         let speakers = Speakers::default();
         {
             let mut handler = call.lock().await;
-            // A rejoin reuses the call, and its handlers with it. Without this
-            // every rejoin added another receiver of the same audio.
+            // A rejoin reuses the call; without this each rejoin adds another receiver.
             handler.remove_all_global_events();
             handler.add_global_event(CoreEvent::VoiceTick.into(), VoiceTickHandler::new(tx));
             handler.add_global_event(
@@ -116,10 +107,7 @@ impl VoiceService {
             );
         }
 
-        // songbird's join() returns as soon as the gateway request is sent, so
-        // a call that never reaches Discord's voice server is indistinguishable
-        // from a working one. Wait for the connection and report the result,
-        // because everything downstream depends on it.
+        // join() returns once the gateway request is sent; wait for the real connection.
         let mut connected = false;
         for _ in 0..50 {
             if call.lock().await.current_connection().is_some() {
@@ -174,12 +162,7 @@ impl VoiceService {
         Ok(())
     }
 
-    /// Reconciles bot presence with the configured target channel: joins when
-    /// people are present, leaves whatever channel it is in once nobody is.
-    ///
-    /// Called both from `voice_state_update` and from `guild_create`, so a
-    /// channel that was already occupied when the bot started counts the same
-    /// as one somebody walks into afterwards.
+    /// Joins the target channel when people are there; leaves its channel once empty.
     pub async fn sync_channel(
         &self,
         ctx: &SerenityContext,
@@ -192,8 +175,7 @@ impl VoiceService {
                 tracing::info!(guild_id = %guild_id, channel = %target, "joined the voice channel");
             }
             Presence::Leave => {
-                // Someone dropping out for a second, a network blip or a
-                // client restart, must not cost everyone the queue.
+                // A brief dropout must not cost everyone the queue.
                 tokio::time::sleep(LEAVE_GRACE).await;
                 if self.presence(ctx, guild_id).await != Presence::Leave {
                     tracing::debug!(guild_id = %guild_id, "someone came back; staying");
@@ -206,7 +188,6 @@ impl VoiceService {
         Ok(())
     }
 
-    /// What presence should be reconciled to right now.
     async fn presence(&self, ctx: &SerenityContext, guild_id: GuildId) -> Presence {
         let target = ChannelId::new(self.config.voice_channel_id);
         let current = match self.manager.get(guild_id) {
@@ -222,8 +203,7 @@ impl VoiceService {
         Self::what_to_do(in_target, here)
     }
 
-    /// The people in `channel`: other bots, this one included, do not count,
-    /// or a second bot in the channel would keep this one there forever.
+    /// People in `channel`, excluding bots, so another bot can't keep this one there forever.
     fn people_in(&self, ctx: &SerenityContext, guild_id: GuildId, channel: ChannelId) -> usize {
         let me = ctx.cache.current_user().id;
         let Some(guild) = ctx.cache.guild(guild_id) else {
@@ -245,9 +225,7 @@ impl VoiceService {
             .count()
     }
 
-    /// Leaves an empty channel, the way `/stop` would: the queue is cleared and
-    /// the dashboard says nothing is playing, rather than showing a song nobody
-    /// can hear.
+    /// Leaves an empty channel the way `/stop` would, clearing queue and dashboard.
     async fn leave_empty(&self, ctx: &SerenityContext, guild_id: GuildId) -> anyhow::Result<()> {
         if self.manager.get(guild_id).is_none() {
             return Ok(());
@@ -261,17 +239,8 @@ impl VoiceService {
         self.stop(guild_id).await
     }
 
-    /// What presence should be reconciled to.
-    ///
-    /// `in_target` is how many people are in the configured channel, and
-    /// `here` how many are in the channel the bot is connected to, if it is in
-    /// one. That is usually the same channel, but not when someone dragged
-    /// the bot elsewhere, and an emptied channel is left either way.
-    ///
-    /// Join whenever anyone is in the target, which is what makes a channel
-    /// that was already occupied at startup count the same as one somebody
-    /// just walked into. A bot that is with people is left alone rather than
-    /// rejoined.
+    /// `in_target`: people in the configured channel; `here`: people in the bot's
+    /// current channel (may differ if it was dragged), if connected.
     fn what_to_do(in_target: usize, here: Option<usize>) -> Presence {
         match here {
             Some(0) => Presence::Leave,
@@ -281,12 +250,7 @@ impl VoiceService {
         }
     }
 
-    /// Joins `channel`, retrying a few times before giving up.
-    ///
-    /// Discord's gateway sometimes takes longer than songbird's 10 s timeout to
-    /// answer, and one such timeout used to leave the bot outside the channel
-    /// for good: it only ever joins in response to a voice state change, so a
-    /// user already sitting in the channel would never trigger another attempt.
+    /// Joins `channel` with retries: the gateway can exceed songbird's 10 s timeout.
     async fn join_with_retry(
         &self,
         ctx: &SerenityContext,
@@ -313,13 +277,7 @@ impl VoiceService {
         Err(last.expect("at least one join attempt is always made"))
     }
 
-    /// Whether `user_id` is currently in this guild's bot voice channel.
-    ///
-    /// The gate for every playback control. The dashboard is a text-channel
-    /// message, so without this anyone in the server — or anyone who can see
-    /// the message at all — could press Skip or Stop on someone else's music,
-    /// and `/stop` could be used to kick the bot out from under the people who
-    /// asked for it.
+    /// Whether `user_id` is in the bot's voice channel; gates every playback control.
     pub fn is_in_bot_channel(
         &self,
         ctx: &SerenityContext,
@@ -336,20 +294,8 @@ impl VoiceService {
         Self::member_is_in(channel, target)
     }
 
-    /// The rule itself.
-    ///
-    /// `channel` is the voice channel the member is in, or `None` when they are
-    /// not in one at all -- no cached voice state, or connected but deaf to
-    /// everything.
-    ///
-    /// Split from [`Self::is_in_bot_channel`] so it can be exercised without a
-    /// gateway: serenity's `Cache` populates itself from events and offers no
-    /// way to insert one in a test.
-    ///
-    /// `None` is refused rather than allowed. The cache can lag a join or a
-    /// move, and the cost of wrongly allowing is that anyone can stop anyone
-    /// else's music; the cost of wrongly refusing is one person has to press
-    /// the button again.
+    /// The rule, split out because serenity's `Cache` can't be filled in tests.
+    /// Unknown (`None`) is refused: a wrong refusal costs a retry, a wrong allow doesn't.
     pub fn member_is_in(channel: Option<ChannelId>, target: ChannelId) -> bool {
         channel == Some(target)
     }

@@ -3,12 +3,7 @@ use symphonia::core::io::MediaSource;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
-/// A one-shot HTTP server on a loopback port.
-///
-/// Hand-rolled rather than pulled in as a dependency: the whole thing is an
-/// accept, a read of the request head and a write of a canned response, and
-/// the tests need to control exactly that -- including never answering,
-/// which is the stall.
+/// A one-shot HTTP server on a loopback port; hand-rolled so a test can make it never answer.
 async fn serve(response: Option<Vec<u8>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!(
@@ -22,8 +17,7 @@ async fn serve(response: Option<Vec<u8>>) -> String {
         let mut request = [0u8; 1024];
         let _ = socket.read(&mut request).await;
         let Some(response) = response else {
-            // A connection that is accepted and then says nothing: the
-            // stall, which no status code ever announces.
+            // Accept and say nothing: the stall.
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             return;
         };
@@ -33,7 +27,7 @@ async fn serve(response: Option<Vec<u8>>) -> String {
     url
 }
 
-/// A minimal MP4 header, enough to be bytes rather than an empty body.
+/// A minimal MP4 header, so the body is not empty.
 const AUDIO: &[u8] = b"\x00\x00\x00\x18ftypM4A \x00\x00\x02\x00isom";
 
 /// The response a server sends for a range request it is willing to serve.
@@ -48,10 +42,6 @@ fn serves(status: &str, body: &[u8]) -> Vec<u8> {
 }
 
 /// The happy path: the format URL answers, so the song streams.
-///
-/// Without this the streaming path could be broken in the one direction that
-/// matters -- a stream that is never used because the probe refuses it -- and
-/// the bot would look fine while getting no faster.
 #[tokio::test]
 async fn a_stream_that_answers_is_the_one_that_plays() {
     let url = serve(Some(serves("206 Partial Content", AUDIO))).await;
@@ -78,17 +68,14 @@ async fn a_stream_that_answers_is_the_one_that_plays() {
     );
 }
 
-/// A signed URL from a while ago is refused with a 403, which is the common
-/// failure: nothing is wrong with the video, the URL is simply past its
-/// life. The song must still play, from the file.
+/// An expired signed URL gets a 403; the song must still play from the file.
 #[tokio::test]
 async fn a_stream_the_server_refuses_falls_back_to_the_file() {
     let url = serve(Some(serves("403 Forbidden", b""))).await;
     let dir = std::env::temp_dir().join("shamash-403-test");
     let _ = tokio::fs::remove_dir_all(&dir).await;
     tokio::fs::create_dir_all(&dir).await.expect("create dir");
-    // Already on disk, so the fallback is a file the song can play rather
-    // than a yt-dlp run these tests cannot make.
+    // On disk, so the fallback needs no yt-dlp.
     let cache = dir.join("abc.m4a");
     tokio::fs::write(&cache, AUDIO).await.expect("write");
     let timing = Timing::default();
@@ -116,8 +103,7 @@ async fn a_stream_the_server_refuses_falls_back_to_the_file() {
     assert_eq!(resolved, Source::File(cache), "the file is what plays");
 }
 
-/// A body that starts and then stops arriving must end in an error, so
-/// `save` can fall back to yt-dlp instead of waiting forever.
+/// A body that stops arriving must error, so `save` can fall back to yt-dlp.
 #[tokio::test(start_paused = true)]
 async fn a_stream_download_that_stalls_gives_up() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -147,9 +133,7 @@ async fn a_stream_download_that_stalls_gives_up() {
     assert!(matches!(result, Ok(Err(_))), "{result:?}");
 }
 
-/// A connection that is accepted and then goes quiet is the other failure,
-/// and the one a status code cannot report. The budget is what turns it into
-/// a fallback instead of a listener waiting forever.
+/// A silent connection must hit the budget and fall back, not hang.
 #[tokio::test]
 async fn a_stream_that_stalls_falls_back_to_the_file() {
     let url = serve(None).await;
@@ -211,8 +195,7 @@ async fn a_file_is_played_as_it_is() {
     );
 }
 
-/// The format chosen for streaming has to be one symphonia can decode, and
-/// the URL has to travel with the headers it was signed for.
+/// The streamed format must be decodable and keep its signed headers.
 #[test]
 fn the_streamed_format_is_decodable_and_carries_its_headers() {
     let json = serde_json::json!({
@@ -230,13 +213,12 @@ fn the_streamed_format_is_decodable_and_carries_its_headers() {
     let picked = pick_streamable(&json).expect("a decodable audio format");
     assert_eq!(picked.url, "https://video.example/aac", "AAC in MP4");
     assert_eq!(picked.ext, "m4a");
-    // Dropping these is what gets a 403, so they have to survive.
+    // Dropping these gets a 403.
     assert_eq!(picked.headers.get("user-agent").unwrap(), "Mozilla/5.0");
     assert_eq!(picked.headers.get("range").unwrap(), "bytes=0-99");
 }
 
-/// A video offering nothing decodable is not a stream: it is downloaded and
-/// transcoded, which is what happened to every song before.
+/// Nothing decodable means download and transcode, not stream.
 #[test]
 fn a_video_with_nothing_decodable_offers_no_stream() {
     let json = serde_json::json!({
@@ -248,20 +230,16 @@ fn a_video_with_nothing_decodable_offers_no_stream() {
     assert!(pick_streamable(&json).is_none());
 }
 
-/// Every request for a stream asks for a closed range over the whole file,
-/// and nothing else: YouTube answers 403 to both a plain GET and to
-/// `bytes=0-`, so a range written any other way turns every song into a
-/// silent fallback, and only in production.
+/// Always a closed range: YouTube 403s a plain GET and `bytes=0-`.
 #[test]
 fn a_stream_is_asked_for_as_a_closed_range_over_the_whole_file() {
     assert_eq!(whole_stream(1), "bytes=0-0");
     assert_eq!(whole_stream(4_096), "bytes=0-4095");
-    // A length that is somehow zero must not produce a backwards range.
+    // Zero length must not produce a backwards range.
     assert_eq!(whole_stream(0), "bytes=0-0");
 }
 
-/// A format with no known length cannot be asked for at all, so it is not
-/// offered: there would be nothing to close the range with.
+/// A format with no known length cannot close the range, so it is not offered.
 #[test]
 fn a_format_with_no_length_offers_no_stream() {
     let json = serde_json::json!({
@@ -275,12 +253,11 @@ fn a_format_with_no_length_offers_no_stream() {
 
 #[test]
 fn decodable_format_avoids_opus_and_prefers_aac() {
-    // Opus has no symphonia decoder, so no branch of the selector may
-    // resolve to it.
+    // Symphonia cannot decode Opus.
     assert!(DECODABLE_FORMAT.contains("acodec!=opus"));
     assert!(!DECODABLE_FORMAT.contains("[acodec=opus]"));
     assert!(DECODABLE_FORMAT.starts_with("bestaudio[acodec^=mp4a]"));
-    // Every branch must be audio-only: a video stream would be silent.
+    // Audio-only: a video stream would be silent.
     for branch in DECODABLE_FORMAT.split('/') {
         assert!(
             branch.contains("bestaudio"),
@@ -291,9 +268,7 @@ fn decodable_format_avoids_opus_and_prefers_aac() {
 
 #[test]
 fn each_song_downloads_to_its_own_file() {
-    // The bug this prevents: one shared path per guild, so a second
-    // request overwrote the audio a track was reading and the song that
-    // was asked for was heard as the one before it.
+    // A shared per-guild path let a second request overwrite the playing track.
     let one = download_args(
         "https://youtu.be/abc",
         Path::new("/tmp/shamash-1"),
@@ -322,9 +297,7 @@ fn each_song_downloads_to_its_own_file() {
 
 #[test]
 fn each_download_forces_a_real_one() {
-    // yt-dlp's default skips a download whose output file already exists,
-    // printing the path and exiting 0, so a stale file too small to play
-    // would be handed to the player as if it were fresh audio.
+    // yt-dlp skips existing outputs by default, passing off a stale file as fresh.
     let args = download_args(
         "https://youtu.be/abc",
         Path::new("/tmp/shamash-1"),
@@ -339,8 +312,7 @@ fn each_download_forces_a_real_one() {
         args.iter().any(|a| a == "--force-overwrites"),
         "a stale file would be replayed: {args:?}"
     );
-    // Writing straight to the output would truncate the file a playing
-    // track is reading, so the default `.part` file must be left alone.
+    // Keep `.part`: writing in place would truncate a playing track's file.
     assert!(
         !args.iter().any(|a| a == "--no-part"),
         "the output must be renamed into place, not written in place: {args:?}"
@@ -356,8 +328,7 @@ fn each_guild_gets_its_own_directory() {
 
 #[test]
 fn a_video_id_cannot_escape_the_cache_directory() {
-    // The id comes from a search result, so it must not be able to name a
-    // path outside the cache.
+    // The id is untrusted: it must not escape the cache.
     for id in ["../../etc/passwd", "a/b", "..", "with space"] {
         let stem = file_stem(id);
         assert!(
@@ -372,8 +343,7 @@ fn a_video_id_cannot_escape_the_cache_directory() {
 
 #[tokio::test]
 async fn audio_already_downloaded_is_reused() {
-    // A file named after the video is that song's audio, so asking for
-    // the same song again must not download it a second time.
+    // A cached song is not downloaded again.
     let dir = std::env::temp_dir().join("shamash-existing-test");
     let _ = tokio::fs::remove_dir_all(&dir).await;
     tokio::fs::create_dir_all(&dir).await.expect("create dir");
@@ -387,8 +357,7 @@ async fn audio_already_downloaded_is_reused() {
 
 #[tokio::test]
 async fn a_half_downloaded_file_is_not_reused() {
-    // A `.part` file is a download that never finished. Reusing it would
-    // play silence or a fragment.
+    // A `.part` file is an unfinished download.
     let dir = std::env::temp_dir().join("shamash-part-test");
     let _ = tokio::fs::remove_dir_all(&dir).await;
     tokio::fs::create_dir_all(&dir).await.expect("create dir");
@@ -413,10 +382,7 @@ async fn an_empty_file_is_not_reused() {
 
 #[tokio::test]
 async fn a_subprocess_that_never_finishes_is_killed_at_the_deadline() {
-    // The point of the deadlines: `Player::play` holds the guild's request
-    // ordering while a fetch runs, so a subprocess that hangs forever must
-    // become an error the listener can be told about rather than a request
-    // that never completes.
+    // `Player::play` holds request ordering during a fetch, so a hang must become an error.
     let budget = Duration::from_millis(200);
     let mut command = Command::new("sh");
     command.kill_on_drop(true).arg("-c").arg("sleep 30");
@@ -434,8 +400,7 @@ async fn a_subprocess_that_never_finishes_is_killed_at_the_deadline() {
     );
 }
 
-/// A command that finishes inside the budget is not disturbed by the
-/// wrapper, or every normal fetch would report a timeout.
+/// A command inside its budget is not disturbed by the wrapper.
 #[tokio::test]
 async fn a_subprocess_that_finishes_in_time_is_not_disturbed() {
     let mut command = Command::new("sh");
@@ -446,9 +411,7 @@ async fn a_subprocess_that_finishes_in_time_is_not_disturbed() {
     assert!(output.status.success());
 }
 
-/// The durations are the documented contract for how long a spoken command
-/// can wait on a subprocess, so they are pinned here rather than only in
-/// the README.
+/// Pins the documented subprocess deadlines.
 #[test]
 fn every_subprocess_has_a_bounded_budget() {
     assert_eq!(DOWNLOAD_TIMEOUT, Duration::from_secs(90));
@@ -475,8 +438,7 @@ async fn pruning_keeps_the_newest_downloads() {
         left.contains(&"song11.m4a".to_string()),
         "newest kept: {left:?}"
     );
-    // The 12 files written are song0..song11, and the newest 8 are kept, so
-    // the four oldest are what goes.
+    // song0..song11 written, newest 8 kept.
     for pruned in ["song0.m4a", "song1.m4a", "song2.m4a", "song3.m4a"] {
         assert!(
             !left.contains(&pruned.to_string()),
@@ -486,10 +448,7 @@ async fn pruning_keeps_the_newest_downloads() {
     assert_eq!(left.len(), KEEP_FILES, "the cache must stay bounded");
 }
 
-/// The bug this exists for: `prune` kept the newest eight files outright,
-/// which is fewer than `MAX_QUEUE`, so with a dozen songs queued a
-/// thirteenth download deleted the audio of songs that were about to play.
-/// Nothing in use is ever deleted, however old it is.
+/// Nothing in use is pruned, however old: newest-eight once deleted queued songs.
 #[tokio::test]
 async fn pruning_never_deletes_a_queued_songs_audio() {
     let dir = std::env::temp_dir().join("shamash-prune-queued-test");
@@ -501,10 +460,10 @@ async fn pruning_never_deletes_a_queued_songs_audio() {
         .collect();
     for path in &queued {
         tokio::fs::write(path, b"audio").await.expect("write");
-        // Deliberately old: pruning is by age, and these must survive it.
+        // Deliberately old; they must survive anyway.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    // Then the thirteenth, which is what triggers the prune.
+    // The thirteenth triggers the prune.
     tokio::fs::write(dir.join("thirteenth.m4a"), b"audio")
         .await
         .expect("write");
@@ -522,8 +481,7 @@ async fn pruning_never_deletes_a_queued_songs_audio() {
     assert_eq!(left.len(), 13, "nothing was in use to prune: {left:?}");
 }
 
-/// Once the songs are gone the cache shrinks again, so a queue that was
-/// full of one-off songs does not keep their audio forever.
+/// Once the songs leave the queue the cache shrinks again.
 #[tokio::test]
 async fn pruning_resumes_once_the_songs_are_no_longer_queued() {
     let dir = std::env::temp_dir().join("shamash-prune-after-test");
@@ -550,9 +508,7 @@ async fn names_in(dir: &Path) -> Vec<String> {
     left
 }
 
-/// Checks the fallback used when YouTube offers nothing but Opus: the
-/// stream is transcoded to WAV, which the `wav` and `pcm` handlers read.
-/// Ignored by default because it needs the ffmpeg binary.
+/// Opus-only fallback transcodes to WAV. Needs ffmpeg (`--ignored`).
 #[tokio::test]
 #[ignore = "needs ffmpeg"]
 async fn transcodes_opus_to_a_decodable_wav() {
@@ -579,9 +535,7 @@ async fn transcodes_opus_to_a_decodable_wav() {
     assert!(header.len() > 44, "the WAV must contain audio");
 }
 
-/// Downloads two different videos and checks each keeps its own audio,
-/// which is the bug behind hearing the previous song again. Ignored by
-/// default because it needs network access and the yt-dlp binary.
+/// Two downloads keep their own audio. Needs network and yt-dlp (`--ignored`).
 #[tokio::test]
 #[ignore = "needs network and yt-dlp"]
 async fn two_songs_keep_separate_audio() {
@@ -600,11 +554,7 @@ async fn two_songs_keep_separate_audio() {
     );
 }
 
-/// A song fetched and left on disk, the way playback leaves it.
-///
-/// The streaming path puts nothing on disk by itself: the audio arrives
-/// through songbird and the cache is filled in the background, so a test that
-/// wants a file has to do what that background write does.
+/// A song left on disk the way playback's background cache write leaves it.
 async fn fetched_file(video_id: &str, url: &str, dir: &Path) -> PathBuf {
     let timing = Timing::default();
     let source = fetch(video_id, url, dir, &[], &timing)
@@ -627,16 +577,8 @@ async fn fetched_file(video_id: &str, url: &str, dir: &Path) -> PathBuf {
     }
 }
 
-/// Plays a real YouTube format URL the way playback does -- one range
-/// request, a source that cannot seek, and symphonia's isomp4 demuxer --
-/// and checks audio comes out of it.
-///
-/// This is the one check the streaming path cannot be built without: an MP4
-/// whose `moov` atom sits after its audio data cannot be demuxed as it
-/// arrives, because the demuxer cannot seek back for the sample tables. A
-/// seekable file hides that completely, and a URL that returns 404 for a
-/// regional format hides it too, so the answer has to come from the real
-/// thing.
+/// Plays a real format URL unseekably, as playback does: a trailing `moov` atom
+/// only fails against the real thing.
 #[tokio::test]
 #[ignore = "needs network; run serially, YouTube refuses concurrent extractions"]
 async fn a_real_youtube_stream_demuxes_without_being_fully_buffered() {
@@ -660,8 +602,7 @@ async fn a_real_youtube_stream_demuxes_without_being_fully_buffered() {
         let mut probed = get_probe()
             .format(
                 &Hint::new(),
-                // Songbird wraps a stream in exactly this: no seek, and
-                // only the bytes that have arrived.
+                // As songbird wraps it: no seek.
                 MediaSourceStream::new(Box::new(Unseekable::new(bytes)), Default::default()),
                 &FormatOptions::default(),
                 &MetadataOptions::default(),
@@ -722,8 +663,7 @@ impl std::io::Read for Unseekable {
 
 impl std::io::Seek for Unseekable {
     fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        // Never actually seekable. Symphonia asks whether it is before it
-        // tries, so this only has to refuse rather than pretend.
+        // Symphonia checks this before seeking.
         Err(std::io::ErrorKind::Unsupported.into())
     }
 }
@@ -738,9 +678,7 @@ impl MediaSource for Unseekable {
     }
 }
 
-/// Downloads a real video and checks the result is something the decoder
-/// can read. Ignored by default because it needs network access and the
-/// yt-dlp binary.
+/// A real download decodes. Needs network and yt-dlp (`--ignored`).
 #[tokio::test]
 #[ignore = "needs network and yt-dlp"]
 async fn fetches_audio_the_decoder_accepts() {

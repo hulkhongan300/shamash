@@ -11,7 +11,7 @@ fn a_model_id_downloads_into_the_cache_layout_resolve_reads() {
     );
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     std::fs::write(&dest, b"gguf").unwrap();
-    // No refs/main at all, as after a first download.
+    // No refs/main, as after a first download.
     assert_eq!(resolve_in(&cache, spec).unwrap(), dest);
     let _ = std::fs::remove_dir_all(&cache);
 }
@@ -23,7 +23,6 @@ async fn a_missing_model_is_downloaded_and_then_found() {
     let cache = std::env::temp_dir().join(format!("shamash-live-{}", std::process::id()));
     let path = ensure_in(&cache, SMALL_MODEL_ID).await.expect("download");
     assert!(std::fs::metadata(&path).unwrap().len() > 100_000_000);
-    // A second call finds it rather than downloading again.
     assert_eq!(ensure_in(&cache, SMALL_MODEL_ID).await.unwrap(), path);
     let _ = std::fs::remove_dir_all(&cache);
 }

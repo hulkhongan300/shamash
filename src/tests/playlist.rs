@@ -16,8 +16,7 @@ fn video_links_of_every_shape_are_read() {
     }
 }
 
-/// The bug this replaced: any single word was taken for a video id, so
-/// `/play dracula` tried to play a video called "dracula".
+/// Regression: any single word used to be taken for a video id.
 #[test]
 fn a_bare_word_is_a_search_not_a_video() {
     for text in [
@@ -52,8 +51,6 @@ fn playlist_and_album_links_are_read() {
     );
 }
 
-/// Sharing one song from a playlist shares a link with both ids. It is
-/// that song, not the playlist.
 #[test]
 fn a_video_inside_a_playlist_is_that_video() {
     let link = "https://www.youtube.com/watch?v=cuMuMnCRfqk&list=OLAK5uy_kW9hN-oBmekJ06jhhfStpwRd5pcRKIztY";
@@ -96,7 +93,7 @@ fn a_long_playlist_is_cut_to_the_room_left() {
     assert_eq!(fitting(11, 25, 20), 0);
 }
 
-/// Lists the album from the issue. Needs network and yt-dlp.
+/// Lists the album from the issue.
 #[tokio::test]
 #[ignore = "needs network and yt-dlp"]
 async fn the_live_album_lists_in_order() {

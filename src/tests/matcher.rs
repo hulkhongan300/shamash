@@ -19,8 +19,7 @@ fn c(said: &'static str, truth: Hit, others: Vec<Hit>) -> Case {
     }
 }
 
-/// The seed benchmark from the design note, plus the cases that broke the
-/// previous scorer.
+/// Seed benchmark plus the cases that broke the previous scorer.
 fn golden() -> Vec<Case> {
     vec![
         c(
@@ -146,8 +145,6 @@ fn golden() -> Vec<Case> {
     ]
 }
 
-/// The true song is among the hits: it must be played or offered, never
-/// replaced.
 #[test]
 fn the_right_song_is_chosen_when_it_is_returned() {
     for case in golden() {
@@ -160,7 +157,6 @@ fn the_right_song_is_chosen_when_it_is_returned() {
     }
 }
 
-/// The true song is NOT among the hits: nothing may be confidently played.
 #[test]
 fn a_wrong_song_is_never_confidently_played() {
     for case in golden() {
@@ -178,9 +174,7 @@ fn a_wrong_song_is_never_confidently_played() {
     }
 }
 
-/// A bare title matches the official recording and its cover equally on
-/// the title; accidental letter overlap with the cover's artist must not
-/// put the cover first. The caller breaks the remaining tie by plays.
+/// Letter overlap with a cover's artist must not rank it first; callers tie-break by plays.
 #[test]
 fn a_bare_title_does_not_favour_a_cover_by_artist_overlap() {
     let hits = [
@@ -195,7 +189,6 @@ fn a_bare_title_does_not_favour_a_cover_by_artist_overlap() {
     }
 }
 
-/// "Stand By Me" must not be read as title "stand" by artist "me".
 #[test]
 fn by_inside_a_title_is_not_a_split() {
     let hits = [
@@ -225,8 +218,7 @@ fn unrelated_titles_by_the_named_artist_are_no_match() {
     );
 }
 
-/// The old scorer's worst answers, one per mechanism. Each was a confident
-/// wrong play before; each is asserted here so it cannot come back.
+/// Regressions: each was a confident wrong play under the old scorer.
 #[test]
 fn the_old_scorers_wrong_answers_are_now_refused() {
     // Right artist, wrong title: the artist is a bonus, never a pass.
@@ -241,12 +233,10 @@ fn the_old_scorers_wrong_answers_are_now_refused() {
         "one shared word must not carry a wrong song"
     );
 
-    // Right artist, one word different title.
     let hits = [("Adele", "Hello Brother"), ("Adele", "Someone Like You")];
     assert_eq!(decide("hello by adele", &hits, key), Verdict::NoMatch);
 
-    // A wrong song by the right artist that the old scorer rated 0.630,
-    // just over its 0.62 bar.
+    // The old scorer rated this 0.630, just over its 0.62 bar.
     let hits = [
         ("The Temper Trap", "Fader"),
         ("The Temper Trap", "Science of Fear"),
@@ -257,8 +247,6 @@ fn the_old_scorers_wrong_answers_are_now_refused() {
     );
 }
 
-/// "Lover" and "Love Story" are one letter apart. What separates them is
-/// that nothing in "Lover" explains the word "story".
 #[test]
 fn a_title_that_leaves_a_word_unexplained_is_discounted() {
     let heard = "love story by taylor swift";
@@ -271,8 +259,6 @@ fn a_title_that_leaves_a_word_unexplained_is_discounted() {
     );
 }
 
-/// The artist-first order is as ordinary as the title-first one, and used
-/// to be worse: "drakula tame impala" names the artist *after* the title.
 #[test]
 fn the_artist_may_come_before_or_after_the_title() {
     let hits = [("Tame Impala", "Dracula"), ("Tame Impala", "Borderline")];
@@ -289,7 +275,6 @@ fn the_artist_may_come_before_or_after_the_title() {
     }
 }
 
-/// Speech-to-text mangles names; the phonetic floor is what rescues those.
 #[test]
 fn a_misheard_name_still_matches() {
     assert!(
@@ -312,11 +297,7 @@ fn a_misheard_name_still_matches() {
     }
 }
 
-/// A bare misheard title with no artist named is a *safe failure*, not a
-/// guess. "hoolig" is two edits from "hooligan", which is 0.75 -- below
-/// ACCEPT on its own -- so the request is offered or refused rather than
-/// played. Naming the artist is what carries it over, which is why the
-/// resolver also asks the catalog for the artist's tracks.
+/// "hoolig" alone scores below ACCEPT: refused, not guessed. Naming the artist carries it.
 #[test]
 fn a_misheard_title_with_no_artist_named_is_not_guessed() {
     let hits = [("BTS", "Hooligan"), ("BTS", "Dynamite")];
@@ -324,8 +305,6 @@ fn a_misheard_title_with_no_artist_named_is_not_guessed() {
     assert!(score("hoolig", "BTS", "Hooligan").title >= TITLE_GATE);
 }
 
-/// A title that equals a common word is not distinctive, and the matcher
-/// must not treat "hey" or "okay" as content to be explained.
 #[test]
 fn filler_words_are_not_content() {
     let hits = [
@@ -343,9 +322,7 @@ fn filler_words_are_not_content() {
     );
 }
 
-/// Non-English titles work through the edit-distance path, which is what
-/// the phonetic floor cannot help with: Double Metaphone is built for
-/// English names and encodes Hangul to nothing useful.
+/// Hangul relies on edit distance; Double Metaphone ignores it.
 #[test]
 fn non_english_titles_still_match() {
     let hits = [
@@ -358,7 +335,6 @@ fn non_english_titles_still_match() {
         Verdict::Confident(h) if h.1 == "밤편지"
     ));
 
-    // A K-pop title spelled in Hangul on both sides.
     let hits = [("BTS", "나비잠"), ("BTS", "봄날"), ("BTS", "에 YOUNG")];
     assert!(matches!(
         decide("나비잠 by bts", &hits, key),
@@ -366,22 +342,19 @@ fn non_english_titles_still_match() {
     ));
 }
 
-/// Two recordings of one title are one song as far as matching goes.
 #[test]
 fn decorated_hits_collapse_to_one_song() {
     let hits = [
         ("Queen", "Don't Stop Me Now (Live)"),
         ("Queen", "Don't Stop Me Now"),
     ];
-    // Which of the two survives does not matter -- they are the same song,
-    // and the catalog's own order decides.
+    // Either survivor is fine; they are the same song.
     match decide("dont stop me now queen", &hits, key) {
         Verdict::Confident(h) => assert_eq!(normalize(h.1), "don t stop me now"),
         other => panic!("{other:?}"),
     }
 }
 
-/// A request with nothing in it must not match anything.
 #[test]
 fn an_empty_transcript_matches_nothing() {
     let hits = [("Tame Impala", "Dracula")];
@@ -389,7 +362,6 @@ fn an_empty_transcript_matches_nothing() {
     assert_eq!(decide("   ", &hits, key), Verdict::NoMatch);
 }
 
-/// A hit with no usable title cannot be matched against anything.
 #[test]
 fn a_hit_with_no_title_is_ignored() {
     let hits = [("Tame Impala", "  "), ("Tame Impala", "Dracula")];
@@ -399,15 +371,13 @@ fn a_hit_with_no_title_is_ignored() {
     ));
 }
 
-/// With nothing to choose from there is no match, not a panic.
 #[test]
 fn no_hits_is_no_match() {
     let hits: Vec<Hit> = Vec::new();
     assert_eq!(decide("dracula tame impala", &hits, key), Verdict::NoMatch);
 }
 
-/// The offered options are the best first and are capped, because the
-/// chooser has three buttons and no more.
+/// The chooser has three buttons.
 #[test]
 fn an_ambiguous_verdict_offers_at_most_three_best_first() {
     let hits = [
@@ -425,8 +395,7 @@ fn an_ambiguous_verdict_offers_at_most_three_best_first() {
     }
 }
 
-/// The thresholds are what the whole design rests on, so the numbers are
-/// pinned rather than left to drift with a retune.
+/// Pinned so a retune is deliberate.
 #[test]
 fn the_thresholds_are_the_documented_ones() {
     assert_eq!(TITLE_GATE, 0.65);

@@ -16,8 +16,7 @@ fn speakers_are_kept_apart_rather_than_mixed() {
     assert!((two.1[0] + 2000.0 / 32768.0).abs() < 1e-6);
 }
 
-/// The failure this prevents: a speaker stops transmitting, Discord sends
-/// nothing at all, and their utterance never ends.
+/// Otherwise an utterance never ends when Discord stops sending.
 #[test]
 fn a_silent_speaker_is_given_silence() {
     let tick = split_tick([], [9]);

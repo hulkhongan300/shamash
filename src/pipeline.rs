@@ -23,10 +23,7 @@ pub enum Understood {
     Nothing(Option<ParseMiss>),
 }
 
-/// The grammar applied to the larger model's transcript of an utterance.
-///
-/// `armed` is an utterance that followed a bare wake word, which is the request
-/// whether or not it repeats the wake word.
+/// Parses the larger model's transcript; `armed` means it follows a bare wake word.
 pub fn understand(parser: &CommandParser, transcript: &str, armed: bool) -> Understood {
     if armed {
         return match parser.armed_request(transcript) {
@@ -41,19 +38,15 @@ pub fn understand(parser: &CommandParser, transcript: &str, armed: bool) -> Unde
     }
 }
 
-/// Acts on what [`crate::wake`] hears: acknowledge the wake word, transcribe
-/// the utterance with the larger model, and turn it into a song.
+/// Turns what [`crate::wake`] hears into acknowledgements and songs.
 pub struct ListenerPipeline {
-    /// The larger model, loaded on the first wake word rather than at startup.
+    /// Loaded on the first wake word, not at startup.
     pub models: Arc<BigModels>,
     pub parser: CommandParser,
     pub player: Arc<Player>,
-    /// Speakers waiting to say their request after a bare wake word.
     armed: Armed,
-    /// Who each voice stream belongs to, for the log.
     speakers: Speakers,
-    /// Utterances that produced no words, reported once there is something
-    /// real to say.
+    /// Wordless utterances, logged with the next real one.
     muted_utterances: AtomicUsize,
 }
 
@@ -75,11 +68,7 @@ impl ListenerPipeline {
         }
     }
 
-    /// Starts the task that handles what the gate hears, and returns its inbox.
-    ///
-    /// Utterances are handled one at a time, in the order they were heard. The
-    /// acknowledgement tone is played on its own task, so a request still being
-    /// resolved cannot delay telling the next speaker they were heard.
+    /// Starts the in-order handler task and returns its inbox.
     pub fn start(
         self: Arc<Self>,
         ctx: SerenityContext,
@@ -103,12 +92,8 @@ impl ListenerPipeline {
         tx
     }
 
-    /// The wake word was heard while the speaker is still talking.
-    ///
-    /// The music is lowered at once, so it does not bleed into the rest of
-    /// what they say through other people's microphones. That part is
-    /// synchronous on purpose: the utterance that follows raises it again, and
-    /// must never be handled before it was lowered.
+    /// Ducks synchronously so the following utterance can never unduck first;
+    /// the tone runs on its own task so a slow request cannot delay it.
     fn handle_wake(self: &Arc<Self>, guild_id: GuildId, ssrc: Ssrc) {
         self.player.duck(guild_id, ssrc, true);
         let this = Arc::clone(self);
@@ -116,8 +101,7 @@ impl ListenerPipeline {
             if let Err(e) = this.player.acknowledge(guild_id, Tone::Wake).await {
                 tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "wake tone failed");
             }
-            // Start loading the larger model now, so it is ready by the time
-            // the speaker finishes. A no-op once it is resident.
+            // Warm the larger model while the speaker is still talking.
             let models = Arc::clone(&this.models);
             if let Ok(Err(e)) = tokio::task::spawn_blocking(move || models.get_or_load()).await {
                 tracing::error!(guild_id = %guild_id, error = %format!("{e:#}"), "could not load the larger model");
@@ -144,8 +128,7 @@ impl ListenerPipeline {
         timing.log("voice");
     }
 
-    /// Returns whether the music should stay lowered, which it does only while
-    /// the speaker is armed to say their request.
+    /// Returns whether to stay ducked (only while the speaker is armed).
     #[allow(clippy::too_many_arguments)]
     async fn handle_utterance_timed(
         self: &Arc<Self>,
@@ -178,15 +161,14 @@ impl ListenerPipeline {
                 return true;
             }
             Understood::Nothing(miss) => {
-                // The tone played and the music dropped for nothing, so this is
-                // the line to count when the bot wakes when it should not.
+                // The false-wake log line.
                 let reason = miss.map_or_else(|| "no request".to_string(), |m| m.to_string());
                 tracing::info!(guild_id = %guild_id, user, transcript = %transcript, armed, reason, "woke, but heard no request");
                 return false;
             }
         };
 
-        // The music comes back while the song is looked up, rather than after.
+        // Unduck before the lookup, not after.
         self.player.duck(guild_id, ssrc, false);
         let rewritten = self
             .rewrite(ctx, config, guild_id, &transcript, timing)
@@ -213,8 +195,7 @@ impl ListenerPipeline {
         false
     }
 
-    /// The speaker said only the wake word: tell them to go ahead, and take
-    /// their next utterance as the request.
+    /// Bare wake word: play the ready tone and take the next utterance as the request.
     fn arm(self: &Arc<Self>, guild_id: GuildId, ssrc: Ssrc) {
         let deadline = self.armed.arm(ssrc);
         tracing::info!(guild_id = %guild_id, ssrc, "heard the wake word on its own; waiting for the request");
@@ -231,7 +212,6 @@ impl ListenerPipeline {
         });
     }
 
-    /// The larger model's transcript of `audio`, or `None` if it failed.
     async fn transcribe(
         &self,
         guild_id: GuildId,
@@ -260,7 +240,7 @@ impl ListenerPipeline {
         }
     }
 
-    /// The rewriting stage, or `None` when it is off or produced nothing better.
+    /// `None` when the rewrite is off or produced nothing better.
     async fn rewrite(
         &self,
         ctx: &SerenityContext,

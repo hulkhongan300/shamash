@@ -1,7 +1,4 @@
-//! The now-playing dashboard posted to the text channel.
-//!
-//! An embed plus buttons. Discord echoes a button's `custom_id` back on every
-//! press, which is how the press is matched to [`action_from_id`].
+//! The now-playing dashboard: an embed plus buttons matched by `custom_id`.
 
 use crate::queue::{Origin, Queued, Shift, Waiting};
 use serenity::all::ReactionType;
@@ -11,50 +8,35 @@ use serenity::builder::{
 };
 use serenity::model::application::ButtonStyle;
 
-/// Custom id prefix for every dashboard button.
-///
-/// The guild is not encoded: a press already arrives with the guild attached.
+/// Custom id prefix for every dashboard button (presses already carry the guild).
 const PREFIX: &str = "shamash";
 
-/// Buttons, in the order they are shown.
 pub const ACTION_PAUSE: &str = "pause";
 pub const ACTION_RESUME: &str = "resume";
 pub const ACTION_SKIP: &str = "skip";
 pub const ACTION_STOP: &str = "stop";
 
-/// Shows what is waiting in the queue, in place of the now-playing view.
 pub const ACTION_QUEUE: &str = "queue";
 
-/// Goes back to the now-playing view from the queue.
-///
-/// The same button cannot do both, because the dashboard is one message that is
-/// edited in place and the bot does not track which way round it was left.
+/// Separate from Queue: the bot doesn't track which view the message shows.
 pub const ACTION_BACK: &str = "back";
 
-/// Turns repeat-one on or off.
 pub const ACTION_REPEAT: &str = "repeat";
 
-/// Says a remembered song was the wrong one: forgets the phrase, skips the
-/// song and asks "Which one?" again. Only shown on a song the memory chose.
+/// Forgets a remembered phrase, skips, and asks again. Only on remembered songs.
 pub const ACTION_WRONG: &str = "wrong";
 
-/// What the dashboard says under a song the song memory chose, so nobody
-/// wonders why the bot did not ask.
+/// Shown under a remembered song, so nobody wonders why the bot didn't ask.
 pub const REMEMBERED_NOTE: &str = "🧠 remembered from last time";
 
-/// Shows the next page of a `/play` search.
 pub const ACTION_NEXT: &str = "next";
 
-/// Throws away a `/play` search.
 pub const ACTION_NOTHING: &str = "nothing";
 
-/// The queue view's song picker: a select menu rather than a button per song,
-/// because Discord fits five rows of five buttons in a message and the queue
-/// holds twenty songs plus the controls.
+/// A select menu: 20 songs plus controls won't fit Discord's 5x5 buttons.
 const PICK: &str = "pick";
 
-/// Marks a custom id as one of the queue view's edit buttons, which carries
-/// the id of the song it acts on.
+/// Custom id marker for queue edit buttons.
 const EDIT_PREFIX: &str = "edit";
 
 /// A change to the queue, made from the queue view.
@@ -67,7 +49,6 @@ pub enum Edit {
 }
 
 impl Edit {
-    /// The word in the custom id.
     fn word(self) -> &'static str {
         match self {
             Edit::Remove => "remove",
@@ -81,34 +62,23 @@ impl Edit {
 /// Discord's limit on a select option's label and description.
 const MAX_OPTION: usize = 100;
 
-/// Marks a custom id as a `/play` song button, which names a position in the
-/// guild's outstanding search rather than an action.
+/// Custom id marker for `/play` song buttons.
 const ASK_PREFIX: &str = "ask";
 
-/// How many songs one page of a `/play` search offers.
-///
-/// Discord takes five buttons to a row and nine is two rows, which leaves room
-/// for the next-page and dismiss buttons on a row of their own.
+/// Songs per `/play` page: two rows of buttons, leaving a row for next/dismiss.
 pub const ASK_PAGE: usize = 9;
 
-/// The longest a title may be before it is trimmed.
-///
-/// Discord rejects an over-long embed rather than truncating it, which would
-/// lose the whole dashboard.
+/// Discord embed limits; it rejects an over-long embed outright.
 const MAX_TITLE: usize = 256;
-/// The same limit applies to the description and field values.
 const MAX_DESCRIPTION: usize = 4096;
-/// Longest field name Discord accepts.
 const MAX_FIELD_NAME: usize = 256;
-/// The same limit applies to a field's value.
 const MAX_FIELD_VALUE: usize = 1024;
 /// Builds the custom id for a dashboard button.
 fn button_id(action: &str) -> String {
     format!("{PREFIX}:{action}")
 }
 
-/// Recovers the intent from a pressed button's custom id, or `None` for
-/// anything that is not a dashboard button.
+/// The action a dashboard button's custom id names, if any.
 pub fn action_from_id(custom_id: &str) -> Option<&str> {
     let action = custom_id.strip_prefix(&format!("{PREFIX}:"))?;
     match action {
@@ -128,10 +98,7 @@ pub fn picked(values: &[String]) -> Option<u64> {
     values.first()?.parse().ok()
 }
 
-/// Builds the custom id for an edit button acting on the waiting song `id`.
-///
-/// The song is named by its queue id rather than its position, so a press
-/// still acts on the song that was picked after the queue has moved on.
+/// Names the song by queue id, not position, so it survives the queue moving.
 fn edit_id(edit: Edit, id: u64) -> String {
     format!("{PREFIX}:{EDIT_PREFIX}:{}:{id}", edit.word())
 }
@@ -174,8 +141,7 @@ fn trim(text: &str, max: usize) -> String {
     }
 }
 
-/// The dashboard view: the embed and the buttons, built apart from the
-/// message so the same parts can be used to post it and to edit it.
+/// The embed and buttons, usable for both posting and editing.
 #[derive(Clone)]
 pub struct View {
     embed: CreateEmbed,
@@ -198,23 +164,15 @@ impl View {
     }
 }
 
-/// The colour of a dashboard that is playing.
 const PLAYING: u32 = 0x1d_b9_54;
-/// The colour of a paused dashboard, so the state shows at a glance.
 const PAUSED: u32 = 0x80_84_8e;
-/// The colour of the idle dashboard.
 const IDLE: u32 = 0x2b_2d_31;
 
-/// How much of a title a list line shows. A list is for finding a song, and a
-/// whole title can be read on the song itself.
+/// How much of a title/artist a list line shows.
 const LIST_TITLE: usize = 80;
-/// How much of an artist a list line shows.
 const LIST_ARTIST: usize = 40;
 
-/// A dashboard button with an icon.
-///
-/// The emoji goes in as a string, which carries the variation selector Discord
-/// needs to draw it as an emoji rather than as a plain character.
+/// A dashboard button; the emoji string keeps the variation selector Discord needs.
 fn button(action: &str, label: &str, emoji: &str, style: ButtonStyle) -> CreateButton {
     CreateButton::new(button_id(action))
         .label(label)
@@ -233,13 +191,9 @@ fn clock(secs: f64) -> String {
     }
 }
 
-/// How many segments the progress bar is drawn with, the knob included.
 const BAR_WIDTH: usize = 12;
 
-/// "▬▬▬🔘▬▬▬▬ 1:12 / 3:26": how far into the song it is.
-///
-/// The position is clamped to the song, because songbird's clock can run a
-/// fraction past a length YouTube rounded down.
+/// "▬▬▬🔘▬▬▬▬ 1:12 / 3:26". Clamped: songbird can overrun YouTube's rounded length.
 fn progress_bar(position: f64, duration: f64) -> String {
     let duration = duration.max(0.0);
     let position = position.clamp(0.0, duration);
@@ -268,7 +222,6 @@ fn total_time(secs: f64) -> String {
     }
 }
 
-/// How a song was asked for, as the dashboard says it.
 fn origin_label(origin: Origin) -> &'static str {
     match origin {
         Origin::Voice => "🎤 asked by voice",
@@ -290,17 +243,7 @@ fn song_line(title: &str, artist: &str) -> String {
     }
 }
 
-/// Builds the dashboard for the song playing now.
-///
-/// `paused` picks between a pause and a resume button, because a paused song
-/// needs the opposite action, and greys the dashboard so the state shows at a
-/// glance. `repeat` is stated on the button and in the embed, because a toggle
-/// whose state is only visible by its effect is one nobody trusts. `up_next` is
-/// the queue behind this song, of which the first is named.
-///
-/// `position` is how far into the song playback is, in seconds. With a known
-/// length it is drawn as a progress bar in place of the bare length; without
-/// either, the dashboard says only what it knows.
+/// Builds the dashboard for the song playing now; `position` is in seconds.
 pub fn dashboard(
     song: &Queued,
     position: Option<f64>,
@@ -374,7 +317,6 @@ pub fn dashboard(
                 toggle,
                 button(ACTION_SKIP, "Skip", "⏭️", ButtonStyle::Secondary),
                 button(ACTION_QUEUE, &queue_label, "📜", ButtonStyle::Secondary),
-                // Green when on: the colour of a switch that is set.
                 button(
                     ACTION_REPEAT,
                     if repeat { "Repeat: on" } else { "Repeat" },
@@ -386,7 +328,7 @@ pub fn dashboard(
                     },
                 ),
             ]),
-            // A row of its own, so it is not pressed by a thumb aiming at Repeat.
+            // Own row, away from a thumb aiming at Repeat.
             CreateActionRow::Buttons(
                 song.remembered
                     .is_some()
@@ -399,16 +341,7 @@ pub fn dashboard(
     }
 }
 
-/// The dashboard showing what is waiting, with the controls to change it and
-/// the way back to now-playing.
-///
-/// One line per song, numbered, under a summary of how many and how long: the
-/// queue holds up to twenty songs, and a block per song made it taller than the
-/// screen.
-///
-/// A song is changed by picking it from the menu and then pressing one of the
-/// buttons under it, which act on `selected`. The buttons stay greyed out until
-/// a song is picked, and a move that would go nowhere is greyed out too.
+/// The queue view: one line per song (blocks overflowed the screen), edits act on `selected`.
 pub fn queue_view(waiting: &[Waiting], selected: Option<u64>) -> View {
     // A pick whose song has since started or been removed picks nothing.
     let selected = selected.and_then(|id| {
@@ -486,8 +419,7 @@ pub fn queue_view(waiting: &[Waiting], selected: Option<u64>) -> View {
 
     let last = waiting.len() - 1;
     let edit = |edit: Edit, label: &str, emoji: &str, style: ButtonStyle, useful: bool| {
-        // With nothing picked the id is left off: a greyed-out button still
-        // needs an id, and one that names no song can never act.
+        // A disabled button still needs an id; one with no song can never act.
         let id = match selected {
             Some((_, id)) => edit_id(edit, id),
             None => format!("{PREFIX}:{EDIT_PREFIX}:{}", edit.word()),
@@ -540,8 +472,7 @@ fn either(words: &[String]) -> String {
     }
 }
 
-/// The dashboard shown when there is nothing playing, saying both ways to
-/// start a song.
+/// The dashboard shown when nothing is playing.
 pub fn idle_dashboard<'a>(wake_words: impl IntoIterator<Item = &'a String>) -> View {
     let mut words: Vec<String> = wake_words.into_iter().cloned().collect();
     words.sort();
@@ -564,14 +495,7 @@ pub fn action_id(action: &str) -> String {
     format!("{PREFIX}:{action}")
 }
 
-/// A one-line notice for something that did not work.
-///
-/// Not an embed and not a button row: it is a sentence to read, it has to say
-/// what was heard, and nothing about it is actionable from Discord.
-/// A short message that something worked, such as an album being queued.
-///
-/// `markdown` is shown as written, so a name in it has to go through
-/// [`markdown_escape`] first.
+/// A short success message; escape names in `markdown` with [`markdown_escape`].
 pub fn info(markdown: &str) -> View {
     View {
         embed: CreateEmbed::new()
@@ -581,6 +505,7 @@ pub fn info(markdown: &str) -> View {
     }
 }
 
+/// A one-line notice for something that did not work.
 pub fn notice(text: &str) -> View {
     View {
         embed: CreateEmbed::new()
@@ -590,22 +515,11 @@ pub fn notice(text: &str) -> View {
     }
 }
 
-/// The chooser a `/play` search posts.
-///
-/// A catalog search rather than a video search: the buttons name songs, and the
-/// upload for whichever one is picked is found afterwards. That is the order
-/// that makes a second page worth having -- the catalog has far more songs
-/// under a query than there are uploads worth offering.
-///
-/// `page` is zero-based, `total` is how many songs the search found in all, and
-/// `options` is this page's window onto them. The buttons carry positions within
-/// the whole search, not within the page, so a press still names the same song
-/// however many pages have gone by.
+/// The `/play` chooser; `page` is zero-based, `options` is this page of `total`.
 pub fn ask(requested: &str, options: &[ChoiceOption<'_>], page: usize, total: usize) -> View {
     let has_next = (page + 1) * ASK_PAGE < total;
     let total_pages = total.div_ceil(ASK_PAGE).max(1);
-    // One line per song: nine blocks of two lines each was taller than the
-    // screen, and the numbers are what the buttons below say.
+    // One line per song: two-line blocks overflowed the screen.
     let mut lines = vec![
         format!(
             "Results for “{}”",
@@ -628,17 +542,11 @@ pub fn ask(requested: &str, options: &[ChoiceOption<'_>], page: usize, total: us
         .description(trim(&lines.join("\n"), MAX_DESCRIPTION))
         .color(PLAYING);
 
-    // Five to a row, because that is Discord's limit for one action row. The id
-    // carries the position in the whole search, not in this page, so a press
-    // still names the same song however many pages have gone by.
     let first = page * ASK_PAGE;
     let numbered: Vec<CreateButton> = options
         .iter()
         .enumerate()
-        // The label numbers the page, to match the fields in the embed above;
-        // the id numbers the whole search, so a press still names the same song
-        // after the page moves. Both are needed: Discord rejects a button that
-        // has an id and no label.
+        // Label numbers the page; id numbers the whole search, so it survives paging.
         .map(|(offset, _)| {
             CreateButton::new(ask_id(first + offset)).label((offset + 1).to_string())
         })
@@ -648,8 +556,7 @@ pub fn ask(requested: &str, options: &[ChoiceOption<'_>], page: usize, total: us
         .map(|chunk| CreateActionRow::Buttons(chunk.to_vec()))
         .collect();
 
-    // Disabled rather than absent when the list has run out: a button that
-    // vanishes leaves the message looking broken, and a press on it would fail.
+    // Disabled, not removed: a vanishing button looks broken.
     rows.push(CreateActionRow::Buttons(vec![
         button(ACTION_NEXT, "Next page", "➡️", ButtonStyle::Secondary).disabled(!has_next),
         button(
@@ -670,21 +577,17 @@ pub fn ask(requested: &str, options: &[ChoiceOption<'_>], page: usize, total: us
 #[derive(Clone, Copy)]
 pub struct ChoiceOption<'a> {
     pub title: &'a str,
-    /// Who recorded or uploaded it, shown as the second line.
+    /// Who recorded or uploaded it.
     pub channel: &'a str,
     pub duration_secs: Option<f64>,
     /// YouTube Music plays, or the upload's view count, when known.
     pub plays: Option<u64>,
-    /// "Album", "EP" or "Single" for a whole release, which plays every
-    /// track; `None` for a song.
+    /// "Album", "EP" or "Single"; `None` for a song.
     pub release: Option<&'static str>,
-    /// The release's year, when known.
     pub year: Option<u16>,
 }
 
 impl ChoiceOption<'_> {
-    /// The line shown under the title: what kind of release it is, if it is
-    /// one, who uploaded it, and how long it runs.
     fn detail(&self) -> String {
         let mut detail = String::new();
         if let Some(release) = self.release {
@@ -745,10 +648,7 @@ fn plays_label(plays: u64) -> String {
     format!("{}{suffix} plays", number.trim_end_matches(".0"))
 }
 
-/// Escapes the Discord markdown that would otherwise be read out of a title.
-///
-/// `requested` is speech-to-text output echoed back, so it can contain anything
-/// the person said, and unescaped `*` or `_` would reformat the message.
+/// Escapes Discord markdown in untrusted text such as transcripts.
 pub(crate) fn markdown_escape(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for c in text.chars() {

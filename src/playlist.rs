@@ -1,17 +1,11 @@
-//! Links pasted into `/play`: one video, or a whole playlist or album.
-//!
-//! A spoken request never names a link, but it can name an album, and the
-//! album is then listed from here too: see [`crate::album`].
+//! Links pasted into `/play` (video, playlist or album); also lists spoken albums.
 
 use anyhow::Context as _;
 use std::time::Duration;
 use tokio::process::Command;
 
-/// How long listing a playlist may take. A flat listing reads one page per
-/// hundred entries, so even a long playlist answers in a few seconds.
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The YouTube hosts a link may name.
 fn is_youtube_host(host: &str) -> bool {
     matches!(
         host,
@@ -19,7 +13,6 @@ fn is_youtube_host(host: &str) -> bool {
     )
 }
 
-/// A video id: exactly eleven of `[A-Za-z0-9_-]`.
 fn is_video_id(id: &str) -> bool {
     id.len() == 11
         && id
@@ -27,8 +20,7 @@ fn is_video_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
-/// A playlist or album id. YouTube's are 13 to 72 characters (`PL…`,
-/// `OLAK5uy_…`, `RD…`), always from the same alphabet as a video id.
+/// YouTube's are 13 to 72 chars (`PL…`, `OLAK5uy_…`, `RD…`); bounds are loose on purpose.
 fn is_list_id(id: &str) -> bool {
     (2..=128).contains(&id.len())
         && id
@@ -41,10 +33,7 @@ fn parse(text: &str) -> Option<reqwest::Url> {
     matches!(url.scheme(), "http" | "https").then_some(url)
 }
 
-/// The video a link points at, for a YouTube or YouTube Music link.
-///
-/// Links only: a bare word is never taken for a video id, so `/play dracula`
-/// searches instead of trying to play a video called "dracula".
+/// Video id from a YouTube link; never from a bare word, so `/play dracula` searches.
 pub fn video_id(text: &str) -> Option<String> {
     let url = parse(text)?;
     let host = url.host_str()?;
@@ -66,12 +55,7 @@ pub fn video_id(text: &str) -> Option<String> {
     is_video_id(&id).then_some(id)
 }
 
-/// The playlist a link points at, as the URL to list it from.
-///
-/// A playlist page (`/playlist?list=…`, YouTube Music albums included) or a
-/// YouTube Music album page (`/browse/MPREb…`). A *video* that happens to be
-/// in a playlist (`watch?v=…&list=…`) is not one: that is somebody sharing a
-/// song, and it plays as that song.
+/// Listing URL for a playlist or album link; `watch?v=…&list=…` is a shared song, not a playlist.
 pub fn playlist_url(text: &str) -> Option<String> {
     let url = parse(text)?;
     if !is_youtube_host(url.host_str()?) {
@@ -95,7 +79,6 @@ pub fn playlist_url(text: &str) -> Option<String> {
     }
 }
 
-/// One track of a playlist, as the listing reports it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Track {
     pub video_id: String,
@@ -110,14 +93,11 @@ impl Track {
     }
 }
 
-/// A listed playlist.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Playlist {
     pub title: String,
-    /// The playable tracks, in playlist order.
     pub tracks: Vec<Track>,
-    /// Entries left out because they cannot be played: private, deleted, or
-    /// without an id.
+    /// Private, deleted, or id-less entries left out.
     pub unavailable: usize,
 }
 
@@ -156,8 +136,7 @@ fn parse_listing(json: &serde_json::Value) -> anyhow::Result<Playlist> {
             .get("title")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        // A private or deleted video keeps its slot in the listing, with a
-        // placeholder title and nothing behind it.
+        // Private/deleted videos keep a slot with a placeholder title.
         let gone = matches!(title, "[Private video]" | "[Deleted video]");
         if !is_video_id(id) || gone {
             unavailable += 1;
@@ -187,10 +166,7 @@ fn parse_listing(json: &serde_json::Value) -> anyhow::Result<Playlist> {
     })
 }
 
-/// How many of `listed` tracks fit, given how many songs already wait.
-///
-/// The playlist goes in whole when it fits, and is cut at the end when it
-/// does not, so the album still starts at its first track.
+/// Tracks that fit the queue; cut from the end so an album starts at track one.
 pub fn fitting(listed: usize, waiting: usize, max_queue: usize) -> usize {
     listed.min(max_queue.saturating_sub(waiting))
 }

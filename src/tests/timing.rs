@@ -15,18 +15,14 @@ async fn a_request_reports_every_stage_it_ran_in_one_line() {
     assert!(line.contains("path=voice"), "{line}");
 }
 
-/// A stage that never ran is left out, so "not configured" is
-/// distinguishable from "cost nothing" -- which is how the rewriting
-/// stage, off by default, is told apart from one that returned instantly.
+/// Absent, not zero, so "not configured" differs from "cost nothing".
 #[tokio::test]
 async fn a_stage_that_never_ran_is_absent() {
     let timing = Timing::default();
     assert!(!timing.summary("voice").contains("llm_rewrite"));
 }
 
-/// The route names which way the audio was played, so one line says both how
-/// long it took and what was done to get there. Without it, a fast request
-/// and a slow one with a cached file are indistinguishable.
+/// Without the route, a streamed request and a cached-file one look alike.
 #[tokio::test]
 async fn the_summary_names_the_route_the_audio_was_played_by() {
     let timing = Timing::default();
@@ -42,8 +38,6 @@ async fn the_summary_names_the_route_the_audio_was_played_by() {
     assert!(timing.summary("voice").contains("path=voice/file"));
 }
 
-/// Two clones share one request's stages, which is the whole reason the
-/// handle is a clone and not a moved value.
 #[tokio::test]
 async fn a_clone_records_into_the_same_request() {
     let timing = Timing::default();

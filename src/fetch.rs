@@ -1,32 +1,9 @@
 //! Downloads a YouTube video's audio, or hands back the URL to play it from.
 //!
-//! Songbird's own [`YoutubeDl`](songbird::input::YoutubeDl) cannot be used
-//! here. It hardcodes `-f "ba[abr>0][vcodec=none]/best"`, which on YouTube
-//! resolves to format 251, WebM carrying Opus. Symphonia 0.5 ships no Opus
-//! decoder at all, so the probe finds the container and then the codec refuses
-//! the track, leaving the call silent. Its arguments also cannot be overridden,
-//! because anything passed as user arguments is placed before that selector and
-//! yt-dlp keeps the last one.
-//!
-//! So the stream is fetched here instead, preferring the AAC in an MP4
-//! container that YouTube also publishes and that the `isomp4` and `aac`
-//! handlers can decode. Only when a video offers nothing else is the best
-//! stream downloaded and transcoded to WAV.
-//!
-//! The audio is *not* downloaded before it plays. One yt-dlp extraction says
-//! which formats the video publishes and hands back their signed URLs, and the
-//! one that can be decoded is played straight off YouTube while the rest of it
-//! is written to the cache in the background. That is what moves the first
-//! sample from "after the whole file" to "after the first few kilobytes". The
-//! download path stays for the cases streaming cannot cover: a URL that has
-//! expired, a connection that never delivers, a video with nothing but Opus.
-//!
-//! Every song gets its own file, named after its video id. A single shared
-//! path cannot work: two commands handled at once, or a queue of more than one
-//! song, would have one download overwrite the audio another track is reading,
-//! and the song that was meant to play would be heard as the one before it.
-//! Because the name is derived from the video, a file already at that path is
-//! that song's audio, so it can be reused instead of downloaded again.
+//! Songbird's `YoutubeDl` forces Opus, which Symphonia 0.5 cannot decode, so we
+//! pick AAC/MP4 ourselves and stream it while caching in the background; download
+//! and transcode is the fallback. One file per video id, so tracks never overwrite
+//! each other and a cached file can be reused.
 
 use crate::queue::Source;
 use crate::timing::Timing;
@@ -38,12 +15,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
-/// Audio formats to try, best first.
-///
-/// `acodec^=mp4a` is the AAC audio YouTube serves inside an MP4 container, and
-/// `ext=m4a` catches the same thing on videos that label it differently. The
-/// last entry takes any audio-only stream that is not Opus, which covers formats
-/// added after this was written.
+/// Audio formats to try, best first: AAC in MP4, any m4a, then any non-Opus audio.
 pub const DECODABLE_FORMAT: &str = "bestaudio[acodec^=mp4a][vcodec=none]/\
      bestaudio[ext=m4a]/\
      bestaudio[acodec!=opus][vcodec=none]";
@@ -51,25 +23,10 @@ pub const DECODABLE_FORMAT: &str = "bestaudio[acodec^=mp4a][vcodec=none]/\
 /// The selector for the fallback download, which is then transcoded.
 const BEST_FORMAT: &str = "bestaudio";
 
-/// How many downloaded files to keep per guild, beyond the ones still in use.
-///
-/// Each song is kept while it is playing or queued, and the newest few survive
-/// afterwards so a repeated request does not download the same audio twice.
-/// Old ones are pruned, because the songs the listener asks for are never the
-/// same twice.
-///
-/// This is deliberately a *retention* rule, not a cache bound: it used to keep
-/// the newest eight files outright, which is fewer than [`crate::queue::MAX_QUEUE`],
-/// so with nine songs queued a ninth download deleted the audio of songs that
-/// were about to play.
+/// Downloaded files kept per guild beyond those in use; a retention rule, not a cache bound.
 const KEEP_FILES: usize = 8;
 
-/// Directory holding one guild's downloaded audio.
-///
-/// Under the user's cache directory (`$XDG_CACHE_HOME`, else `~/.cache`) rather
-/// than `/tmp`, which many systems clear on every boot, so a song asked for
-/// again after a restart is still instant. Falls back to the temp directory
-/// when there is no home to put it in.
+/// Directory holding one guild's downloaded audio; under the cache dir so it survives reboots.
 pub fn cache_dir(guild_id: u64) -> PathBuf {
     cache_root().join(format!("shamash-{guild_id}"))
 }
@@ -85,28 +42,15 @@ fn cache_root() -> PathBuf {
     std::env::temp_dir()
 }
 
-/// Tries to delete a file, logging rather than failing when it cannot.
-///
-/// None of these deletions decide whether playback succeeds, so an error is
-/// only worth a warning. It is logged rather than ignored because a cache that
-/// cannot prune itself grows without bound, and a temporary file that cannot
-/// be cleaned up accumulates in the working directory.
+/// Tries to delete a file, warning on failure so unbounded cache growth is visible.
 async fn remove_file(path: &Path, what: &str) {
     if let Err(e) = tokio::fs::remove_file(path).await {
         tracing::warn!("could not remove {what} {}: {e}", path.display());
     }
 }
 
-/// Downloads decodable audio for `video_id` into `dir` and returns where to
-/// play it from.
-///
-/// `video_id` names the file, so a song already downloaded is reused. Otherwise
-/// one yt-dlp extraction says what this video publishes: a format symphonia can
-/// decode comes back as [`Source::Stream`] and plays while it arrives, and a
-/// video with nothing decodable is downloaded and transcoded as before.
-///
-/// `in_use` names the songs that are playing or queued. Their audio is never
-/// deleted, whatever the retention rule says.
+/// Returns where to play `video_id` from: cached file, [`Source::Stream`], or a fresh download.
+/// Songs in `in_use` are never pruned.
 pub async fn fetch(
     video_id: &str,
     url: &str,
@@ -126,9 +70,7 @@ pub async fn fetch(
 
     let stream = match extract(url, timing).await {
         Ok(json) => pick_streamable(&json),
-        // No extraction is not a failure worth reporting: it only means this
-        // song takes the download path, which is the behaviour that predates
-        // streaming and works for every format.
+        // No extraction just means the download path.
         Err(e) => {
             tracing::debug!("could not extract {url}, so it will be downloaded: {e:#}");
             None
@@ -149,27 +91,18 @@ pub async fn fetch(
 
 /// What one extraction found for a video.
 pub struct Streamable {
-    /// The signed format URL, valid for hours rather than forever.
+    /// The signed format URL; expires after hours.
     pub url: String,
     /// The headers that URL must be requested with.
     pub headers: HeaderMap,
     /// The container, which is the cache file's extension.
     pub ext: String,
-    /// How many bytes the format is, in bytes.
-    ///
-    /// Not a nicety: YouTube refuses the URL outright unless the request
-    /// carries a *closed* `range`, `bytes=0-<length-1>`. An open-ended
-    /// `bytes=0-` and a plain GET both answer 403, and the length is the only
-    /// way to close it. Songbird takes the same number for the same reason.
+    /// Size in bytes; YouTube 403s anything but a closed `range`, which needs it.
     pub length: u64,
 }
 
 impl Streamable {
     /// The stream a queued song carries, if it is playing from one.
-    ///
-    /// The container and the length live in different fields of the queued
-    /// source -- one names the cache file, the other closes the range -- so this
-    /// is the one place that puts them back together.
     pub fn of(source: &Source) -> Option<Self> {
         let Source::Stream {
             url,
@@ -193,18 +126,11 @@ impl Streamable {
     }
 }
 
-/// The browser User-Agent YouTube's own player sends.
-///
-/// A media URL is signed against the client that asked for it, so a direct GET
-/// that announces yt-dlp is the request that gets a 403.
+/// The browser User-Agent YouTube's player sends; announcing yt-dlp gets a 403.
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                           (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// One yt-dlp extraction, and the JSON it printed.
-///
-/// A single run for the whole decision: this used to be a download that
-/// resolved the format and moved the bytes in one subprocess, which cannot be
-/// reused because the URL only exists inside it.
 async fn extract(url: &str, timing: &Timing) -> anyhow::Result<serde_json::Value> {
     let mut command = Command::new("yt-dlp");
     command
@@ -236,17 +162,11 @@ async fn extract(url: &str, timing: &Timing) -> anyhow::Result<serde_json::Value
     serde_json::from_slice(&output.stdout).context("yt-dlp printed no usable json")
 }
 
-/// The best audio format symphonia can decode, with the headers it needs.
-///
-/// The preference order is [`DECODABLE_FORMAT`]'s, so the format played is the
-/// one that would have been downloaded: AAC in MP4 first, then any m4a, then
-/// any audio-only format that is not Opus. Ties go to the larger bitrate, which
-/// is what `bestaudio` does.
+/// The best decodable format, in [`DECODABLE_FORMAT`]'s order; ties go to bitrate.
 fn pick_streamable(json: &serde_json::Value) -> Option<Streamable> {
     use serde_json::Value;
 
-    /// 0 for the preferred codecs, 1 for anything else decodable, `None` for
-    /// what symphonia cannot read.
+    /// 0 preferred, 1 other decodable, `None` undecodable.
     fn rank(format: &Value) -> Option<u8> {
         let acodec = format.get("acodec")?.as_str().unwrap_or("none");
         let ext = format.get("ext")?.as_str().unwrap_or_default();
@@ -285,11 +205,7 @@ fn pick_streamable(json: &serde_json::Value) -> Option<Streamable> {
         .map(|(_, _, picked)| picked)
 }
 
-/// How long a format is, which the request cannot be made without.
-///
-/// `filesize_approx` is the one to fall back on: some extractors report an
-/// estimate for an audio stream whose exact size was never declared, and a
-/// range that overshoots the end is still a range YouTube honours.
+/// A format's byte length; `filesize_approx` is fine since YouTube honours an overshooting range.
 fn length_of(format: &serde_json::Value) -> Option<u64> {
     format
         .get("filesize")
@@ -298,11 +214,7 @@ fn length_of(format: &serde_json::Value) -> Option<u64> {
         .filter(|length| *length > 0)
 }
 
-/// The headers a format URL was signed with, ready to replay.
-///
-/// Anything that is not a valid header is dropped rather than failing the whole
-/// extraction: a format whose headers cannot be sent is not a format worth
-/// streaming.
+/// The headers a format URL was signed with; invalid ones are dropped.
 fn header_map(headers: &serde_json::Value) -> HeaderMap {
     headers
         .as_object()
@@ -317,32 +229,15 @@ fn header_map(headers: &serde_json::Value) -> HeaderMap {
         .collect()
 }
 
-/// How long a stream has to prove itself before the file is used instead.
-///
-/// Bounded because the alternative is silence: a song that starts and then
-/// stops is worse than one that starts a moment late. Two and a half seconds is
-/// far longer than a healthy connection needs for the first packet, so a
-/// genuine stall is what gets caught rather than a slow moment.
+/// How long a stream has to deliver before the file is used instead.
 pub const STREAM_BUDGET: Duration = Duration::from_millis(2500);
 
-/// The `range` a stream's URL has to be asked for.
-///
-/// A *closed* range, and the whole file: YouTube serves this URL for that and
-/// nothing else, so a check that asked for less would pass a URL that playback
-/// then gets a 403 for. It costs one discarded response body and saves a song
-/// that starts and then dies.
+/// The closed whole-file `range` YouTube requires; probing with less would miss 403s.
 fn whole_stream(length: u64) -> String {
     format!("bytes=0-{}", length.saturating_sub(1))
 }
 
-/// Decides how a queued song actually plays: the stream if its URL still
-/// resolves, the downloaded file if it does not.
-///
-/// The URL is signed and expires, so a song queued twenty minutes ago can be
-/// refused with a 403, and a connection that never delivers is a stall rather
-/// than an error. Both have to be caught before playback starts, which is what
-/// the request below is for: it asks for the same range playback will ask for,
-/// refuses a non-success status, and gives up at [`STREAM_BUDGET`].
+/// Plays the stream if its URL still serves (it may have expired or stall), else the file.
 pub async fn resolve(
     source: &Source,
     watch_url: &str,
@@ -369,8 +264,7 @@ pub async fn stream_usable(stream: &Streamable, timing: &Timing) -> bool {
     usable_within(stream, STREAM_BUDGET, timing).await
 }
 
-/// [`stream_usable`] with the deadline written out, so the stall test can use a
-/// short one instead of waiting the real budget out.
+/// [`stream_usable`] with an explicit deadline, for tests.
 async fn usable_within(stream: &Streamable, budget: Duration, timing: &Timing) -> bool {
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(budget, async {
@@ -387,8 +281,7 @@ async fn usable_within(stream: &Streamable, budget: Duration, timing: &Timing) -
             stream.url,
             response.status()
         );
-        // Reading one chunk is what separates "answered" from "delivering": a
-        // connection can be established and then say nothing at all.
+        // A connection can answer and then send nothing; require a chunk.
         response
             .chunk()
             .await
@@ -416,13 +309,7 @@ async fn usable_within(stream: &Streamable, budget: Duration, timing: &Timing) -
     }
 }
 
-/// Puts a song's audio in the cache file, ready to be played or reused.
-///
-/// Runs twice: in the background while a stream plays, and again when a stream
-/// turns out to be unusable. The direct URL is tried first because it is one
-/// GET of bytes yt-dlp would otherwise download for us; yt-dlp is the fallback,
-/// so a URL that has expired between queueing and playing still resolves into a
-/// file.
+/// Puts a song's audio in the cache file: direct URL first, yt-dlp if it has expired.
 pub async fn save(
     stream: &Streamable,
     cache: &Path,
@@ -433,8 +320,7 @@ pub async fn save(
     if let Some(there) = existing_at(cache).await {
         return Ok(there);
     }
-    // Written beside the target and renamed into place, so a reader never sees
-    // a half-written file and `existing` never mistakes one for audio.
+    // Write then rename, so nobody sees a half-written file.
     let part = cache.with_extension("part");
     match fetch_to_file(stream, &part).await {
         Ok(()) => {
@@ -447,8 +333,7 @@ pub async fn save(
         Err(e) => {
             tracing::debug!("could not save the stream for {watch_url}: {e:#}");
             let _ = tokio::fs::remove_file(&part).await;
-            // The cache path is `{dir}/{stem}.{ext}`, so the two yt-dlp wants to
-            // write to are recoverable from it.
+            // The cache path is `{dir}/{stem}.{ext}`.
             let dir = cache.parent().context("the cache path has no directory")?;
             let stem = cache
                 .file_stem()
@@ -459,18 +344,13 @@ pub async fn save(
     }
 }
 
-/// Writes the stream's audio to `dest`.
-///
-/// A whole-file read rather than a streamed copy: these are a few megabytes and
-/// the buffered body is one allocation instead of a read loop that has to be
-/// correct about partial writes.
+/// Writes the stream's audio to `dest`; whole-body read, since files are a few MB.
 async fn fetch_to_file(stream: &Streamable, dest: &Path) -> anyhow::Result<()> {
     let response = client()
         .get(&stream.url)
         .headers(stream.headers.clone())
         .header(RANGE, whole_stream(stream.length))
-        // Covers the body too: a stalled transfer must fall back to yt-dlp, not
-        // hold up the request (or the background cache task) forever.
+        // Covers the body too, so a stalled transfer falls back to yt-dlp.
         .timeout(DOWNLOAD_TIMEOUT)
         .send()
         .await
@@ -492,10 +372,6 @@ async fn fetch_to_file(stream: &Streamable, dest: &Path) -> anyhow::Result<()> {
 }
 
 /// The http client every direct request goes through.
-///
-/// `rustls-tls` is already on: the project depends on reqwest with it, so the
-/// media URLs get the same TLS stack as the rest of the bot rather than pulling
-/// in a second one.
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -509,11 +385,7 @@ async fn existing_at(path: &Path) -> Option<PathBuf> {
     (metadata.len() > 0).then(|| path.to_path_buf())
 }
 
-/// Downloads decodable audio through yt-dlp, transcoding if it must, and
-/// prunes the cache.
-///
-/// The path streaming cannot cover, and the fallback inside [`save`]: a video
-/// with no decodable format, or a URL that has stopped working.
+/// Downloads via yt-dlp (transcoding if needed) and prunes; the fallback when streaming can't work.
 pub async fn download_to_cache(
     url: &str,
     dir: &Path,
@@ -524,10 +396,7 @@ pub async fn download_to_cache(
     let path = match download(url, dir, stem, DECODABLE_FORMAT, timing, "ytdlp").await {
         Ok(path) => path,
         Err(no_decodable) => {
-            // Recorded as its own stage because it is the expensive failure
-            // mode: a video with no AAC stream costs two extra yt-dlp runs and
-            // an ffmpeg pass, and the rate of it is the only thing that says
-            // whether DECODABLE_FORMAT is still the right selector.
+            // Its own stage: the expensive path, and its rate tells whether DECODABLE_FORMAT still fits.
             tracing::debug!("no decodable stream for {url}: {no_decodable:#}");
             let source = download(url, dir, stem, BEST_FORMAT, timing, "ytdlp_fallback")
                 .await
@@ -545,10 +414,7 @@ pub async fn download_to_cache(
     Ok(path)
 }
 
-/// A file name safe to build from a video id.
-///
-/// Video ids are URL-safe already, but the id reaches this from a search
-/// result, so anything unexpected is replaced rather than trusted as a path.
+/// A file name safe to build from a video id, which comes from untrusted search results.
 fn file_stem(video_id: &str) -> String {
     let cleaned: String = video_id
         .chars()
@@ -568,10 +434,7 @@ fn file_stem(video_id: &str) -> String {
     }
 }
 
-/// The audio already downloaded for this song, if there is any.
-///
-/// A `.part` file is ignored: it is a download that never finished, so it is
-/// not audio that can be played.
+/// The audio already downloaded for this song, ignoring unfinished `.part` files.
 async fn existing(stem: &str, dir: &Path) -> Option<PathBuf> {
     let mut entries = tokio::fs::read_dir(dir).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
@@ -594,15 +457,8 @@ async fn existing(stem: &str, dir: &Path) -> Option<PathBuf> {
 
 /// The yt-dlp arguments used for every download.
 ///
-/// `--force-overwrites` matters when a previous download of this song left a
-/// file behind that was too small to be usable. yt-dlp's default is
-/// `--no-force-overwrites`, and that skips a download whose output already
-/// exists, printing the path and exiting 0, so the caller could not tell a
-/// fresh download from a skipped one.
-///
-/// `--no-part` is deliberately absent. With the default `.part` file the new
-/// audio is renamed into place, so a track reading a file of the same name
-/// keeps the old inode and never sees a half-written file.
+/// `--force-overwrites` so a stale file is not silently "skipped"; no `--no-part`,
+/// so a playing track keeps its old inode.
 fn download_args(url: &str, dir: &Path, stem: &str, format: &str) -> Vec<OsString> {
     let output = dir.join(format!("{stem}.%(ext)s"));
     [
@@ -618,10 +474,7 @@ fn download_args(url: &str, dir: &Path, stem: &str, format: &str) -> Vec<OsStrin
         OsString::from(format),
         OsString::from("--output"),
         output.into_os_string(),
-        // The marker comes first in the argument list but last in the output:
-        // yt-dlp resolves the format and only then starts transferring bytes,
-        // so this line separates the metadata cost from the transfer cost of
-        // one subprocess. Without it the two are indistinguishable from inside.
+        // Printed between format resolution and transfer, to time them separately.
         OsString::from("--print"),
         OsString::from(format!("before_dl:{BEFORE_DOWNLOAD_MARKER}")),
         OsString::from("--print"),
@@ -631,40 +484,19 @@ fn download_args(url: &str, dir: &Path, stem: &str, format: &str) -> Vec<OsStrin
     .collect()
 }
 
-/// What yt-dlp prints on stdout once the format is resolved and bytes are about
-/// to flow. A literal, so it cannot be confused with the file path the other
-/// `--print` emits.
+/// What yt-dlp prints once the format is resolved and bytes are about to flow.
 const BEFORE_DOWNLOAD_MARKER: &str = "shamash-formats-resolved";
 
-/// How long one yt-dlp download may take before it is treated as failed.
-///
-/// A few minutes for a slow connection on a long track, and bounded regardless:
-/// the download runs while a request is in flight, and an unbounded yt-dlp would
-/// leave the request unresolved rather than reporting a failure the listener
-/// could hear about.
+/// How long one yt-dlp download may take; bounded so a request always resolves.
 pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// How long one yt-dlp extraction may take.
-///
-/// Shorter than a download because it moves no bytes, and a speaker waiting for
-/// a song is waiting on it: this is the whole cost before playback starts on
-/// the streaming path.
+/// How long one yt-dlp extraction may take; short because it moves no bytes.
 pub const EXTRACT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How long one ffmpeg transcode may take.
-///
-/// Shorter than the download because it is only a CPU-bound local rewrite of a
-/// file that has already arrived, so ninety seconds of that means something is
-/// wrong rather than slow.
+/// How long one ffmpeg transcode may take (local and CPU-bound).
 pub const TRANSCODE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Runs `command` to completion under a deadline, killing it if it overruns.
-///
-/// Every subprocess this crate spawns goes through here. Two properties matter
-/// and neither comes from the timeout alone: `kill_on_drop` so a cancelled or
-/// timed-out call does not leave the child running with the guild's ordering
-/// still held, and a named command in the error so a stalled yt-dlp can be told
-/// from a stalled ffmpeg in the log.
+/// Runs `command` under a deadline, killing it on overrun or cancellation.
 async fn run(
     mut command: Command,
     what: &str,
@@ -677,9 +509,6 @@ async fn run(
 }
 
 /// Downloads one format into `dir` and returns the path yt-dlp wrote.
-///
-/// `stage` prefixes the recorded timings, so the fallback download is
-/// distinguishable from the first attempt in the request's summary line.
 async fn download(
     url: &str,
     dir: &Path,
@@ -701,8 +530,7 @@ async fn download(
         .with_context(|| format!("could not run yt-dlp to fetch {url}"))?;
 
     let stderr = child.stderr.take().context("yt-dlp stderr was not piped")?;
-    // Collected on its own task so a chatty stderr cannot fill its pipe and
-    // wedge yt-dlp, and so the failure message still has something to say.
+    // Drained on its own task so a full pipe cannot wedge yt-dlp.
     let complaints = tokio::spawn(async move {
         let mut buf = Vec::new();
         let _ = BufReader::new(stderr).read_to_end(&mut buf).await;
@@ -754,8 +582,7 @@ async fn download(
         String::from_utf8_lossy(&complaints.await.unwrap_or_default()).trim()
     );
 
-    // `--print` emits the final path, one per line; later lines win so a
-    // resumed or retried download reports the file that is actually in place.
+    // Last printed path wins (retries print again).
     let path = downloaded
         .pop()
         .context("yt-dlp reported no downloaded file")?;
@@ -772,10 +599,7 @@ async fn download(
     Ok(path)
 }
 
-/// Rewrites `source` as 16-bit PCM WAV at `dest`.
-///
-/// Songbird resamples to its own 48 kHz stereo output, so the sample rate and
-/// channel count are left as they are and only the codec is replaced.
+/// Rewrites `source` as 16-bit PCM WAV at `dest`; songbird resamples it later.
 async fn transcode(source: &Path, dest: &Path) -> anyhow::Result<()> {
     let mut command = Command::new("ffmpeg");
     command
@@ -809,13 +633,7 @@ async fn transcode(source: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Deletes downloads that are neither in use nor among the newest
-/// [`KEEP_FILES`].
-///
-/// `in_use` is the audio of every song playing or waiting in the queue. Those
-/// are never deleted, whatever their age: keeping "the newest eight files"
-/// outright is fewer than a full queue, so with nine songs queued a ninth
-/// download used to delete the audio of a song about to play.
+/// Deletes downloads that are neither in `in_use` nor among the newest [`KEEP_FILES`].
 async fn prune(dir: &Path, in_use: &[PathBuf]) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return;

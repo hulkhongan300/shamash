@@ -10,15 +10,13 @@ fn directives() -> Vec<String> {
         .collect()
 }
 
-/// A typo in `DEFAULT_LOG` panics at startup, because the fallback goes
-/// through `From<&str>`, which cannot fail. Parse it here instead.
+/// A typo in `DEFAULT_LOG` would panic at startup via `From<&str>`.
 #[test]
 fn the_default_log_filter_parses() {
     let _: EnvFilter = DEFAULT_LOG.into();
     assert!(!directives().is_empty());
 }
 
-/// What was heard, and which models loaded.
 #[test]
 fn the_default_log_filter_keeps_the_pipeline_and_the_model_lines() {
     let d = directives();
@@ -35,9 +33,6 @@ fn the_default_log_filter_keeps_the_pipeline_and_the_model_lines() {
     }
 }
 
-/// A dependency's chatter must not get through at info: it is a line per
-/// connection and per packet. Warnings still do, so a failure is never
-/// silent -- which is what the bare `warn` floor is for.
 #[test]
 fn the_default_log_filter_silences_dependency_chatter_but_keeps_warnings() {
     let d = directives();
@@ -53,8 +48,7 @@ fn the_default_log_filter_silences_dependency_chatter_but_keeps_warnings() {
     }
 }
 
-/// What the bot would actually print for `message` at warn, from the target
-/// songbird uses.
+/// What the bot prints for `message` warned from songbird's target.
 fn printed_for(message: &str) -> String {
     use std::sync::{Arc, Mutex};
     let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -71,8 +65,7 @@ fn printed_for(message: &str) -> String {
             tracing::warn!(target: "songbird::driver::tasks::udp_rx", "{message}");
         },
     );
-    // Not `try_unwrap`: tracing may still hold a clone of the buffer when
-    // this runs, and that made the read come back empty at random.
+    // Not `try_unwrap`: tracing may still hold a clone, which flaked empty.
     let out = buffer.lock().unwrap().clone();
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -89,16 +82,13 @@ impl std::io::Write for MutexWriter {
     }
 }
 
-/// The RTCP warning is noise: Discord sends RTCP for streams the bot has no
-/// key for, so it fires continuously on a working connection.
 #[test]
 fn the_rtcp_decryption_warning_is_not_printed() {
     let printed = printed_for("RTCP decryption failed: Crypto(Error)");
     assert!(printed.is_empty(), "still reaching stdout: {printed}");
 }
 
-/// The same module logs failures that mean the bot has stopped hearing.
-/// Those must stay loud, or a silent bot looks healthy.
+/// Same module, but these mean the bot stopped hearing.
 #[test]
 fn the_driver_warnings_that_matter_are_still_printed() {
     for message in [
@@ -115,8 +105,6 @@ fn the_driver_warnings_that_matter_are_still_printed() {
     }
 }
 
-/// A warning of ours that happens to begin the same way is not songbird's,
-/// and must not be dropped.
 #[test]
 fn our_own_warnings_are_still_printed() {
     use std::sync::{Arc, Mutex};

@@ -38,14 +38,7 @@ fn best_title(candidates: &[Candidate], target: &Target) -> String {
         .to_string()
 }
 
-/// The catalog's names are what the YouTube query is built from. Getting
-/// them right is the whole reason the catalog is called at all: a
-/// misheard "hoolig" would otherwise be searched as those letters and come
-/// back as whatever matched them.
-/// A flat yt-dlp listing carries both `url` and `webpage_url`. Reading
-/// either one as an alias for the other makes serde see a duplicate field
-/// and fail every result, which showed up as "failed to parse yt-dlp JSON
-/// output" on every search.
+/// Flat listings carry both `url` and `webpage_url`; aliasing one to the other fails every parse.
 #[test]
 fn a_flat_result_with_both_url_spellings_still_parses() {
     let line = r#"{
@@ -73,12 +66,7 @@ fn the_query_uses_the_catalog_names() {
     assert_eq!(target.search_query(), "BTS Hooligan");
 }
 
-/// The bug the whole module exists for, as a live search saw it.
-///
-/// Every result names the requested song and is roughly its length. The
-/// 75-million-view video is a different cut, and ranking by views -- what
-/// the old selector did -- picks it. Only the running time separates them,
-/// and only the penalty separates the two 206-second uploads.
+/// The 75 M-view result is a different cut; only running time picks the right recording.
 #[test]
 fn a_remix_with_twenty_times_the_views_still_loses_to_the_right_recording() {
     let entries = [
@@ -105,8 +93,7 @@ fn a_remix_with_twenty_times_the_views_still_loses_to_the_right_recording() {
     );
 }
 
-/// The tolerance is four seconds either way, so a video that padded the
-/// start is not treated as a different recording.
+/// A few seconds of padding is still the same recording.
 #[test]
 fn a_length_within_tolerance_counts_as_a_match() {
     let target = catalogued("dracula");
@@ -135,8 +122,7 @@ fn a_length_outside_tolerance_is_penalised_proportionally() {
     );
 }
 
-/// A ten-minute mix is not a wrong answer, it is a different product, and
-/// the penalty has to be capped so it cannot swamp the arithmetic.
+/// Capped so a ten-minute mix cannot swamp the arithmetic.
 #[test]
 fn the_length_penalty_is_capped() {
     let target = catalogued("dracula");
@@ -144,8 +130,7 @@ fn the_length_penalty_is_capped() {
     assert_eq!(parts.duration, -DURATION_PENALTY_MAX);
 }
 
-/// A duration-less upload cannot be scored on length and must not be
-/// assumed wrong for it.
+/// No duration means no length score, not a penalty.
 #[test]
 fn an_unknown_length_is_neither_rewarded_nor_punished() {
     let target = catalogued("dracula");
@@ -162,8 +147,7 @@ fn a_topic_channel_is_the_strongest_provenance_signal() {
         &on_channel(candidate("Dracula", None, None), "Tame Impala - Topic"),
         &target,
     );
-    // A topic channel is YouTube's channel for the artist, so it earns
-    // both provenance bonuses; it is the best evidence available.
+    // A topic channel also names the artist, so it earns both bonuses.
     assert_eq!(parts.channel, CHANNEL_TOPIC + CHANNEL_ARTIST);
     assert!(parts.channel > CHANNEL_ARTIST);
 }
@@ -185,13 +169,11 @@ fn a_vevo_channel_is_rewarded() {
         &on_channel(candidate("Dracula", None, None), "TameImpalaVEVO"),
         &target,
     );
-    // A VEVO channel is the artist's channel under a label handle, so it
-    // earns both provenance bonuses.
+    // A VEVO handle also names the artist, so it earns both bonuses.
     assert_eq!(parts.channel, CHANNEL_VEVO + CHANNEL_ARTIST);
 }
 
-/// An unrelated channel earns nothing, which is the point: the boost is for
-/// provenance, not for having a channel at all.
+/// The boost is for provenance, not for having a channel.
 #[test]
 fn an_unrelated_channel_earns_nothing() {
     let target = catalogued("dracula");
@@ -202,8 +184,7 @@ fn an_unrelated_channel_earns_nothing() {
     assert_eq!(parts.channel, 0.0);
 }
 
-/// Every version the spec lists, checked against the title that would carry
-/// it.
+/// Every version the spec lists, against a title carrying it.
 #[test]
 fn every_version_marker_is_penalised() {
     let target = catalogued("dracula");
@@ -232,9 +213,7 @@ fn every_version_marker_is_penalised() {
     }
 }
 
-/// The listener is the reason for the conditional. Asking for the live
-/// version and being given the studio cut is a worse failure than either
-/// one alone.
+/// Asking for the live version and getting the studio cut is the worse failure.
 #[test]
 fn a_marker_the_request_asked_for_is_not_penalised() {
     let target = catalogued("dracula live");
@@ -247,8 +226,7 @@ fn a_marker_the_request_asked_for_is_not_penalised() {
     }
 }
 
-/// "remix" contains "mix", so a naive substring test would bill the same
-/// title twice for one fault.
+/// "remix" contains "mix", but one fault is billed once.
 #[test]
 fn mix_does_not_also_fire_on_remix() {
     let target = catalogued("dracula");
@@ -256,8 +234,7 @@ fn mix_does_not_also_fire_on_remix() {
     assert_eq!(parts.penalties, vec!["remix"]);
 }
 
-/// "live" is a whole word, so a title that merely contains the letters is
-/// not mistaken for a live recording.
+/// "live" matches whole words only.
 #[test]
 fn markers_only_match_whole_words() {
     let target = catalogued("delivery");
@@ -279,8 +256,7 @@ fn a_repeated_marker_is_charged_once() {
     assert_eq!(parts.penalties, vec!["lyric"]);
 }
 
-/// Views are a tie-breaker, not a ranking. 75 million views must not be
-/// worth more than being the right length.
+/// Views break ties; 75 M must not beat the right length.
 #[test]
 fn views_cannot_outvote_a_length_mismatch() {
     let target = catalogued("dracula");
@@ -309,8 +285,7 @@ fn a_zero_view_count_does_not_produce_a_negative_infinity() {
     assert_eq!(parts.views, 0.0);
 }
 
-/// The threshold is the whole point of the chooser: a real match plays, a
-/// near miss asks.
+/// A real match plays, a near miss asks.
 #[test]
 fn a_confident_match_is_not_offered_as_a_choice() {
     let entries = [on_channel(
@@ -346,18 +321,7 @@ fn a_low_score_offers_a_choice_instead_of_guessing() {
     );
 }
 
-/// A request the catalog could not resolve has no length to score on, so
-/// holding it to the full threshold would ask about every song forever.
-///
-/// What it may no longer assert is that a good hit plays. This case encoded
-/// the shared-token floor that 1.2 removed: relevance used to be
-/// `similarity("hooligan", "bts 방탄소년단 hooligan") * 25`, and a pair
-/// sharing any one whole word was floored at 0.72 — so an upload whose
-/// title carries the artist name *in front of* the song scored as well as
-/// an exact title. That is the mechanism behind "hello by adele" answering
-/// with *Hello Brother*, and it is exactly what item 1.3 now covers from the
-/// other side: an unresolved request is offered as a choice, never played
-/// on its own.
+/// No length to score on, so a lower bar; relevance alone is untrustworthy, so never autoplayed.
 #[test]
 fn an_unresolved_request_is_judged_on_a_lower_bar_but_never_autoplayed() {
     let target = Target {
@@ -384,8 +348,6 @@ fn an_unresolved_request_is_judged_on_a_lower_bar_but_never_autoplayed() {
     assert!(target.effective_threshold(DEFAULT_MATCH_THRESHOLD) < DEFAULT_MATCH_THRESHOLD);
 }
 
-/// The list is already ordered best first, so the best result is index zero
-/// and the alternatives follow it.
 #[test]
 fn the_ranking_is_ordered_best_first() {
     let entries = [
@@ -405,8 +367,7 @@ fn the_ranking_is_ordered_best_first() {
     );
 }
 
-/// A remix of something nobody asked for is not a near miss, it is a
-/// different song, so it is dropped before it is scored.
+/// An unrequested remix is a different song, dropped before scoring.
 #[test]
 fn an_unrequested_remix_is_dropped_rather_than_ranked() {
     let entries = [
@@ -418,8 +379,7 @@ fn an_unrequested_remix_is_dropped_rather_than_ranked() {
     assert_eq!(choice.ranked[0].candidate.title(), "Dracula");
 }
 
-/// The query is the corrected one. Searching the transcript is what
-/// produced the wrong song in the first place.
+/// Searching the raw transcript is what found the wrong song.
 #[test]
 fn the_query_uses_the_canonical_names() {
     let target = catalogued("hoolig bts");
@@ -438,8 +398,7 @@ fn an_unresolved_request_searches_what_was_heard() {
     assert_eq!(target.search_query(), "the name of that one song");
 }
 
-/// Search results are not curated: a ten-second clip and a six-hour upload
-/// are not songs, whatever they score.
+/// Clips and six-hour uploads are not songs, whatever they score.
 #[test]
 fn clips_and_long_mixes_are_excluded() {
     let entries = [
@@ -453,8 +412,7 @@ fn clips_and_long_mixes_are_excluded() {
     );
 }
 
-/// The pre-catalog ranking still had to cope with junk arriving from the
-/// search, so it degrades to popularity when nothing is relevant.
+/// With nothing relevant, ranking degrades to popularity.
 #[test]
 fn an_unresolvable_request_falls_back_to_popularity() {
     let entries = [
@@ -492,27 +450,14 @@ fn media_rank_orders_audio_above_video() {
     assert_eq!(rank("Song (Dance Practice)"), 0);
 }
 
-/// A video marker wins over an audio marker in the same title, so
-/// "Official Audio [Official MV]" is still treated as a video.
+/// "Official Audio [Official MV]" is still a video.
 #[test]
 fn a_video_marker_beats_an_audio_marker_in_the_same_title() {
     let entry = candidate("Song (Official Audio) [Official MV]", Some(1), Some(200.0));
     assert_eq!(entry.media_rank(), 0);
 }
 
-/// Speech-to-text drops letters from proper nouns, so a request that is
-/// nearly a title still has to match it.
-///
-/// This test encoded the shared-token floor item 1.2 removed, and it shows
-/// exactly why the floor had to go: relevance is a whole-string
-/// `jaro_winkler`, and an upload whose title leads with the artist
-/// ("BTS 방탄소년단 'Hooligan'") shares no *prefix* with the bare word
-/// "hooligan", so it scores zero for the title it is named after and loses
-/// to a wrong song on view count. The floor papered over that by crediting
-/// any shared word, which is the same mechanism that answered "hello by
-/// adele" with *Hello Brother*. Both cases are handled properly by
-/// `matcher::best_window`, which matches the title against a window of the
-/// spoken words and so ignores a leading artist.
+/// Whole-string `jaro_winkler` cannot see past a leading artist; `matcher::best_window` handles that.
 #[test]
 fn a_misspelled_request_scores_badly_against_a_title_that_leads_with_the_artist() {
     let target = Target {
@@ -522,23 +467,18 @@ fn a_misspelled_request_scores_badly_against_a_title_that_leads_with_the_artist(
         requested: "bts hoolig".to_string(),
         catalogued: false,
     };
-    // Not zero, but far below what the title deserves. The old floor made
-    // any pair sharing one word worth 0.72 of the 25 available, which is
-    // what let a wrong song clear the bar on a single shared word.
+    // Low, not zero; the old 0.72 shared-word floor let wrong songs clear the bar.
     let relevance = score(&candidate("BTS 방탄소년단 'Hooligan'", None, None), &target).relevance;
     assert!(
         relevance < RELEVANCE_MAX * 0.6,
         "a whole-string comparison cannot see through the leading artist: {relevance}"
     );
-    // Which is why an unverified result is offered as a choice rather than
-    // played: relevance is all the scorer has left without a catalog (see
-    // `unverified_results_are_never_confident`).
+    // Hence unverified results are offered, not played (see `unverified_results_are_never_confident`).
 }
 
 #[test]
 fn reads_the_video_id_from_every_url_shape() {
-    // --flat-playlist search reports these in different shapes depending
-    // on version, and the dashboard needs the id for the thumbnail.
+    // yt-dlp versions report different shapes; the dashboard needs the id for thumbnails.
     for (url, expected) in [
         ("https://www.youtube.com/watch?v=09839DpTctU", "09839DpTctU"),
         ("https://youtube.com/watch?v=09839DpTctU", "09839DpTctU"),
@@ -583,8 +523,7 @@ fn an_empty_reported_id_falls_back_to_the_url() {
 
 // ---- the resolution contract ------------------------------------------
 
-/// A catalog that hands back whatever the request asked for, without any
-/// network. Keeps the catalog half of these tests out of the picture.
+/// A catalog that returns whatever was asked for, without network.
 struct Stub {
     hits: Vec<resolve::CatalogTrack>,
 }
@@ -670,8 +609,7 @@ fn request(query: &str) -> PlayRequest {
     }
 }
 
-/// The ordinary case: a request that names a song and an artist resolves to
-/// that song, and the running time comes with it for the upload search.
+/// A song-and-artist request resolves with its running time.
 #[tokio::test]
 async fn a_named_song_resolves_to_one_track() {
     let catalog = stub_catalog(vec![catalog_track("Tame Impala", "Dracula", Some(205.0))]);
@@ -690,8 +628,7 @@ async fn a_named_song_resolves_to_one_track() {
     assert_eq!(track.duration_secs, Some(205.0));
 }
 
-/// Two artists, one title, nothing said to tell them apart: the bot must
-/// ask rather than pick. This is the README's "Look at Me" case.
+/// Two artists, one title, nothing to tell them apart: ask (the README's "Look at Me").
 #[tokio::test]
 async fn a_title_two_artists_share_is_asked_about() {
     let catalog = stub_catalog(vec![
@@ -717,8 +654,7 @@ async fn a_title_two_artists_share_is_asked_about() {
     }
 }
 
-/// Everything failing is not an error. It is the same outcome as nothing
-/// matching, and the caller reports it rather than playing something.
+/// Everything failing is the same as nothing matching, not an error.
 #[tokio::test]
 async fn a_catalog_that_finds_nothing_is_unknown_not_an_error() {
     let catalog = resolve::Catalog::with_budget(vec![Box::new(Empty)], 2_500);
@@ -736,9 +672,7 @@ async fn a_catalog_that_finds_nothing_is_unknown_not_an_error() {
     ));
 }
 
-/// A provider that fails outright must not stop the request. Before the
-/// fan-out, `?` on a provider error aborted everything: one unreadable
-/// response and the listener heard nothing at all.
+/// One failing provider must not stop the request.
 #[tokio::test]
 async fn a_failing_provider_leaves_the_request_alone() {
     struct Broken;
@@ -767,9 +701,7 @@ async fn a_failing_provider_leaves_the_request_alone() {
     assert!(matches!(resolved, Resolved::Unknown));
 }
 
-/// The rewriting stage is a second *candidate*, not a replacement: it can
-/// only ever propose a transcript, which then has to clear the same catalog
-/// verification as the words that were heard.
+/// The rewrite is a second candidate, verified like the heard words.
 #[tokio::test]
 async fn a_rewrite_can_rescue_a_request_the_words_could_not() {
     // The words as heard match nothing; the rewrite names the song.
@@ -789,9 +721,7 @@ async fn a_rewrite_can_rescue_a_request_the_words_could_not() {
     );
 }
 
-/// ...and it cannot override the words as heard when those already
-/// resolved. The heard transcript is the evidence; the rewrite is the
-/// speculation.
+/// ...and cannot override heard words that already resolved.
 #[tokio::test]
 async fn a_rewrite_does_not_override_words_that_already_resolved() {
     let catalog = stub_catalog(vec![
@@ -833,10 +763,8 @@ async fn a_useless_rewrite_changes_nothing() {
     );
 }
 
-/// ---- the upload search ------------------------------------------------
-///
-/// The catalog names the song; the upload search finds the recording. Both
-/// have to agree before anything plays.
+// ---- the upload search ------------------------------------------------
+
 #[tokio::test]
 async fn a_confident_song_is_searched_for_by_its_canonical_names() {
     let resolved = Resolved::Track {
@@ -869,8 +797,7 @@ async fn a_confident_song_is_searched_for_by_its_canonical_names() {
     );
 }
 
-/// A provider that names the upload skips the search entirely. Searching
-/// would rank a second opinion and could play a different video.
+/// A provider-named upload skips the search, which could only pick a different video.
 #[tokio::test]
 async fn a_catalogued_video_is_played_without_searching_again() {
     let mut track = catalog_track("XXXTENTACION", "Look At Me!", Some(127.0));
@@ -898,8 +825,7 @@ async fn a_catalogued_video_is_played_without_searching_again() {
     );
 }
 
-/// Providers disagree about the length by a few seconds; an upload matching
-/// any of them is the right recording, so the closest of the set decides.
+/// Providers disagree by seconds; the closest of the set decides.
 #[tokio::test]
 async fn an_upload_matching_any_reported_length_is_the_right_recording() {
     let resolved = Resolved::Track {
@@ -932,8 +858,7 @@ async fn an_upload_matching_any_reported_length_is_the_right_recording() {
     );
 }
 
-/// Nothing that clears the bar means the *song* is known but the *upload*
-/// is not, which is a far narrower question to ask.
+/// The song is known, so only the recording is asked about.
 #[tokio::test]
 async fn no_convincing_upload_means_offering_recordings_not_songs() {
     let resolved = Resolved::Track {
@@ -966,10 +891,7 @@ async fn no_convincing_upload_means_offering_recordings_not_songs() {
     );
 }
 
-/// Unverified results are never played on their own. There is no catalog
-/// behind them, so the scorer has a title similarity and a view count and
-/// nothing else, and `find_unverified` says so rather than trusting the
-/// caller to remember.
+/// No catalog behind them, so `find_unverified` never marks results confident.
 #[tokio::test]
 async fn unverified_results_are_never_confident() {
     let entries = [on_channel(
@@ -990,8 +912,7 @@ async fn unverified_results_are_never_confident() {
     assert!(choice.best().is_some(), "but it is still offered");
 }
 
-/// An empty result list is a failure of the search itself, not a ranking
-/// result, so it stays an error the caller reports.
+/// No results is a search failure, kept as an error.
 #[tokio::test]
 async fn no_results_from_the_search_is_an_error() {
     let resolved = Resolved::Track {
@@ -1013,8 +934,7 @@ async fn no_results_from_the_search_is_an_error() {
     assert!(err.contains("no results"), "unhelpful: {err}");
 }
 
-/// A search that fails is reported with the query in the message, because
-/// the query is what has to be logged when it happens.
+/// A failed search names the query in its error, for the log.
 #[tokio::test]
 async fn a_failing_search_names_the_query() {
     struct Broken;
@@ -1042,8 +962,7 @@ async fn a_failing_search_names_the_query() {
     assert_eq!(err, "could not search YouTube for 'BTS Hooligan'");
 }
 
-/// `find_video` needs a song. Asking it to find an upload of a *question*
-/// would silently pick one of the offered songs for the user.
+/// Given a question, `find_video` would silently pick a song for the user.
 #[tokio::test]
 async fn a_question_cannot_be_turned_into_a_video() {
     let asked = Resolved::Ask(vec![catalog_track("Oasis", "Stand By Me", Some(254.0))]);
@@ -1078,10 +997,7 @@ fn hit(artist: &str, title: &str, popularity: Option<u32>) -> resolve::Hit {
     }
 }
 
-/// The live "biome fest" failure: four rows normalize to the same title,
-/// the cover was first in the matcher's list, and auto played 4k plays
-/// instead of the official 4.5M. Popularity settles only that same-title
-/// tie; a different song's huge count cannot win.
+/// The live "biome fest" bug: auto played a 4k-play cover over the 4.5 M official; popularity settles only same-title ties.
 #[test]
 fn auto_picks_the_most_played_recording_of_the_same_title() {
     let hits = [
@@ -1108,8 +1024,7 @@ fn auto_without_plays_keeps_the_matcher_order() {
     assert_eq!(most_played_same_title(&options).unwrap().artist, "A");
 }
 
-/// `AMBIGUOUS_POLICY=popular` is a documented escape hatch, and it is
-/// deliberately timid: the popular one has to be *three times* the other.
+/// `AMBIGUOUS_POLICY=popular` is timid: the winner must be 3x bigger.
 #[test]
 fn popularity_only_settles_a_tie_when_it_is_overwhelming() {
     let big = resolve::CatalogTrack {
@@ -1131,8 +1046,7 @@ fn popularity_only_settles_a_tie_when_it_is_overwhelming() {
     assert!(!popular_beats_a_rival(&big, &[middling]));
 }
 
-/// Two recordings by the *same* artist are not a choice between artists,
-/// and a rival with no popularity gives nothing to compare against.
+/// Same-artist recordings are no rivalry, and a rival without popularity gives nothing to compare.
 #[test]
 fn popularity_never_settles_a_question_within_one_artist() {
     let big = resolve::CatalogTrack {
@@ -1155,15 +1069,11 @@ fn popularity_never_settles_a_question_within_one_artist() {
 
 // ---- live --------------------------------------------------------------
 
-/// The whole path, against the real catalog and the real YouTube.
-///
-/// Ignored by default because it needs network access, the yt-dlp binary
-/// and the YouTube Music API: `cargo test -- --ignored search`.
+/// The whole path against the real catalog and YouTube: `cargo test -- --ignored search`.
 #[tokio::test]
 #[ignore = "needs network, yt-dlp and the YouTube Music API"]
 async fn the_whole_path_picks_the_requested_recording() {
-    // Built directly rather than through `Config`, which would also want a
-    // Discord token and a voice channel id that a test has no use for.
+    // Not via `Config`, which would demand a Discord token and channel id.
     let catalog = resolve::Catalog::with_budget(
         vec![Box::new(resolve::YtMusic::new().expect("HTTP client"))],
         2_500,
@@ -1218,8 +1128,7 @@ async fn the_whole_path_picks_the_requested_recording() {
     }
 }
 
-/// Hits the real YouTube via yt-dlp. Ignored by default because it needs
-/// network access and the yt-dlp binary.
+/// Hits the real YouTube via yt-dlp.
 #[tokio::test]
 #[ignore = "needs network and yt-dlp"]
 async fn ranks_a_live_search_against_the_catalog() {

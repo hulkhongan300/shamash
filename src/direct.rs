@@ -1,25 +1,8 @@
 //! Speech recognition through transcribe.cpp, linked directly.
 //!
-//! This is the same engine the Handy app wraps, and the same Parakeet models,
-//! but the model is loaded once at startup and held in the process instead of
-//! being reloaded for every command. That is the whole point of this module.
-//!
-//! Going through `handy --transcribe-file` cost about 350 ms per utterance on
-//! this machine, of which only ~155 ms was transcription: ~180 ms was the Tauri
-//! app starting up (loading compute backends, seeding 69 catalogue models into
-//! its registry) and ~125 ms was reloading the weights from disk. Neither
-//! depends on the audio. Holding the model resident leaves only inference, and
-//! the same utterance then transcribes in ~50 ms.
-//!
-//! It also removes the temp WAV file: the engine takes raw f32 PCM, so the
-//! samples go straight from the voice connection to the decoder.
-//!
-//! Inference goes on the GPU when one is available, because `Model::load`
-//! leaves the backend as `Auto` and ggml picks the best device it has: Vulkan
-//! on AMD and Intel under Linux, Metal on macOS. The difference is not marginal
-//! for the Whisper models -- on an RX 570 a decode that takes ~17 s on the CPU
-//! takes ~1 s on the GPU. Requesting a backend here instead would be worse,
-//! because it would take Metal away from the macOS build for no gain.
+//! The model stays loaded for the process: shelling out to `handy` cost ~350 ms
+//! per utterance versus ~50 ms resident. Backend is left `Auto` so ggml picks
+//! Vulkan/Metal itself; forcing one would break the macOS build.
 
 use crate::model;
 use crate::transcriber::Transcriber;
@@ -29,43 +12,23 @@ use transcribe_cpp::{Feature, Model, RunExtension, RunOptions, Session, WhisperR
 
 /// Transcribes with a permanently loaded model.
 pub struct DirectTranscriber {
-    /// `Session` is `Send` but not `Sync`: its methods take `&mut self` and the
-    /// underlying library allows one in-flight run per model. The mutex is what
-    /// makes this type `Sync`, which `Box<dyn Transcriber>` requires.
+    /// Mutex makes this `Sync` (required by `Box<dyn Transcriber>`); one run per model.
     session: Mutex<Session>,
-    /// A language hint, for the models that need one (Canary and Nemotron
-    /// return empty text without it). `None` leaves detection to the model.
+    /// Language hint; Canary and Nemotron return empty text without one.
     language: Option<String>,
-    /// A decoding prompt, for the models that take one (Whisper). Biasing the
-    /// decoder towards "groovy, play <title> by <artist>" is what makes it spell
-    /// song and artist names as names instead of as the nearest common words.
-    /// `None` for models that do not accept a prompt.
+    /// Whisper decoding prompt; biases it to spell song and artist names as names.
     prompt: Option<String>,
-    /// Kept for the startup log line; the session holds its own reference.
+    /// Kept for the startup log line.
     model_id: String,
 }
 
 impl DirectTranscriber {
-    /// Loads the model and opens a session. Costs one model load, so call it
-    /// once at startup rather than per utterance.
-    ///
-    /// `model` is either a path or a Handy catalogue id; see
-    /// [`crate::model::resolve`]. `prompt` is ignored by models that cannot
-    /// take one, so it is safe to pass for any model.
+    /// Loads the model once; `model` is a path or catalogue id (see [`crate::model::resolve`]).
     pub fn new(model: &str, language: Option<&str>, prompt: Option<&str>) -> anyhow::Result<Self> {
-        // Both of these are process-global and the library asks for them once,
-        // before the first model load. `Once` keeps a second engine from
-        // re-scanning the backend directory.
-        //
-        // `Once::call_once` cannot report failure to the caller, so the result
-        // is stashed and re-checked here: a missing compute backend surfaces as
-        // a normal startup error instead of a model load that mysteriously
-        // runs at glacial speed.
+        // Process-global init; result stashed so a missing backend is a startup error, not a slow load.
         static BACKENDS: std::sync::OnceLock<anyhow::Result<()>> = std::sync::OnceLock::new();
         let backends = BACKENDS.get_or_init(|| {
-            // Route the native library's chatter through `log`, which
-            // `tracing_subscriber` already bridges, so RUST_LOG governs it.
-            // Without this the engine prints to stderr on every utterance.
+            // Route native logs through `log` so RUST_LOG governs them.
             transcribe_cpp::init_logging();
             transcribe_cpp::init_backends_default().map_err(anyhow::Error::from)
         });
@@ -77,12 +40,7 @@ impl DirectTranscriber {
         let loaded = Model::load(&path)
             .map_err(|e| anyhow::anyhow!("failed to load ASR model {}: {e}", path.display()))?;
 
-        // Checked here rather than left to the first utterance. The engine does
-        // not reject an unknown language at load; it rejects it at *run*, so a
-        // typo in `ASR_LANGUAGE` used to leave the bot joining the channel and
-        // then failing every single transcription, which looks like a model
-        // problem and is not one. Codes are plain ISO-639-1 -- `pt` and `en`,
-        // not `pt-PT` or `Portuguese`.
+        // The engine only rejects a bad language at run time; catch it at startup. ISO-639-1 codes.
         if let Some(language) = language {
             let supported = loaded.capabilities().languages;
             if !language_is_known(language, &supported) {
@@ -94,11 +52,7 @@ impl DirectTranscriber {
             }
         }
 
-        // The backend and device the model actually *bound to*, not the devices
-        // that merely registered. That distinction is the whole question: a
-        // registered Vulkan0 alongside "CPU" says nothing about where the
-        // weights went, and silently falling back to the CPU is exactly what
-        // this reports so it can be noticed.
+        // The device the model actually bound to, so a silent CPU fallback shows up.
         let device = loaded
             .device()
             .map(|d| d.name)
@@ -154,8 +108,7 @@ impl Transcriber for DirectTranscriber {
             ..RunOptions::default()
         };
 
-        // A poisoned lock means an earlier call panicked; the session is still
-        // a valid pointer, so recover rather than propagating the panic.
+        // Poisoned by an earlier panic; the session is still valid.
         let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
         let transcript = session.run(samples, &options)?;
 
@@ -173,21 +126,13 @@ impl Transcriber for DirectTranscriber {
 }
 
 /// True when `path` looks like something [`DirectTranscriber::new`] can open.
-///
-/// Used by the startup check to explain a bad `REQUEST_MODEL` before the bot
-/// joins a voice channel.
 pub fn model_exists(spec: &str) -> bool {
     Path::new(spec).is_file() || model::resolve(spec).is_ok()
 }
 
-/// Checks a language hint against what a model advertises, without a model.
-///
-/// The engine takes a language it does not know and only complains when it runs,
-/// which is far too late: the bot is already in the voice channel by then. Split
-/// out so the rule is testable without a several-hundred-megabyte GGUF.
+/// Checks a language hint against what a model advertises; split out to test without a GGUF.
 fn language_is_known(language: &str, supported: &[String]) -> bool {
-    // A model that advertises nothing accepts anything; some Parakeet builds do
-    // not publish a list at all.
+    // Some Parakeet builds advertise no list; accept anything.
     supported.is_empty() || supported.iter().any(|known| known == language)
 }
 

@@ -47,16 +47,10 @@ fn the_json_line_is_found_even_after_log_output() {
     let _ = &transcriber;
 }
 
-/// The default model has to stay one that `--transcribe-file` can actually
-/// transcribe with. Every command spawns a fresh process, so the cost that
-/// matters is load time, and a model that returns empty text fails the bot
-/// silently rather than loudly. Canary and Nemotron both did; see the
-/// comment on `crate::model::SMALL_MODEL_ID`.
+/// `--transcribe-file` has no `--language`, so a model needing one returns
+/// empty text silently (Canary and Nemotron did).
 #[test]
 fn the_default_model_does_not_need_a_language_hint() {
-    // `handy --list-models` reports `supports_language_selection` for each
-    // model, and the CLI offers no `--language` for `--transcribe-file`.
-    // A model that needs one returns empty text for every utterance.
     assert!(
         !crate::model::SMALL_MODEL_ID.contains("canary"),
         "needs -l <lang>"

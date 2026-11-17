@@ -15,10 +15,7 @@ fn song() -> Queued {
     }
 }
 
-/// The description a view will actually send.
-///
-/// `CreateEmbed` keeps its fields private and offers only setters, so the
-/// message is read back the way Discord would see it.
+/// The description a view sends, read via JSON since `CreateEmbed` fields are private.
 fn description_of(view: View) -> String {
     serde_json::to_value(&view.embed)
         .expect("an embed serialises")
@@ -28,10 +25,7 @@ fn description_of(view: View) -> String {
         .to_string()
 }
 
-/// A notice echoes back what the bot thought it heard, which is
-/// speech-to-text output, so it can contain anything the person said --
-/// including markdown that would reformat the message or a stray backtick
-/// pair that swallows the rest of it.
+/// Transcripts can contain markdown that would reformat the message.
 #[test]
 fn a_notice_escapes_what_it_echoes_back() {
     let description = description_of(notice("I heard “*stand* by _me_”, but couldn’t match it."));
@@ -41,16 +35,12 @@ fn a_notice_escapes_what_it_echoes_back() {
     );
 }
 
-/// A notice is not a question, so it must not leave buttons behind that
-/// would answer a question nobody asked.
 #[test]
 fn a_notice_has_no_buttons() {
     assert!(notice("something went wrong").buttons.is_empty());
 }
 
-/// A very long transcript must not be able to push the notice over
-/// Discord's field limit, which would make the send fail -- and a failed
-/// send is exactly the silence this is here to remove.
+/// Over Discord's limit the send fails, and the notice is silently lost.
 #[test]
 fn a_notice_is_trimmed_to_something_discord_will_send() {
     let said = "a".repeat(MAX_DESCRIPTION * 2);
@@ -73,7 +63,6 @@ fn option(title: &str, channel: &str, duration: Option<f64>) -> ChoiceOption<'st
     }
 }
 
-/// An album says it is one, so it is not mistaken for a song of that name.
 #[test]
 fn an_album_option_says_it_is_an_album() {
     let album = ChoiceOption {
@@ -84,14 +73,12 @@ fn an_album_option_says_it_is_an_album() {
     assert_eq!(album.detail(), "Album \u{2022} XXXTENTACION \u{2022} 2017");
 }
 
-/// A candidate with no reported length still has to render as a field.
 #[test]
 fn an_option_without_metadata_still_renders() {
     assert_eq!(option("Dracula", "", None).detail(), "unknown length");
 }
 
-/// The chooser answers "which one" with the one fact that separates two
-/// recordings of the same title: how often each has been played.
+/// Play count is what separates two recordings of the same title.
 #[test]
 fn an_option_shows_its_play_count() {
     let mut option = option("Dracula", "Tame Impala", Some(206.0));
@@ -130,7 +117,6 @@ fn every_button_round_trips_through_its_custom_id() {
 
 #[test]
 fn a_custom_id_from_elsewhere_is_ignored() {
-    // Another feature's button must not be read as a playback action.
     assert_eq!(action_from_id("other:pause"), None);
     assert_eq!(action_from_id("shamash:unknown"), None);
     assert_eq!(action_from_id("shamash:"), None);
@@ -138,7 +124,6 @@ fn a_custom_id_from_elsewhere_is_ignored() {
     assert_eq!(action_from_id(""), None);
 }
 
-/// Songs as the queue hands them to the queue view, numbered from 0.
 fn waiting(songs: &[Queued]) -> Vec<Waiting> {
     songs
         .iter()
@@ -148,7 +133,6 @@ fn waiting(songs: &[Queued]) -> Vec<Waiting> {
         .collect()
 }
 
-/// The queue view's components as JSON.
 fn queue_rows(waiting: &[Waiting], selected: Option<u64>) -> Vec<serde_json::Value> {
     serde_json::to_value(&queue_view(waiting, selected).buttons)
         .unwrap()
@@ -172,8 +156,6 @@ fn edit_buttons(waiting: &[Waiting], selected: Option<u64>) -> Vec<(String, bool
         .collect()
 }
 
-/// A long queue cannot have a button per song, so songs are picked from
-/// one menu, and the controls and Back fit under it.
 #[test]
 fn the_queue_view_picks_a_song_from_a_menu() {
     let queue = waiting(&vec![song(); crate::queue::MAX_QUEUE]);
@@ -189,7 +171,6 @@ fn the_queue_view_picks_a_song_from_a_menu() {
     assert_eq!(rows[2]["components"][0]["custom_id"], "shamash:back");
 }
 
-/// Until a song is picked, there is nothing for the buttons to act on.
 #[test]
 fn the_edit_buttons_wait_for_a_pick() {
     let queue = waiting(&[song(), song()]);
@@ -199,8 +180,7 @@ fn the_edit_buttons_wait_for_a_pick() {
     }
 }
 
-/// The buttons carry the picked song's id, so they act on it even after
-/// the queue has shifted under the view.
+/// By id, so they still act on it after the queue shifts.
 #[test]
 fn the_edit_buttons_name_the_picked_song() {
     let queue = waiting(&[song(), song(), song()]);
@@ -225,7 +205,6 @@ fn the_edit_buttons_name_the_picked_song() {
     assert_eq!(menu["options"][0]["default"], false);
 }
 
-/// A move that would go nowhere is greyed out rather than doing nothing.
 #[test]
 fn a_song_at_either_end_cannot_move_past_it() {
     let queue = waiting(&[song(), song()]);
@@ -240,14 +219,13 @@ fn a_song_at_either_end_cannot_move_past_it() {
     assert_eq!(disabled(1), [false, false, true, false]);
 }
 
-/// A pick whose song has since started playing is no pick at all.
 #[test]
 fn a_pick_that_is_no_longer_waiting_picks_nothing() {
     let queue = waiting(&[song()]);
     assert!(edit_buttons(&queue, Some(7)).iter().all(|(_, d)| *d));
 }
 
-/// An empty queue has nothing to pick, and Discord rejects an empty menu.
+/// Discord rejects an empty menu.
 #[test]
 fn an_empty_queue_has_only_the_way_back() {
     let rows = queue_rows(&[], None);
@@ -275,7 +253,6 @@ fn an_edit_id_round_trips_and_strangers_are_ignored() {
     assert_eq!(picked(&[]), None);
 }
 
-/// The view as Discord would receive it, for asserting on its contents.
 fn rendered(view: &View) -> String {
     serde_json::to_string(&(&view.embed, &view.buttons)).expect("view serialises")
 }
@@ -321,7 +298,6 @@ fn named(title: &str, artist: &str, duration: Option<f64>) -> Queued {
     song
 }
 
-/// The next song is named rather than counted, and the rest are summed up.
 #[test]
 fn the_next_song_is_named() {
     let empty = rendered(&dashboard(&song(), None, false, &[], false));
@@ -340,8 +316,6 @@ fn the_next_song_is_named() {
     assert!(many.contains("Queue (3)"), "{many}");
 }
 
-/// A song the memory chose says so and offers the way to correct it; one
-/// that was looked up has nothing to correct, so it offers neither.
 #[test]
 fn a_remembered_song_says_so_and_offers_wrong_song() {
     let looked_up = rendered(&dashboard(&song(), None, false, &[], false));
@@ -360,7 +334,6 @@ fn a_remembered_song_says_so_and_offers_wrong_song() {
     );
 }
 
-/// The length and how the song was asked for are shown under the title.
 #[test]
 fn the_dashboard_says_how_long_and_how_it_was_asked_for() {
     let voice = description_of(dashboard(&song(), None, false, &[], false));
@@ -375,7 +348,6 @@ fn the_dashboard_says_how_long_and_how_it_was_asked_for() {
     );
 }
 
-/// Paused greys the dashboard and says so; repeat says so too.
 #[test]
 fn paused_and_repeat_are_visible_at_a_glance() {
     let colour = |view: &View| serde_json::to_value(&view.embed).unwrap()["color"].clone();
@@ -397,7 +369,6 @@ fn lengths_read_like_a_clock() {
     assert_eq!(total_time(3900.0), "1 h 05 min");
 }
 
-/// The idle dashboard names both ways in: the wake words and `/play`.
 #[test]
 fn the_idle_dashboard_names_the_wake_words_and_play() {
     let words = ["shamash".to_string(), "bot".to_string()];
@@ -412,8 +383,7 @@ fn the_idle_dashboard_names_the_wake_words_and_play() {
 
 #[test]
 fn an_over_long_title_is_trimmed_rather_than_rejected() {
-    // Discord rejects an embed whose title is over the limit, which would
-    // lose the whole dashboard.
+    // Discord rejects an over-long title, losing the whole dashboard.
     let mut long = song();
     long.title = "x".repeat(400);
     let json = serde_json::to_string(&dashboard(&long, None, false, &[], false).embed)
@@ -449,8 +419,6 @@ fn short_text_is_left_alone() {
     assert_eq!(trim("short", 20), "short");
 }
 
-/// The now-playing view has to offer the way into the queue, or the button
-/// is unreachable.
 #[test]
 fn the_dashboard_offers_the_queue_and_the_queue_offers_the_way_back() {
     let now_playing = rendered(&dashboard(&song(), None, false, &[song()], false));
@@ -459,12 +427,9 @@ fn the_dashboard_offers_the_queue_and_the_queue_offers_the_way_back() {
 
     let queue = rendered(&queue_view(&waiting(&[song()]), None));
     assert!(queue.contains("Back"), "{queue}");
-    // Back is the only way off, so a queue view without it is a dead end.
     assert!(!queue.contains("Stop"), "{queue}");
 }
 
-/// The queue is the reason the view exists, so the songs in it have to be
-/// named, soonest first.
 #[test]
 fn the_queue_view_lists_every_waiting_song_in_order() {
     let view = queue_view(
@@ -487,7 +452,6 @@ fn the_queue_view_lists_every_waiting_song_in_order() {
     );
 }
 
-/// A song of unknown length makes the total a lower bound.
 #[test]
 fn a_queue_with_an_unknown_length_says_over() {
     let view = queue_view(
@@ -509,8 +473,6 @@ fn the_queue_view_keeps_the_order_and_artist() {
     assert!(json.contains("An Artist"), "the artist is shown: {json}");
 }
 
-/// An empty queue still has to render, and must say so rather than showing
-/// an embed with nothing in it.
 #[test]
 fn an_empty_queue_says_so() {
     let view = queue_view(&[], None);
@@ -521,8 +483,6 @@ fn an_empty_queue_says_so() {
     );
 }
 
-/// A toggle whose state is only visible in its effect is one nobody trusts,
-/// so the button has to say which way it is set.
 #[test]
 fn the_repeat_button_says_whether_repeat_is_on() {
     let off = rendered(&dashboard(&song(), None, false, &[], false));
@@ -533,8 +493,6 @@ fn the_repeat_button_says_whether_repeat_is_on() {
     assert!(on.contains("Repeat: on"), "{on}");
 }
 
-/// Every control is still there, with Stop on a row of its own so it is
-/// not pressed by accident, and every button has an icon.
 #[test]
 fn stop_has_a_row_of_its_own_and_nothing_was_lost() {
     let value = serde_json::to_value(&dashboard(&song(), None, false, &[], false).buttons).unwrap();
@@ -565,7 +523,6 @@ fn stop_has_a_row_of_its_own_and_nothing_was_lost() {
     }
 }
 
-/// Repeat is grey when off and green when on, the colours of a switch.
 #[test]
 fn the_repeat_button_is_green_when_on() {
     let style = |repeat| {
@@ -577,8 +534,7 @@ fn the_repeat_button_is_green_when_on() {
     assert_eq!(style(true), 3, "success when on");
 }
 
-/// A queued title can be arbitrarily long, and Discord rejects an embed
-/// whose field name is over the limit rather than truncating it.
+/// Discord rejects an over-long field name rather than truncating it.
 #[test]
 fn an_over_long_queued_title_is_trimmed_rather_than_rejected() {
     let mut long = song();
@@ -606,8 +562,6 @@ fn offers(n: usize) -> Vec<ChoiceOption<'static>> {
         .collect()
 }
 
-/// A `/play` button has to survive the round trip, and must not be
-/// readable as a playback action.
 #[test]
 fn a_play_button_round_trips_and_is_not_a_playback_action() {
     assert_eq!(asked_index(&ask_id(4)), Some(4));
@@ -626,8 +580,6 @@ fn a_play_button_round_trips_and_is_not_a_playback_action() {
     assert_eq!(asked_index("other:ask:0"), None);
 }
 
-/// The position in the button id is the position in the whole search, not
-/// in the page, so a press still names the same song after a redraw.
 #[test]
 fn the_buttons_name_songs_across_the_whole_search() {
     let json = serde_json::to_string(&ask("dracula", &offers(9), 1, 20).into_message())
@@ -637,9 +589,7 @@ fn the_buttons_name_songs_across_the_whole_search() {
     assert!(!json.contains("ask:0"), "the ids are absolute: {json}");
 }
 
-/// Nine songs, so two rows of five and one of four, plus a row for the page
-/// controls. Discord takes five to a row and twenty-five in total, and
-/// anything over is dropped by the API.
+/// Discord allows five per row, 25 in total; the API drops the rest.
 #[test]
 fn the_chooser_fits_discords_buttons() {
     let json = serde_json::to_string(&ask("dracula", &offers(9), 0, 20).into_message())
@@ -658,8 +608,6 @@ fn the_chooser_fits_discords_buttons() {
     assert_eq!(total, 11, "nine songs and two controls");
 }
 
-/// The last page says so on the button rather than leaving it to fail: a
-/// button that vanishes makes the message look broken.
 #[test]
 fn the_next_page_button_is_disabled_when_the_list_has_run_out() {
     let next_disabled = |view: View| {
@@ -677,15 +625,14 @@ fn the_next_page_button_is_disabled_when_the_list_has_run_out() {
         !next_disabled(ask("dracula", &offers(9), 0, 20)),
         "more exist"
     );
-    // 20 songs, 9 to a page: page three is the last, and holds two.
+    // 20 songs, 9 per page: page three is the last.
     assert!(
         next_disabled(ask("dracula", &offers(2), 2, 20)),
         "the last page"
     );
 }
 
-/// Discord rejects a button that carries an id and no label, so a chooser
-/// of unlabelled buttons does not post at all. Every button must have both.
+/// Discord rejects a button with an id and no label.
 #[test]
 fn every_button_in_the_chooser_is_labelled() {
     for (page, total) in [(0, 20), (1, 20), (2, 20), (0, 4)] {
@@ -707,9 +654,7 @@ fn every_button_in_the_chooser_is_labelled() {
     }
 }
 
-/// The label numbers the page, because that is what the embed's fields say;
-/// the id numbers the whole search. Getting those the wrong way round would
-/// make button 1 mean the tenth song.
+/// Swapped, button 1 would mean the tenth song.
 #[test]
 fn the_label_numbers_the_page_and_the_id_numbers_the_search() {
     let json = serde_json::to_string(&ask("dracula", &offers(9), 1, 20).into_message())
@@ -723,8 +668,6 @@ fn the_label_numbers_the_page_and_the_id_numbers_the_search() {
     assert!(json.contains(r#""label":"9""#), "and the last is 9: {json}");
 }
 
-/// One line per song, numbered like the buttons, with what was asked for
-/// echoed above them.
 #[test]
 fn the_chooser_is_one_line_per_song() {
     let mut first = option("All Caps", "Madvillain", Some(130.0));
@@ -744,7 +687,6 @@ fn the_chooser_is_one_line_per_song() {
     );
 }
 
-/// The page count has to be the whole list's, not this page's.
 #[test]
 fn the_chooser_says_which_page_of_how_many() {
     let json = description_of(ask("dracula", &offers(9), 1, 20));
@@ -759,8 +701,7 @@ fn the_progress_bar_shows_how_far_into_the_song_it_is() {
     assert_eq!(progress_bar(72.0, 206.0), "▬▬▬▬🔘▬▬▬▬▬▬▬ 1:12 / 3:26");
 }
 
-/// Songbird's clock can pass a length YouTube rounded down, and a bar must
-/// never be drawn longer than itself or say it is past the end.
+/// Songbird's clock can pass a length YouTube rounded down.
 #[test]
 fn the_progress_bar_stays_within_the_song() {
     assert_eq!(progress_bar(210.0, 206.0), progress_bar(206.0, 206.0));
@@ -784,8 +725,7 @@ fn a_known_position_is_drawn_as_a_bar_in_place_of_the_length() {
         "how it was asked for is still said: {description}"
     );
 
-    // Without a position, or without a length to measure it against, there
-    // is no bar, and the length is shown as before.
+    // No position or no length: no bar.
     let unknown = description_of(dashboard(&song(), None, false, &[], false));
     assert!(!unknown.contains("🔘"), "{unknown}");
     assert!(unknown.contains("3:26"), "{unknown}");
@@ -795,7 +735,6 @@ fn a_known_position_is_drawn_as_a_bar_in_place_of_the_length() {
     assert!(!endless.contains("🔘"), "{endless}");
 }
 
-/// Pausing stops the clock, so the paused dashboard shows where it stopped.
 #[test]
 fn a_paused_song_keeps_its_place_on_the_bar() {
     let paused = description_of(dashboard(&song(), Some(72.0), true, &[], false));

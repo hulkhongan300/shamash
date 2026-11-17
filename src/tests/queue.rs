@@ -13,9 +13,7 @@ fn song(title: &str) -> Queued {
     }
 }
 
-/// A song whose audio is still arriving, which is what most queued songs
-/// are: nothing is on disk yet, but the file the stream will be written to
-/// has to be treated the same as one that is.
+/// A song still streaming: its cache file must count as on disk.
 fn streaming(title: &str) -> Queued {
     Queued {
         source: Source::Stream {
@@ -76,9 +74,7 @@ fn skipping_drops_the_song_playing_and_starts_the_next() {
 
 #[test]
 fn a_skip_supersedes_the_skipped_songs_own_ending() {
-    // Songbird reports a skipped song as ended, so a skip must not also be
-    // counted as the song finishing, which would drop two songs for one
-    // button press.
+    // Songbird reports a skipped song as ended; that must not drop a second song.
     let queue = Queue::default();
     queue.push(song("playing"));
     queue.push(song("next"));
@@ -142,8 +138,6 @@ fn a_stopped_song_does_not_come_back_when_it_reports_ending() {
 
 #[test]
 fn stopping_keeps_the_waiting_songs() {
-    // A stop button pauses the queue, it is not a way to throw away
-    // everything the listener asked for.
     let queue = Queue::default();
     queue.push(song("playing"));
     queue.push(song("waiting"));
@@ -189,7 +183,6 @@ fn a_guild_gets_its_own_queue() {
     one.push(song("only for one"));
     assert_eq!(one.pending(), 1);
     assert_eq!(two.pending(), 0, "queues must not be shared");
-    // The same guild resolves to the same queue.
     assert_eq!(queues.get(GuildId::new(1)).pending(), 1);
 }
 
@@ -201,8 +194,6 @@ fn a_clone_shares_one_queue() {
     assert_eq!(other.pending(), 1);
 }
 
-/// The cache must know which audio is still wanted: the song playing and
-/// every one queued behind it. `prune` never deletes these.
 #[test]
 fn in_use_covers_the_playing_song_and_the_whole_queue() {
     let queue = Queue::default();
@@ -222,11 +213,9 @@ fn in_use_covers_the_playing_song_and_the_whole_queue() {
     );
 
     queue.advance();
-    // The playing song is still wanted, and the queue behind it too.
     assert_eq!(queue.in_use().len(), 2);
 
     queue.clear();
-    // With nothing playing, only the waiting song is still wanted.
     assert_eq!(queue.in_use(), vec![PathBuf::from("/tmp/second.m4a")]);
 
     queue.advance();
@@ -239,9 +228,7 @@ fn in_use_covers_the_playing_song_and_the_whole_queue() {
     assert!(queue.in_use().is_empty());
 }
 
-/// A stream's audio is not on disk when it is queued, but the file it is
-/// being written to is exactly what a later request will read, so the cache
-/// must keep it. Pruning it would make the repeat download the song again.
+/// Pruning a stream's cache file would make a repeat download it again.
 #[test]
 fn in_use_keeps_the_cache_file_a_stream_is_being_written_to() {
     let queue = Queue::default();
@@ -261,7 +248,6 @@ fn the_thumbnail_comes_from_the_video_id() {
 
 #[test]
 fn a_queue_survives_a_poisoned_lock() {
-    // A panic elsewhere must not make every later command fail.
     let queue = Queue::default();
     let clone = queue.clone();
     let _ = std::thread::spawn(move || {
@@ -272,8 +258,6 @@ fn a_queue_survives_a_poisoned_lock() {
 
     assert!(queue.push(song("after the panic")));
 }
-/// The point of repeat: a song that ends with nothing behind it plays
-/// again, rather than the queue running dry.
 #[test]
 fn repeat_plays_a_song_again_when_nothing_is_queued_behind_it() {
     let queue = Queue::default();
@@ -295,8 +279,7 @@ fn repeat_plays_a_song_again_when_nothing_is_queued_behind_it() {
     );
 }
 
-/// Repeat one is not repeat-all: a song that ends with others waiting plays
-/// the next one, and only comes back when the list has run down.
+/// Repeat one, not repeat-all: the song only comes back once the list runs down.
 #[test]
 fn repeat_does_not_interrupt_the_queue_behind_the_song() {
     let queue = Queue::default();
@@ -313,12 +296,10 @@ fn repeat_does_not_interrupt_the_queue_behind_the_song() {
         "the finished song did not jump the queue"
     );
 
-    // The list has run down now, so the last song comes round again.
     let now = queue.advance();
     assert_eq!(now.current.expect("repeats last").title, "second");
 }
 
-/// Turning it off must actually stop it, or the button is a one-way door.
 #[test]
 fn turning_repeat_off_stops_the_song_coming_back() {
     let queue = Queue::default();
@@ -332,8 +313,6 @@ fn turning_repeat_off_stops_the_song_coming_back() {
     assert_eq!(queue.pending(), 0);
 }
 
-/// Stopping clears the queue. A repeat flag left on would otherwise put a
-/// stopped song straight back.
 #[test]
 fn a_cleared_queue_does_not_resurrect_the_song_under_repeat() {
     let queue = Queue::default();
@@ -347,12 +326,10 @@ fn a_cleared_queue_does_not_resurrect_the_song_under_repeat() {
     assert_eq!(queue.pending(), 0);
 }
 
-/// The titles waiting, soonest first.
 fn titles(queue: &Queue) -> Vec<String> {
     queue.pending_songs().into_iter().map(|s| s.title).collect()
 }
 
-/// The id the queue gave the waiting song with this title.
 fn id_of(queue: &Queue, title: &str) -> u64 {
     queue
         .waiting()
@@ -387,8 +364,7 @@ fn removing_takes_out_only_the_song_picked() {
     assert_eq!(titles(&queue), ["first", "last"]);
 }
 
-/// The queue moves on while the view is open, so the id the button carries
-/// can be stale. Acting on it must not hit whatever now sits in its place.
+/// A stale id from an open view must not hit whatever slid into its place.
 #[test]
 fn removing_a_song_that_already_started_changes_nothing() {
     let queue = Queue::default();
@@ -415,8 +391,6 @@ fn removing_twice_removes_once() {
     assert_eq!(titles(&queue), ["stays"]);
 }
 
-/// An id belongs to one entry, so the same song queued again later is not
-/// what an old pick refers to.
 #[test]
 fn an_id_is_not_reused_for_a_later_song() {
     let queue = Queue::default();
@@ -459,7 +433,6 @@ fn a_song_at_either_end_stays_put() {
     assert_eq!(titles(&queue), ["first", "last"]);
 }
 
-/// A move keeps the id, so pressing "up" again moves the same song again.
 #[test]
 fn a_moved_song_keeps_its_id() {
     let queue = Queue::default();

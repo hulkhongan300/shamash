@@ -5,20 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The Handy model used when `PARAKEET_MODEL` is unset.
-///
-/// Hands each utterance to the Handy app's headless batch mode and returns the
-/// text it prints.
-///
-/// Handy owns the model, the compute backend and the decoding parameters, so
-/// Shamash does not carry its own ASR runtime. The model is Parakeet
-/// (transcribe.cpp), which on this machine's GPU is roughly five times quicker
-/// than the bundled Whisper for a spoken command, and it returns punctuated,
-/// capitalized text instead of lowercased fragments.
+/// Transcribes via the Handy app's headless batch mode, which owns the model and backend.
 pub struct HandyTranscriber {
     program: String,
     model: String,
-    /// Serializes calls: one Handy process handles one utterance at a time.
+    /// One Handy process per utterance at a time.
     lock: std::sync::Mutex<()>,
 }
 
@@ -32,7 +23,7 @@ impl HandyTranscriber {
     }
 }
 
-/// The fields Shamash reads out of Handy's `--json` output.
+/// Handy's `--json` output.
 #[derive(Debug, Deserialize)]
 struct HandyOutput {
     text: String,
@@ -43,7 +34,6 @@ struct HandyOutput {
 }
 
 impl HandyTranscriber {
-    /// Runs Handy over `wav_path` and returns its transcript.
     fn run(&self, wav_path: &Path) -> anyhow::Result<HandyOutput> {
         let output = Command::new(&self.program)
             .arg("--transcribe-file")
@@ -75,8 +65,7 @@ impl HandyTranscriber {
             );
         }
 
-        // Handy logs to stderr and prints one JSON object to stdout, but a
-        // crash report can precede it, so start from the last line that parses.
+        // A crash report can precede the JSON, so take the last line that parses.
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines().rev() {
             if let Ok(parsed) = serde_json::from_str::<HandyOutput>(line) {
@@ -106,9 +95,7 @@ impl Transcriber for HandyTranscriber {
             .with_context(|| format!("failed to write {}", path.display()))?;
 
         let result = self.run(&path);
-        // The WAV only exists to be handed to the subprocess, so a failure to
-        // delete it is worth a warning: it accumulates in the working directory
-        // otherwise.
+        // Warn: leftover WAVs accumulate in the temp dir.
         if let Err(e) = std::fs::remove_file(&path) {
             tracing::warn!("could not remove temp wav {}: {e}", path.display());
         }
@@ -123,14 +110,13 @@ impl Transcriber for HandyTranscriber {
     }
 }
 
-/// A unique path for one utterance's WAV file.
 fn temp_wav_path() -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("shamash-asr-{}-{n}.wav", std::process::id()))
 }
 
-/// Minimal 16-bit PCM WAV writing, the one format Handy's batch mode reads.
+/// 16-bit PCM WAV, the one format Handy's batch mode reads.
 mod wav {
 
     pub fn write(samples: &[f32], sample_rate: u32) -> Vec<u8> {
@@ -158,7 +144,6 @@ mod wav {
         out
     }
 
-    /// Reads a mono 16-bit PCM WAV back into samples, for tests.
     #[cfg(test)]
     pub fn read(bytes: &[u8]) -> anyhow::Result<(u32, Vec<f32>)> {
         anyhow::ensure!(
@@ -191,7 +176,7 @@ mod wav {
                 }
                 _ => {}
             }
-            // Chunks are word aligned, so an odd size is followed by a pad byte.
+            // Odd-sized chunks have a pad byte.
             pos = end + (size % 2);
         }
         anyhow::bail!("WAV has no data chunk")

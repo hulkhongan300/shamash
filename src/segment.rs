@@ -1,66 +1,43 @@
 //! Cuts one speaker's audio into utterances.
 //!
-//! This replaces a fixed RMS gate that kept only the frames louder than
-//! -34 dBFS. That gate had two faults that both cost words. A quiet speaker
-//! never crossed it at all. Worse, the frames it *dropped* inside an utterance
-//! were the quiet ones: the soft consonants, the ends of words, the pauses
-//! between them. The model was handed speech with those spliced out, which
-//! reads to it as words glued together.
-//!
-//! Here a small neural voice detector ([`earshot`]) decides where speech
-//! starts and stops, and **every** sample between those points is kept: a
-//! short lead-in from before the onset, so the first syllable is not clipped,
-//! and the quiet stretches inside the utterance, so nothing is spliced.
+//! A neural VAD ([`earshot`]) finds the start and end, and every sample in
+//! between is kept (plus a lead-in): the old RMS gate spliced out quiet
+//! consonants and pauses, which glued words together for the model.
 
 use std::collections::VecDeque;
 
 /// Sample rate the detector and the models expect.
 pub const SAMPLE_RATE: usize = 16_000;
 
-/// Samples per detector frame: 16 ms at 16 kHz, which is what earshot takes.
+/// 16 ms at 16 kHz, the frame size earshot takes.
 pub const VAD_FRAME: usize = 256;
 
-/// Score at or above which a frame counts as voice.
 const VOICE_THRESHOLD: f32 = 0.5;
 
-/// Consecutive voiced frames that start an utterance: 3 x 16 ms.
-///
-/// A single voiced frame is too easy to get from a click or a cough.
+/// 48 ms: one voiced frame is too easy to get from a click or cough.
 const ONSET_FRAMES: usize = 3;
 
-/// Consecutive unvoiced frames that end an utterance: 40 x 16 ms = 640 ms.
-///
-/// Long enough to survive the pause between "groovy, play" and the title, short
-/// enough that the request is acted on promptly once the speaker stops.
+/// 640 ms: survives the pause after "groovy, play" yet acts promptly.
 const HANGOVER_FRAMES: usize = 40;
 
-/// Audio kept from before the onset: 300 ms.
-///
-/// The detector needs a few frames to be sure, and the start of the first word
-/// is in those frames.
+/// 300 ms lead-in: the first word starts while the detector is still unsure.
 const PREROLL_SAMPLES: usize = SAMPLE_RATE * 3 / 10;
 
-/// Silence kept after the last voiced frame: 250 ms. The rest of the hangover
-/// is trimmed off, because it is only there to decide that speech ended.
+/// 250 ms of trailing silence kept; the rest of the hangover is trimmed.
 const TAIL_SAMPLES: usize = SAMPLE_RATE / 4;
 
-/// Hard cap on one utterance: 15 s. Speech that runs longer is cut there and
-/// carries on as a new utterance.
+/// 15 s cap; longer speech continues as a new utterance.
 const MAX_SAMPLES: usize = SAMPLE_RATE * 15;
 
-/// Utterances with fewer voiced frames than this are dropped: 6 x 16 ms.
+/// Utterances with fewer voiced frames (96 ms) are dropped.
 const MIN_VOICED_FRAMES: usize = 6;
 
-/// Scores one frame as voice (1.0) or not (0.0).
-///
-/// A trait so the segmenter's own logic can be tested with a detector whose
-/// answers are known, rather than with recordings.
+/// Scores a frame as voice (1.0) or not (0.0); a trait so tests can fake it.
 pub trait VoiceDetector: Send {
     fn score(&mut self, frame: &[f32]) -> f32;
     fn reset(&mut self);
 }
 
-/// The production detector.
 pub struct Earshot(Box<earshot::Detector>);
 
 impl Default for Earshot {
@@ -82,20 +59,17 @@ impl VoiceDetector for Earshot {
 /// What a push into the segmenter produced.
 #[derive(Debug, PartialEq)]
 pub enum Segment {
-    /// Speech began.
     Started,
-    /// Speech ended; this is the whole utterance.
+    /// The whole utterance.
     Ended(Vec<f32>),
 }
 
 /// Utterance segmentation for one speaker.
 pub struct Segmenter {
     detector: Box<dyn VoiceDetector>,
-    /// Samples not yet making up a whole detector frame.
+    /// Leftover samples short of a whole frame.
     pending: Vec<f32>,
-    /// The most recent audio while idle, for the lead-in.
     preroll: VecDeque<f32>,
-    /// The utterance in progress.
     utterance: Vec<f32>,
     in_speech: bool,
     voiced_run: usize,
@@ -126,7 +100,6 @@ impl Segmenter {
         }
     }
 
-    /// Whether an utterance is in progress.
     pub fn in_speech(&self) -> bool {
         self.in_speech
     }
@@ -136,7 +109,6 @@ impl Segmenter {
         &self.utterance
     }
 
-    /// Forgets everything, as if the speaker had just arrived.
     pub fn reset(&mut self) {
         self.detector.reset();
         self.pending.clear();
@@ -149,7 +121,7 @@ impl Segmenter {
         self.last_voiced_end = 0;
     }
 
-    /// Feeds any number of samples and returns what they caused, in order.
+    /// Feeds samples of any length; returns the resulting events in order.
     pub fn push(&mut self, samples: &[f32]) -> Vec<Segment> {
         self.pending.extend_from_slice(samples);
         let mut out = Vec::new();
@@ -199,8 +171,7 @@ impl Segmenter {
         }
     }
 
-    /// Ends the utterance. `still_speaking` is the length cap cutting speech
-    /// that has not stopped, which carries on as a fresh utterance.
+    /// `still_speaking`: cut by the length cap, so a fresh utterance starts.
     fn close(&mut self, out: &mut Vec<Segment>, still_speaking: bool) {
         let mut audio = std::mem::take(&mut self.utterance);
         if !still_speaking {
