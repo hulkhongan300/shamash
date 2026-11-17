@@ -1,15 +1,9 @@
 use anyhow::Context as _;
 use std::collections::HashSet;
 
-/// Wake words used when `WAKE_WORDS` is unset.
-///
-/// Distinctive words only. "play" used to be one, which made any sentence with
-/// "play" in it ("let's play a game") a song request. "bot" was one until it
-/// had to be matched loosely enough to catch the small model's "but", which
-/// then woke the bot on every "but" in a conversation: one syllable is too
-/// little to tell a wake word from ordinary speech. Add it back in
-/// `WAKE_WORDS` if you want it.
-pub const DEFAULT_WAKE_WORDS: &[&str] = &["groovy", "shamash"];
+/// Wake words used when `WAKE_WORDS` is unset. A command is "groovy play
+/// <request>", with both words heard exactly.
+pub const DEFAULT_WAKE_WORDS: &[&str] = &["groovy"];
 
 /// Identifies the bot to the services it calls.
 pub const HTTP_USER_AGENT: &str = concat!("shamash/", env!("CARGO_PKG_VERSION"));

@@ -17,7 +17,7 @@ leaves the host.
 
 ## Features
 
-- **Hands-free requests.** Say the wake word and a song, in one breath or in
+- **Hands-free requests.** Say "groovy play" and a song, in one breath or in
   two. The music ducks to 20% while you speak.
 - **Whole albums.** "Groovy, play the album 17 by XXXTENTACION" queues every
   track. Without "album", the bot plays the album when no song has that name,

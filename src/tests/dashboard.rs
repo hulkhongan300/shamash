@@ -404,7 +404,7 @@ fn the_idle_dashboard_names_the_wake_words_and_play() {
     let description = description_of(idle_dashboard(&words));
     assert_eq!(
         description,
-        "Say **bot** or **shamash** and a song, or use `/play`."
+        "Say **bot play** or **shamash play** and a song, or use `/play`."
     );
     let none: [String; 0] = [];
     assert!(description_of(idle_dashboard(&none)).contains("/play"));

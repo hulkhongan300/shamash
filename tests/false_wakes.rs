@@ -47,6 +47,13 @@ const CONVERSATION: &[&str] = &[
     // No wake word at all.
     "can we play some games later",
     "play it cool",
+    // Anything but the wake word straight before "play".
+    "Groovy, Dracula by Tame Impala",
+    "Hey groovy, could you play Bohemian Rhapsody?",
+    "Groovy please play Bohemian Rhapsody",
+    "Shamash, play Dracula",
+    "Groove play Dracula",
+    "groovy late look at me",
 ];
 
 /// Said to the bot. Each must wake the gate and be a request.
@@ -55,15 +62,7 @@ const REQUESTS: &[(&str, &str)] = &[
         "Groovy, play Dracula by Tame Impala.",
         "dracula by tame impala",
     ),
-    ("Groovy, Dracula by Tame Impala", "dracula by tame impala"),
-    (
-        "Hey groovy, could you play Bohemian Rhapsody?",
-        "bohemian rhapsody",
-    ),
-    ("Groovy please play Bohemian Rhapsody", "bohemian rhapsody"),
     ("okay so groovy, play Dracula", "dracula"),
-    ("Shamash, play Dracula", "dracula"),
-    ("Shemash play Dracula", "dracula"),
 ];
 
 #[test]
@@ -95,9 +94,9 @@ fn a_request_to_the_bot_is_heard() {
 }
 
 #[test]
-fn the_wake_word_on_its_own_waits_for_the_request() {
+fn groovy_play_on_its_own_waits_for_the_request() {
     let parser = parser();
-    for said in ["Groovy.", "Hey groovy", "Shamash?", "groovy play"] {
+    for said in ["Groovy, play.", "hey groovy play"] {
         assert!(parser.wakes_on(said), "the gate missed {said:?}");
         assert_eq!(
             understand(&parser, said, false),
@@ -107,12 +106,12 @@ fn the_wake_word_on_its_own_waits_for_the_request() {
     }
 }
 
-/// The troubleshooting guide's example of a false wake: the gate can wake on
-/// it, when its window starts at "groovy", but it is not a request.
+/// The troubleshooting guide's example of a false wake: no "play" after
+/// "groovy", so neither the gate nor the grammar takes it.
 #[test]
 fn the_documented_false_wake_is_not_a_request() {
     let said = "I mean the whole set was groovy, man.";
-    assert!(parser().wakes_on("groovy, man."));
+    assert!(!parser().wakes_on("groovy, man."));
     assert!(matches!(
         understand(&parser(), said, false),
         Understood::Nothing(_)

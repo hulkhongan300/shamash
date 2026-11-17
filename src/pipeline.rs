@@ -17,7 +17,7 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 pub enum Understood {
     /// A request to play something.
     Request(PlayRequest),
-    /// The wake word on its own: wait for the request.
+    /// "groovy play" on its own: wait for the request.
     WakeOnly,
     /// Not a command after all.
     Nothing(Option<ParseMiss>),
