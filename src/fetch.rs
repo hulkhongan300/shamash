@@ -469,6 +469,9 @@ async fn fetch_to_file(stream: &Streamable, dest: &Path) -> anyhow::Result<()> {
         .get(&stream.url)
         .headers(stream.headers.clone())
         .header(RANGE, whole_stream(stream.length))
+        // Covers the body too: a stalled transfer must fall back to yt-dlp, not
+        // hold up the request (or the background cache task) forever.
+        .timeout(DOWNLOAD_TIMEOUT)
         .send()
         .await
         .with_context(|| format!("could not GET {}", stream.url))?;
@@ -958,6 +961,38 @@ mod tests {
         .expect("resolve");
 
         assert_eq!(resolved, Source::File(cache), "the file is what plays");
+    }
+
+    /// A body that starts and then stops arriving must end in an error, so
+    /// `save` can fall back to yt-dlp instead of waiting forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_download_that_stalls_gives_up() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!(
+            "http://{}/videoplayback",
+            listener.local_addr().expect("addr")
+        );
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n")
+                .await;
+            std::future::pending::<()>().await;
+        });
+        let stream = Streamable {
+            url,
+            headers: HeaderMap::new(),
+            ext: "m4a".to_string(),
+            length: 1000,
+        };
+        let dest = std::env::temp_dir().join("shamash-body-stall-test.part");
+        let result =
+            tokio::time::timeout(DOWNLOAD_TIMEOUT * 2, fetch_to_file(&stream, &dest)).await;
+        assert!(matches!(result, Ok(Err(_))), "{result:?}");
     }
 
     /// A connection that is accepted and then goes quiet is the other failure,

@@ -1387,10 +1387,10 @@ impl Player {
             });
         }
 
-        let label = resolved
-            .as_track()
-            .map(|track| track.label())
-            .unwrap_or_default();
+        let Some(track) = resolved.as_track() else {
+            return Ok(Outcome::Unknown);
+        };
+        let label = track.label();
         let choice = search::find_video(
             &resolved,
             &request.query,
@@ -1420,16 +1420,24 @@ impl Player {
             return Ok(Outcome::Uploads(choice));
         }
 
+        let mut song = self
+            .fetch
+            .fetch(guild_id, &best.candidate, &queue.in_use(), timing)
+            .await
+            .map_err(|e| Failure::new(Problem::FetchFailed, e))?;
+        song.remembered = recalled.then(|| request.query.clone());
+
         // The request is being committed; record it for the learning that
-        // happens when the song finishes (or is skipped).
+        // happens when the song finishes (or is skipped). Recorded only once
+        // the fetch succeeded, so a failed one leaves nothing behind.
         self.pending.set(
             best.candidate.url.clone(),
             Pending {
                 said: request.query.clone(),
                 track: crate::library::Track {
-                    artist: resolved.as_track().unwrap().artist.clone(),
-                    title: resolved.as_track().unwrap().title.clone(),
-                    duration_secs: resolved.as_track().unwrap().duration_secs,
+                    artist: track.artist.clone(),
+                    title: track.title.clone(),
+                    duration_secs: track.duration_secs,
                     // The upload that was chosen, not the catalog's: it is the
                     // one that played, so a phrase heard again can go straight
                     // to it.
@@ -1437,15 +1445,15 @@ impl Player {
                 },
             },
         );
-        let mut song = self
-            .fetch
-            .fetch(guild_id, &best.candidate, &queue.in_use(), timing)
-            .await
-            .map_err(|e| Failure::new(Problem::FetchFailed, e))?;
-        song.remembered = recalled.then(|| request.query.clone());
-        Ok(self
+        let outcome = self
             .outcome(guild_id, &queue, song, started_at, timing)
-            .await)
+            .await;
+        if matches!(outcome, Outcome::Cancelled) {
+            // Never queued, so it never stops and is never judged; left in
+            // place it would judge a later play of the same video by these words.
+            self.pending.take(&best.candidate.url);
+        }
+        Ok(outcome)
     }
 
     /// Adds a downloaded song and reports what became of it.
