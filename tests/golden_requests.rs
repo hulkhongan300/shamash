@@ -577,11 +577,7 @@ fn golden() -> Vec<Case> {
 /// All are rescued downstream -- by the artist-only query, YouTube Music's
 /// spell-correcting search, the LLM rewrite, or by offering the user a choice --
 /// and none is played on a guess.
-const EXPECTED_REFUSALS: [(&str, &str); 5] = [
-    // "22" is two characters; the request said "twenty two". No string metric
-    // bridges a number and its words, and the catalog search will not find
-    // "22" from "twenty two" either.
-    ("twenty two by taylor swift", "the title is digits"),
+const EXPECTED_REFUSALS: [(&str, &str); 4] = [
     // The transcript said "jimi hendrix"; the catalog says "The Jimi Hendrix
     // Experience".
     (

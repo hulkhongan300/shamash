@@ -68,6 +68,56 @@ pub fn normalize(text: &str) -> String {
     noise_words(&kept).join(" ")
 }
 
+/// [`normalize`] with numbers spelled out, for scoring only: song memory keys
+/// are stored normalized, and changing those would forget saved picks.
+fn spoken(text: &str) -> String {
+    normalize(text)
+        .split(' ')
+        .map(|w| spelled(w).unwrap_or_else(|| w.to_string()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A number up to 99 written out, so the "seventeen" speech-to-text hears
+/// matches the "17" the catalog lists. Words rather than digits because the
+/// phonetic floor only reads letters: "won" must still find "One Dance".
+fn spelled(word: &str) -> Option<String> {
+    const ONES: [&str; 20] = [
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+    ];
+    const TENS: [&str; 10] = [
+        "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+    ];
+    if word.len() > 2 || !word.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: usize = word.parse().ok()?;
+    Some(match n {
+        0..20 => ONES[n].to_string(),
+        _ if n.is_multiple_of(10) => TENS[n / 10].to_string(),
+        _ => format!("{} {}", TENS[n / 10], ONES[n % 10]),
+    })
+}
+
 /// The words of a normalized string, with the release noise removed.
 fn noise_words(normalized: &str) -> Vec<&str> {
     normalized
@@ -105,7 +155,7 @@ fn noise_words(normalized: &str) -> Vec<&str> {
 fn is_filler(w: &str) -> bool {
     matches!(
         w,
-        "by" | "please" | "play" | "song" | "hey" | "ok" | "okay" | "some" | "something"
+        "by" | "from" | "please" | "play" | "song" | "hey" | "ok" | "okay" | "some" | "something"
     )
 }
 
@@ -180,11 +230,11 @@ pub struct Score {
 /// title nor the artist explains. That is what rejects "Lover" for "love story":
 /// one letter apart, but "story" is left over.
 pub fn score(transcript: &str, artist: &str, title: &str) -> Score {
-    let tokens: Vec<String> = normalize(transcript)
+    let tokens: Vec<String> = spoken(transcript)
         .split_whitespace()
         .map(String::from)
         .collect();
-    let (title, artist) = (normalize(title), normalize(artist));
+    let (title, artist) = (spoken(title), spoken(artist));
     let (ts, t0, tl) = best_window(&tokens, &title);
     let (a_s, a0, al) = best_window(&tokens, &artist);
 
