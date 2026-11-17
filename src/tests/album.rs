@@ -45,6 +45,22 @@ fn an_album_named_with_its_artist_is_found() {
     );
 }
 
+/// Speech-to-text writes the number out, the catalog writes the digits,
+/// and "from" is said as often as "by".
+#[test]
+fn a_spelled_out_number_and_from_still_find_the_album() {
+    let mut albums = xxxtentacion();
+    albums.push(album("XXXTENTACION", "SKINS", ReleaseKind::Album));
+    assert_eq!(
+        find("seventeen by xxxtentacion", &albums, false),
+        Found::One(album("XXXTENTACION", "17", ReleaseKind::Album))
+    );
+    assert_eq!(
+        find("skins from xxxtentacion", &albums, false),
+        Found::One(album("XXXTENTACION", "SKINS", ReleaseKind::Album))
+    );
+}
+
 /// The song "Look at Me!" shares most of its name with an album, which
 /// must not make the song request a question.
 #[test]
@@ -183,6 +199,8 @@ async fn live_requests_settle_the_way_they_should() {
     );
     for (said, expected) in [
         ("17 by xxxtentacion", "album"),
+        ("seventeen by xxxtentacion", "album"),
+        ("skins from xxxtentacion", "album"),
         ("currents by tame impala", "album"),
         ("blonde by frank ocean", "album"),
         ("thriller by michael jackson", "ask"),
