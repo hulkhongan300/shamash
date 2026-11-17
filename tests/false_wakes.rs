@@ -47,12 +47,14 @@ const CONVERSATION: &[&str] = &[
     // No wake word at all.
     "can we play some games later",
     "play it cool",
-    // Anything but the wake word straight before "play".
+    "Could you play that part again?",
+    "can you put on your headphones",
+    // The wake word, but no way to ask for a song after it.
     "Groovy, Dracula by Tame Impala",
-    "Hey groovy, could you play Bohemian Rhapsody?",
-    "Groovy please play Bohemian Rhapsody",
     "Shamash, play Dracula",
     "groovy late look at me",
+    "that's so groovy, can you believe it",
+    "I told groovy to put on something",
 ];
 
 /// Said to the bot. Each must wake the gate and be a request.
@@ -62,6 +64,12 @@ const REQUESTS: &[(&str, &str)] = &[
         "dracula by tame impala",
     ),
     ("okay so groovy, play Dracula", "dracula"),
+    (
+        "Hey groovy, could you play Bohemian Rhapsody?",
+        "bohemian rhapsody",
+    ),
+    ("Groovy please play Bohemian Rhapsody", "bohemian rhapsody"),
+    ("Groovy, put on Dracula", "dracula"),
 ];
 
 #[test]
@@ -95,7 +103,11 @@ fn a_request_to_the_bot_is_heard() {
 #[test]
 fn groovy_play_on_its_own_waits_for_the_request() {
     let parser = parser();
-    for said in ["Groovy, play.", "hey groovy play"] {
+    for said in [
+        "Groovy, play.",
+        "hey groovy play",
+        "Groovy, could you play?",
+    ] {
         assert!(parser.wakes_on(said), "the gate missed {said:?}");
         assert_eq!(
             understand(&parser, said, false),

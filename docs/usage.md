@@ -16,11 +16,18 @@ Say **"groovy play"** and the song:
   Impala"**. "Groovy play" on its own arms that speaker for 8 seconds, and
   their next utterance is taken as the request.
 
-"Play" has to come straight after "groovy". What people say to each other is
-left alone: "that's so groovy", "I told groovy to play something" and "this
-song has a great groove" do not wake it. The speech models rarely spell
-"groovy" right ("Roovy, play", "rove played"), so it is matched by how it
-sounds.
+You can also ask the way you would ask a person: **"Hey groovy, could you play
+Dracula?"**, **"Groovy, please put on Dracula"**, **"Groovy, throw on some
+Tame Impala"**. After "groovy" has to come "play", "put on" or "throw on",
+with at most "can you", "could you", "would you", "will you" and "please"
+before it. "Queue" does not work: the speech models run it into the next word.
+
+What people say to each other is left alone: "that's so groovy", "I told groovy
+to play something" and "this song has a great groove" do not wake it. The
+speech models rarely spell "groovy" right ("Roovy, play", "rove played"), so it
+is matched by how it sounds. That has a cost: a name that sounds like it, as in
+"Harvey, would you play the next round?", is taken as a request. If someone in
+the channel has such a name, [choose another wake word](configuration.md#choosing-wake-words).
 
 ### Albums
 

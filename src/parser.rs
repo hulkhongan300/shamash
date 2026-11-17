@@ -13,11 +13,31 @@ pub struct PlayRequest {
     pub splits: Vec<(String, String)>,
 }
 
-/// The command word that must come straight after the wake word.
+/// The verb a rewriter or an armed speaker may repeat before the request.
 const PLAY_VERB: &str = "play";
 
-/// How the speech models write the "play" after the wake word.
-const PLAY_FORMS: &[&str] = &["play", "played"];
+/// Polite openers allowed between the wake word and the verb: "groovy, could you play".
+const ASKS: &[&[&str]] = &[
+    &["can", "you"],
+    &["could", "you"],
+    &["would", "you"],
+    &["will", "you"],
+];
+
+/// Verbs that ask for a song after the wake word; the models often write "play" as "played".
+///
+/// Not "queue": the wake model runs it into the next word ("cubohemian rhapsody").
+const VERBS: &[&[&str]] = &[&["play"], &["played"], &["put", "on"], &["throw", "on"]];
+
+/// What follows "[could you] [please] <verb>" at the start of `words`, if a verb is there.
+fn after_verb<'a>(words: &'a [&'a str]) -> Option<&'a [&'a str]> {
+    let words = ASKS
+        .iter()
+        .find_map(|ask| words.strip_prefix(*ask))
+        .unwrap_or(words);
+    let words = words.strip_prefix(&["please"]).unwrap_or(words);
+    VERBS.iter().find_map(|verb| words.strip_prefix(*verb))
+}
 
 /// Whether `heard` could be a speech model's spelling of the wake word `wake`.
 ///
@@ -106,7 +126,7 @@ impl std::fmt::Display for ParseMiss {
     }
 }
 
-/// Turns transcripts into [`PlayRequest`]s: "<wake word> play <request>", nothing else.
+/// Turns transcripts into [`PlayRequest`]s: "<wake word> [could you] [please] play <request>".
 #[derive(Debug, Clone)]
 pub struct CommandParser {
     wake_words: HashSet<String>,
@@ -132,19 +152,21 @@ impl CommandParser {
         self.wake_words.contains(word)
     }
 
-    /// Whether `words[at]` sounds like a wake word with "play" straight after it.
+    /// Where the request starts, when `words[at]` sounds like a wake word and a
+    /// verb follows it, perhaps asked politely: "groovy, could you please play".
     ///
     /// By sound, not spelling: spelled exactly, four in five requests were missed
     /// in tests with 40 voices, as both models drop or swap the "g" ("ruby
     /// played", "Roovy, play").
-    fn starts_command(&self, words: &[&str], at: usize, b_is_v: bool) -> bool {
-        words
-            .get(at + 1)
-            .is_some_and(|next| PLAY_FORMS.contains(next))
-            && self
-                .wake_words
-                .iter()
-                .any(|wake| sounds_like(words[at], wake, b_is_v))
+    fn request_start(&self, words: &[&str], at: usize, b_is_v: bool) -> Option<usize> {
+        if !self
+            .wake_words
+            .iter()
+            .any(|wake| sounds_like(words[at], wake, b_is_v))
+        {
+            return None;
+        }
+        after_verb(&words[at + 1..]).map(|request| words.len() - request.len())
     }
 
     /// The request in "<wake word> play <request>", or `None`.
@@ -171,25 +193,26 @@ impl CommandParser {
         build_request(&words.join(" ")).map(|request| request.query)
     }
 
-    /// Whether the wake model's window holds "<wake word> play".
+    /// Whether the wake model's window holds "<wake word> play", or another way to ask.
     pub fn wakes_on(&self, window: &str) -> bool {
         let text = normalize(window);
         let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
-        (0..words.len()).any(|at| self.starts_command(&words, at, true))
+        (0..words.len()).any(|at| self.request_start(&words, at, true).is_some())
     }
 
-    /// The words after the first "<wake word> play" are the request.
+    /// The words after the first "<wake word> play", or another way to ask, are the request.
     pub fn command(&self, transcript: &str) -> Result<PlayRequest, ParseMiss> {
         let text = normalize(transcript);
         let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
-        let Some(at) = (0..words.len()).find(|&at| self.starts_command(&words, at, false)) else {
+        let Some(start) = (0..words.len()).find_map(|at| self.request_start(&words, at, false))
+        else {
             return Err(if words.iter().any(|w| self.is_wake_word(w)) {
                 ParseMiss::NoPlayVerb
             } else {
                 ParseMiss::NoWakeWord
             });
         };
-        build_request(&words[at + 2..].join(" ")).ok_or(ParseMiss::EmptyRequest)
+        build_request(&words[start..].join(" ")).ok_or(ParseMiss::EmptyRequest)
     }
 
     /// The request after "groovy play" and a pause; a repeated wake word or "play" is dropped.
