@@ -146,6 +146,11 @@ impl EventHandler for Handler {
         tracing::info!(user = %ready.user.name, "Shamash is online");
         // No global registration: per-guild in `guild_create` is instant, and both would show twice.
 
+        // A full reconnect fires READY again; a new Player would orphan the one that is playing.
+        if ctx.data.read().await.contains_key::<PlayerKey>() {
+            return;
+        }
+
         // One player shared by voice and dashboard; built here, where songbird is first reachable.
         let manager = match songbird::get(&ctx).await {
             Some(manager) => manager,
@@ -586,6 +591,11 @@ impl Handler {
                 match VoiceService::from_ctx(ctx).await {
                     Ok(service) => {
                         let was_connected = service.manager.get(guild_id).is_some();
+                        // Clear the queue too, or the old song stays "current" and the next request waits behind it.
+                        if let Some(player) = ctx.data.read().await.get::<PlayerKey>().cloned() {
+                            player.release_duck(guild_id);
+                            player.stop(ctx, &service.config, guild_id).await;
+                        }
                         match service.stop(guild_id).await {
                             Ok(()) if was_connected => "Left the voice channel.".to_string(),
                             Ok(()) => "I wasn't in a voice channel.".to_string(),

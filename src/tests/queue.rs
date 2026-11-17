@@ -445,3 +445,23 @@ fn a_moved_song_keeps_its_id() {
     assert_eq!(titles(&queue), ["c", "a", "b"]);
     assert_eq!(id_of(&queue, "c"), c);
 }
+
+/// A song that cannot start must leave "current", or the dashboard shows it
+/// playing in silence and every later request queues behind it forever.
+#[test]
+fn a_song_that_fails_to_start_is_skipped_and_not_repeated() {
+    let queue = Queue::default();
+    assert!(queue.toggle_repeat(), "even with repeat on");
+    assert!(queue.push(song("dead")));
+    let dead = queue.advance();
+
+    let after = queue.skip_failed(dead.generation).expect("skip");
+    assert!(after.current.is_none(), "the dead song does not come back");
+    assert!(queue.is_idle(), "so the next request starts at once");
+    assert!(queue.push(song("next")));
+    assert_eq!(queue.advance().current.expect("next").title, "next");
+    assert!(
+        queue.skip_failed(after.generation).is_none(),
+        "a stale skip does not drop the song now playing"
+    );
+}

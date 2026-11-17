@@ -1462,21 +1462,16 @@ impl Player {
         guild_id: GuildId,
         timing: &Timing,
     ) {
-        let advanced = self.queues.get(guild_id).advance();
+        let queue = self.queues.get(guild_id);
+        let advanced = queue.advance();
         // Here rather than on a track event: covers skips and natural ends alike.
         self.learn_from_stopped(guild_id, advanced.stopped.as_ref());
         if advanced.current.is_some() {
             self.started_at.set(guild_id, std::time::Instant::now());
         }
-        if let Some(handle) = start_track(
-            &self.manager,
-            guild_id,
-            &self.queues.get(guild_id),
-            &advanced,
-            timing,
-        )
-        .await
-        {
+        let (handle, advanced, skipped) =
+            start_playable(&self.manager, guild_id, &queue, advanced, timing).await;
+        if let Some(handle) = handle {
             if self.ducks.is_ducked(guild_id) {
                 let _ = handle.set_volume(DUCK_VOLUME);
             }
@@ -1484,6 +1479,13 @@ impl Player {
             self.follow_when_finished(ctx, config, guild_id, handle, advanced.generation);
         }
         self.draw_dashboard(ctx, config, guild_id).await;
+        for title in &skipped {
+            let failure = Failure::new(
+                Problem::FetchFailed,
+                anyhow::anyhow!("'{title}' could not start, so it was skipped"),
+            );
+            self.report(ctx, config, guild_id, title, &failure).await;
+        }
     }
 
     /// Lets a stopped song count against a remembered phrase (skipped within
@@ -1565,18 +1567,18 @@ impl Player {
                 else {
                     return;
                 };
-                // Track the new generation, or the next song looks superseded and the queue stops.
-                generation = advanced.generation;
-
-                match start_track(
+                let (handle, advanced, _skipped) = start_playable(
                     &this.manager,
                     guild_id,
                     &this.queues.get(guild_id),
-                    &advanced,
+                    advanced,
                     &Timing::default(),
                 )
-                .await
-                {
+                .await;
+                // Track the new generation, or the next song looks superseded and the queue stops.
+                generation = advanced.generation;
+
+                match handle {
                     Some(handle) => {
                         this.tracks.set(guild_id, handle.clone());
                         // Watch the new song so the queue keeps moving.
@@ -2277,6 +2279,32 @@ impl EventHandler for Ended {
     }
 }
 
+/// [`start_track`], moving past songs that cannot start, so a dead one never
+/// stays "current" with nothing playing and every later request queued behind it.
+/// Returns the handle, the advance that ended up playing, and the titles skipped.
+async fn start_playable(
+    manager: &Songbird,
+    guild_id: GuildId,
+    queue: &Queue,
+    mut advanced: Advanced,
+    timing: &Timing,
+) -> (Option<TrackHandle>, Advanced, Vec<String>) {
+    let mut skipped = Vec::new();
+    loop {
+        if let Some(handle) = start_track(manager, guild_id, queue, &advanced, timing).await {
+            return (Some(handle), advanced, skipped);
+        }
+        let Some(failed) = advanced.current.as_ref() else {
+            return (None, advanced, skipped);
+        };
+        skipped.push(failed.title.clone());
+        match queue.skip_failed(advanced.generation) {
+            Some(next) => advanced = next,
+            None => return (None, advanced, skipped),
+        }
+    }
+}
+
 /// Stops the playing song and starts the next, caching its audio as it plays.
 ///
 /// Returns `None` when the queue is dry, the bot left, or the fetch failed. The old
@@ -2290,9 +2318,9 @@ async fn start_track(
 ) -> Option<TrackHandle> {
     let started = std::time::Instant::now();
     let call = manager.get(guild_id)?;
-    let song = advanced.current.as_ref()?;
     // Stop first: resolving the next source may mean a download.
     call.lock().await.stop();
+    let song = advanced.current.as_ref()?;
 
     let in_use = queue.in_use();
     let source = match fetch::resolve(&song.source, &song.url, &in_use, timing).await {

@@ -196,6 +196,24 @@ impl Queue {
         })
     }
 
+    /// Moves past a song that could not start, never repeating it, so a dead
+    /// song can't stay "current" and wedge the queue; `None` if something else advanced first.
+    pub fn skip_failed(&self, generation: u64) -> Option<Advanced> {
+        let mut state = self.lock();
+        if state.generation != generation {
+            return None;
+        }
+        let stopped = state.current.take();
+        state.take_next();
+        state.paused = false;
+        state.generation = state.generation.wrapping_add(1);
+        Some(Advanced {
+            stopped,
+            current: state.current.clone(),
+            generation: state.generation,
+        })
+    }
+
     /// Whether a song that ends with nothing behind it plays again.
     pub fn is_repeat(&self) -> bool {
         self.lock().repeat
