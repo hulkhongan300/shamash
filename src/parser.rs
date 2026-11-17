@@ -16,6 +16,48 @@ pub struct PlayRequest {
 /// The command word that must come straight after the wake word.
 const PLAY_VERB: &str = "play";
 
+/// How the speech models write the "play" after the wake word.
+const PLAY_FORMS: &[&str] = &["play", "played"];
+
+/// Whether `heard` could be a speech model's spelling of the wake word `wake`.
+///
+/// They lose vowels and the first consonant ("rove", "Roovy" for "groovy") but
+/// keep the rest, so the consonants are compared: all the same, or the same but
+/// for the first. The word must also end alike, in a vowel or not, which keeps
+/// "rob played" out. Under three consonants it must be exact, or "bot" would
+/// wake on "but". `b_is_v` is for the wake model, which writes "ruby" for
+/// "groovy"; from the request model, "Ruby" is somebody's name.
+fn sounds_like(heard: &str, wake: &str, b_is_v: bool) -> bool {
+    if heard == wake {
+        return true;
+    }
+    let ends_in_vowel = |word: &str| word.ends_with(['a', 'e', 'i', 'o', 'u', 'y', 'w']);
+    let (h, w) = (consonants(heard, b_is_v), consonants(wake, b_is_v));
+    w.len() >= 3
+        && ends_in_vowel(heard) == ends_in_vowel(wake)
+        && (h == w || h[..] == w[1..] || (h.len() == w.len() && h[1..] == w[1..]))
+}
+
+/// A word's consonants, with letters that sound alike merged and repeats dropped.
+fn consonants(word: &str, b_is_v: bool) -> Vec<char> {
+    let mut out: Vec<char> = Vec::new();
+    for c in word.chars() {
+        let c = match c {
+            'b' | 'p' if !b_is_v => 'b',
+            'b' | 'f' | 'p' | 'v' => 'v',
+            'c' | 'g' | 'j' | 'k' | 'q' => 'g',
+            'd' | 't' => 't',
+            's' | 'x' | 'z' => 's',
+            'l' | 'm' | 'n' | 'r' => c,
+            _ => continue,
+        };
+        if out.last() != Some(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Spoken asides Whisper appends after the request ("look at me. come on").
 const TRAILING_ASIDES: &[&str] = &["come on"];
 
@@ -90,9 +132,19 @@ impl CommandParser {
         self.wake_words.contains(word)
     }
 
-    /// Whether `words[at]` is a wake word with "play" straight after it.
-    fn starts_command(&self, words: &[&str], at: usize) -> bool {
-        self.is_wake_word(words[at]) && words.get(at + 1) == Some(&PLAY_VERB)
+    /// Whether `words[at]` sounds like a wake word with "play" straight after it.
+    ///
+    /// By sound, not spelling: spelled exactly, four in five requests were missed
+    /// in tests with 40 voices, as both models drop or swap the "g" ("ruby
+    /// played", "Roovy, play").
+    fn starts_command(&self, words: &[&str], at: usize, b_is_v: bool) -> bool {
+        words
+            .get(at + 1)
+            .is_some_and(|next| PLAY_FORMS.contains(next))
+            && self
+                .wake_words
+                .iter()
+                .any(|wake| sounds_like(words[at], wake, b_is_v))
     }
 
     /// The request in "<wake word> play <request>", or `None`.
@@ -123,14 +175,14 @@ impl CommandParser {
     pub fn wakes_on(&self, window: &str) -> bool {
         let text = normalize(window);
         let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
-        (0..words.len()).any(|at| self.starts_command(&words, at))
+        (0..words.len()).any(|at| self.starts_command(&words, at, true))
     }
 
     /// The words after the first "<wake word> play" are the request.
     pub fn command(&self, transcript: &str) -> Result<PlayRequest, ParseMiss> {
         let text = normalize(transcript);
         let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
-        let Some(at) = (0..words.len()).find(|&at| self.starts_command(&words, at)) else {
+        let Some(at) = (0..words.len()).find(|&at| self.starts_command(&words, at, false)) else {
             return Err(if words.iter().any(|w| self.is_wake_word(w)) {
                 ParseMiss::NoPlayVerb
             } else {

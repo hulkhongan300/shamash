@@ -52,7 +52,6 @@ const CONVERSATION: &[&str] = &[
     "Hey groovy, could you play Bohemian Rhapsody?",
     "Groovy please play Bohemian Rhapsody",
     "Shamash, play Dracula",
-    "Groove play Dracula",
     "groovy late look at me",
 ];
 

@@ -53,8 +53,10 @@ While someone talks, the small wake model checks the last two seconds every
 model when the speaker stops, so the request is transcribed in one piece, wake
 word included.
 
-Only the wake word with "play" straight after it counts, both heard exactly,
-so "that's so groovy" plays no tone and leaves the music alone.
+Only the wake word with "play" straight after it counts, so "that's so groovy"
+plays no tone and leaves the music alone. Both models are checked by sound, not
+spelling: the small one spells "groovy play" wrong more often than right ("ruby
+play", "rove played"). See [Choosing wake words](configuration.md#choosing-wake-words).
 
 ## Resolving the request
 

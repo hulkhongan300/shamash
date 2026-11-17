@@ -101,11 +101,18 @@ from ordinary speech. `bot` used to be a default. The small model often wrote
 it as "but", so it had to answer to "but" too, and then every sentence that
 opened with "but" was a song request.
 
-A command is a wake word with "play" straight after it, both heard exactly:
-"groovy play Dracula". Nothing else wakes the bot: not "groovy" on its own, not
-"hey groovy, Dracula", not "groovy please play", not "groove play" or "groovy
-late". So "that's so groovy" is left alone, and so is "play" without the wake
-word in front of it.
+A command is a wake word with "play" straight after it: "groovy play Dracula".
+Nothing else wakes the bot: not "groovy" on its own, not "hey groovy, Dracula",
+not "groovy please play", not "groovy late". So "that's so groovy" is left
+alone, and so is "play" without the wake word in front of it.
+
+The wake word is matched by sound, not spelling, because the speech models
+rarely spell it right: "groovy play" comes back as "ruby play", "rove played"
+or "Roovy, play". A word counts when it has the wake word's consonants (or all
+but the first) and ends the same way, in a vowel or not. The wake model's "b"
+also counts as "v", since it writes "ruby" for "groovy"; the request model's
+does not, so "Ruby, play your card" plays no song. A wake word with fewer than
+three consonants, such as `bot`, must be heard exactly.
 
 ## The rewrite stage
 

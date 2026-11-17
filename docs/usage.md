@@ -7,24 +7,20 @@ when it is not sure which song you meant.
 
 ## Saying it
 
-Any of these work:
+Say **"groovy play"** and the song:
 
 - **"Groovy, play Dracula by Tame Impala"**, in one breath. The request model
   is given the whole sentence, so nothing said along with the wake word is
   lost.
-- **"Groovy, Dracula by Tame Impala"**. "Play" is optional when the wake word
-  starts the sentence, after at most a greeting ("hey groovy, …").
-- **"…so groovy, play Dracula"**. Anywhere else in a sentence, "play" has to
-  come straight after the wake word.
-- **"Groovy."**, then wait for the second tone and say **"Dracula by Tame
-  Impala"**. A wake word on its own arms that speaker for 8 seconds, and their
-  next utterance is taken as the request.
+- **"Groovy, play"**, then wait for the second tone and say **"Dracula by Tame
+  Impala"**. "Groovy play" on its own arms that speaker for 8 seconds, and
+  their next utterance is taken as the request.
 
-What people say to each other is left alone. "That's so groovy", "I told
-groovy to play something" and "this song has a great groove" do not wake it.
-A wake word misheard by a letter ("shemash" for "shamash") is only taken with
-"play" straight after it, because one letter off is also how ordinary words
-look ("groove" for "groovy").
+"Play" has to come straight after "groovy". What people say to each other is
+left alone: "that's so groovy", "I told groovy to play something" and "this
+song has a great groove" do not wake it. The speech models rarely spell
+"groovy" right ("Roovy, play", "rove played"), so it is matched by how it
+sounds.
 
 ### Albums
 
@@ -56,8 +52,7 @@ The bot answers with tones:
 | 988 Hz | Only the wake word was heard. Say the request now |
 | 440 Hz | It could not find or play the song. A message in the text channel says what it heard |
 
-The wake words are `groovy` and `shamash` by default. Set `WAKE_WORDS` to change
-them.
+The wake word is `groovy` by default. Set `WAKE_WORDS` to change it.
 
 ## Slash commands
 

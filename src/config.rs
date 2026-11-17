@@ -1,7 +1,7 @@
 use anyhow::Context as _;
 use std::collections::HashSet;
 
-/// Wake words used when `WAKE_WORDS` is unset; a command is "groovy play <request>", both words exact.
+/// Wake words used when `WAKE_WORDS` is unset; a command is "groovy play <request>".
 pub const DEFAULT_WAKE_WORDS: &[&str] = &["groovy"];
 
 /// Identifies the bot to the services it calls.
