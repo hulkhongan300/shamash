@@ -40,3 +40,16 @@ fn a_language_the_model_does_not_know_is_refused_up_front() {
 fn a_model_that_advertises_nothing_accepts_anything() {
     assert!(language_is_known("anything", &[]));
 }
+
+/// `en,pt` gives Whisper both, and the English-only wake model just `en`.
+#[test]
+fn each_model_keeps_the_listed_languages_it_knows() {
+    let english_only = vec!["en".to_string()];
+    assert_eq!(
+        usable_languages("en, pt", &whisper_languages()),
+        ["en", "pt"]
+    );
+    assert_eq!(usable_languages("en,pt", &english_only), ["en"]);
+    assert!(usable_languages("pt", &english_only).is_empty());
+    assert!(usable_languages("", &whisper_languages()).is_empty());
+}

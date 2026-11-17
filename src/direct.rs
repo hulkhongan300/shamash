@@ -14,8 +14,10 @@ use transcribe_cpp::{Feature, Model, RunExtension, RunOptions, Session, WhisperR
 pub struct DirectTranscriber {
     /// Mutex makes this `Sync` (required by `Box<dyn Transcriber>`); one run per model.
     session: Mutex<Session>,
-    /// Language hint; Canary and Nemotron return empty text without one.
-    language: Option<String>,
+    /// `ASR_LANGUAGE` codes this model knows; Canary and Nemotron return empty text without one.
+    languages: Vec<String>,
+    /// Several languages on a model that detects: detect, then re-run if it picked another.
+    detect: bool,
     /// Whisper decoding prompt; biases it to spell song and artist names as names.
     prompt: Option<String>,
     /// Kept for the startup log line.
@@ -41,16 +43,21 @@ impl DirectTranscriber {
             .map_err(|e| anyhow::anyhow!("failed to load ASR model {}: {e}", path.display()))?;
 
         // The engine only rejects a bad language at run time; catch it at startup. ISO-639-1 codes.
-        if let Some(language) = language {
-            let supported = loaded.capabilities().languages;
-            if !language_is_known(language, &supported) {
-                anyhow::bail!(
-                    "ASR_LANGUAGE={language} is not a language this model knows; \
-                     expected an ISO-639-1 code such as {}",
-                    supported.first().map(String::as_str).unwrap_or("en")
-                );
-            }
+        let capabilities = loaded.capabilities();
+        let languages = usable_languages(language.unwrap_or(""), &capabilities.languages);
+        if let (Some(language), true) = (language, languages.is_empty()) {
+            anyhow::bail!(
+                "ASR_LANGUAGE={language} has no language this model knows; \
+                 expected ISO-639-1 codes such as {}",
+                capabilities
+                    .languages
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("en")
+            );
         }
+        let detect = languages.len() > 1 && capabilities.supports_language_detect;
+        tracing::info!(model = %path.display(), languages = ?languages, detect, "ASR languages");
 
         // The device the model actually bound to, so a silent CPU fallback shows up.
         let device = loaded
@@ -75,7 +82,8 @@ impl DirectTranscriber {
 
         Ok(Self {
             session: Mutex::new(session),
-            language: language.map(str::to_string),
+            languages,
+            detect,
             prompt,
             model_id: model.to_string(),
         })
@@ -97,8 +105,10 @@ impl Transcriber for DirectTranscriber {
             return Ok(String::new());
         }
 
-        let options = RunOptions {
-            language: self.language.clone(),
+        // Detecting: no hint. Otherwise the first code, or none when ASR_LANGUAGE is unset.
+        let first = self.languages.first().cloned();
+        let options = |language| RunOptions {
+            language,
             family: self.prompt.as_ref().map(|prompt| {
                 RunExtension::Whisper(WhisperRunOptions {
                     initial_prompt: Some(prompt.clone()),
@@ -110,7 +120,15 @@ impl Transcriber for DirectTranscriber {
 
         // Poisoned by an earlier panic; the session is still valid.
         let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
-        let transcript = session.run(samples, &options)?;
+        let mut transcript =
+            session.run(samples, &options(first.clone().filter(|_| !self.detect)))?;
+        if self.detect
+            && let Some(detected) = &transcript.language
+            && !self.languages.contains(detected)
+        {
+            tracing::debug!(%detected, "detected a language outside ASR_LANGUAGE; re-running");
+            transcript = session.run(samples, &options(first))?;
+        }
 
         tracing::debug!(
             text = %transcript.text,
@@ -128,6 +146,26 @@ impl Transcriber for DirectTranscriber {
 /// True when `path` looks like something [`DirectTranscriber::new`] can open.
 pub fn model_exists(spec: &str) -> bool {
     Path::new(spec).is_file() || model::resolve(spec).is_ok()
+}
+
+/// The comma-separated `ASR_LANGUAGE` codes this model knows, so an English-only wake model drops `pt`.
+fn usable_languages(listed: &str, supported: &[String]) -> Vec<String> {
+    listed
+        .split(',')
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .filter(|code| {
+            let known = language_is_known(code, supported);
+            if !known {
+                tracing::warn!(
+                    code,
+                    "ASR_LANGUAGE code this model does not know; skipping it"
+                );
+            }
+            known
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 /// Checks a language hint against what a model advertises; split out to test without a GGUF.
