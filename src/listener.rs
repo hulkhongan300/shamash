@@ -1,9 +1,5 @@
-//! Receiving voice from Discord.
-//!
-//! Every speaker arrives as their own stream (an RTP SSRC), and they are kept
-//! apart rather than mixed: a model given two people talking at once, or one
-//! person and someone else's music bleeding into their microphone, hears
-//! neither of them well. [`crate::wake`] runs one gate per stream.
+//! Receiving voice from Discord, one stream (SSRC) per speaker, never mixed:
+//! the model hears overlapping voices badly.
 
 use crate::audio::rms;
 use crate::wake::{Ssrc, Tick};
@@ -16,18 +12,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// Sample rate (Hz) of the mono audio songbird is configured to decode to.
+/// Mono sample rate songbird decodes to.
 pub const LISTEN_SAMPLE_RATE: u32 = 16_000;
-/// Samples per 20 ms frame at [`LISTEN_SAMPLE_RATE`]: one Discord packet.
+/// One 20 ms Discord packet.
 pub const FRAME_SAMPLES: usize = 320;
 
-/// A frame RMS below which the diagnostic report calls audio too quiet to be
-/// ordinary speech: -40 dBFS. Only a hint for `VOICE_DIAG`; the voice detector
-/// does not use a level at all.
+/// -40 dBFS; only a `VOICE_DIAG` hint, the voice detector ignores level.
 pub const QUIET_SPEECH_RMS: f32 = 0.01;
 
-/// Which Discord user each voice stream belongs to, learnt from songbird's
-/// speaking-state events. Used to say who asked.
+/// SSRC to Discord user, from speaking-state events.
 #[derive(Debug, Clone, Default)]
 pub struct Speakers(Arc<Mutex<HashMap<Ssrc, UserId>>>);
 
@@ -45,7 +38,6 @@ impl Speakers {
     }
 }
 
-/// Records which user owns which voice stream.
 pub struct SpeakingHandler(pub Speakers);
 
 #[async_trait]
@@ -62,16 +54,13 @@ impl EventHandler for SpeakingHandler {
     }
 }
 
-/// Converts one speaker's decoded i16 frame to f32 in [-1, 1].
+/// i16 PCM to f32 in [-1, 1].
 pub fn to_f32(frame: &[i16]) -> Vec<f32> {
     frame.iter().map(|s| f32::from(*s) / 32768.0).collect()
 }
 
-/// Splits one songbird tick into each speaker's audio.
-///
-/// A speaker the call knows about who sent nothing this tick gets a frame of
-/// silence. Discord only sends audio while somebody transmits, so silence
-/// never arrives on its own, and without it an utterance could never end.
+/// Splits a tick per speaker; silent speakers get zeros, since Discord never
+/// sends silence and an utterance could otherwise never end.
 pub fn split_tick<'a>(
     speaking: impl IntoIterator<Item = (Ssrc, Option<&'a [i16]>)>,
     silent: impl IntoIterator<Item = Ssrc>,
@@ -91,7 +80,7 @@ pub fn split_tick<'a>(
     tick
 }
 
-/// Songbird event handler forwarding each tick's per-speaker audio.
+/// Forwards each tick's per-speaker audio.
 #[derive(Debug)]
 pub struct VoiceTickHandler {
     tx: UnboundedSender<Tick>,
@@ -139,7 +128,6 @@ impl VoiceTickHandler {
     }
 }
 
-/// How often [`TickDiag::report`] emits a line.
 const DIAG_INTERVAL: Duration = Duration::from_secs(5);
 
 impl TickDiag {
@@ -154,15 +142,13 @@ impl TickDiag {
         }
     }
 
-    /// Whether this is the first tick seen, so the arrival can be announced.
     fn announce_first_tick(&mut self) -> bool {
         let first = !self.announced;
         self.announced = true;
         first
     }
 
-    /// Folds one tick into the counters. `voiced` is how many of its speakers
-    /// actually sent audio, rather than being given silence.
+    /// `voiced`: speakers that sent real audio, not padded silence.
     fn observe(&mut self, tick: &Tick, voiced: usize) {
         self.ticks += 1;
         self.frames += voiced as u64;
@@ -172,10 +158,8 @@ impl TickDiag {
         }
     }
 
-    /// Returns a report once `interval` has passed, and resets the counters.
-    ///
-    /// Driven by ticks rather than audio, so a bot that receives nothing can be
-    /// told apart from one that receives silence.
+    /// Reports and resets once `interval` passed; tick-driven so "nothing
+    /// received" differs from "silence received".
     fn report(&mut self, now: Instant, interval: Duration) -> Option<String> {
         let elapsed = now.saturating_duration_since(self.since);
         if elapsed < interval {
@@ -214,7 +198,6 @@ impl TickDiag {
     }
 }
 
-/// Full-scale decibel level of a linear amplitude.
 pub fn to_dbfs(amplitude: f32) -> f32 {
     20.0 * amplitude.max(1e-9).log10()
 }
@@ -239,13 +222,8 @@ impl EventHandler for VoiceTickHandler {
                 let _ = self.tx.send(split);
             }
         }
-        // Must stay `None`. Returning the same event type we were invoked with
-        // looks like a no-op but deletes the handler: songbird removes it from
-        // the list it is iterating, re-adds it to the store it just emptied,
-        // and then overwrites that store with the list minus the handler. The
-        // bot then receives exactly one tick and is deaf from then on, with no
-        // error anywhere. See `EventStore::process_untimed` in songbird, and
-        // the `EventHandler::act` contract: `None` maintains the event type.
+        // Must stay `None`: returning the event silently unregisters the
+        // handler (songbird `EventStore::process_untimed`), deafening the bot.
         None
     }
 }

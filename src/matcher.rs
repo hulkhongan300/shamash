@@ -1,37 +1,12 @@
-//! Offline matching of a spoken request against catalog hits.
+//! Offline matching of a spoken request against catalog hits (pure, no network).
 //!
-//! Pure functions, no network: everything here is unit-testable with
-//! hand-written hits, and the whole point of the module is that deciding which
-//! song was asked for is a *decision*, not a side effect of which provider
-//! answered.
-//!
-//! The two ideas that do the work:
-//!
-//! - **A window, not a whole string.** The request "drakula tame impala" names
-//!   the artist after the title, "tame impala drakula" names it before, and
-//!   "hoolig by bts" has a filler word in the middle. Comparing the request to
-//!   a title as one string scores all three badly. So the title is scored
-//!   against the best *window* of the spoken words, and separately against the
-//!   artist's.
-//! - **Leftover words count against a match.** "Lover" and "Love Story" are one
-//!   letter apart, and a whole-string similarity cannot tell them apart. But the
-//!   request said "story" and nothing in "Lover" explains it, so the score has to
-//!   fall. This is what separates the two, and it is why the title — not the
-//!   artist — has to clear a gate on its own.
-//!
-//! Phonetic matching is the third tool: "billy eyelash" has to reach Billie
-//! Eilish. Double Metaphone is built for English names and does nothing useful
-//! on Korean titles, so the edit-distance path still carries those.
+//! Titles score against the best *window* of spoken words (artist order varies),
+//! and words the hit leaves unexplained lower the score ("Lover" vs "love story").
 
 use rphonetic::{DoubleMetaphone, Encoder};
 use strsim::{jaro_winkler, normalized_damerau_levenshtein as ndl};
 
-/// A title must explain the request at least this well to be considered at all.
-///
-/// A gate on the title alone, deliberately. The old scorer let the artist be a
-/// free pass: 0.7 title + 0.3 artist meant "right artist, wrong title" cleared
-/// the bar, which is how "sweet disposition by temper trap" came to answer
-/// with *Science of Fear*.
+/// Minimum title score on its own, so the right artist can't carry a wrong title.
 pub const TITLE_GATE: f32 = 0.65;
 /// Combined (0.8 title + 0.2 artist) score needed to play without asking.
 pub const ACCEPT: f32 = 0.72;
@@ -40,15 +15,10 @@ pub const MARGIN: f32 = 0.10;
 /// Same title by another artist within this gap of the winner => ask which artist.
 pub const ARTIST_GAP: f32 = 0.06;
 
-/// Lowercase, drop decorations, drop release-noise words.
+/// Lowercase, drop decorations and release-noise words.
 ///
-/// A bracketed span *after* the title has started is a decoration -- a feature
-/// credit, a remaster year, a "Part 2" marker -- and is dropped. A bracket that
-/// *opens* the string is not: catalogs write "(I Can't Get No) Satisfaction" and
-/// "(How Does It Feel) Pios Bolly", and treating the prefix as an aside would
-/// reduce the first to the bare word "satisfaction", which matches every song
-/// called anything. Dropping it is not the conservative choice here; it is the
-/// one that loses the title.
+/// Brackets after the title starts are dropped; a leading one is kept, as in
+/// "(I Can't Get No) Satisfaction".
 pub fn normalize(text: &str) -> String {
     let mut kept = String::with_capacity(text.len());
     let mut started = false;
@@ -68,8 +38,7 @@ pub fn normalize(text: &str) -> String {
     noise_words(&kept).join(" ")
 }
 
-/// [`normalize`] with numbers spelled out, for scoring only: song memory keys
-/// are stored normalized, and changing those would forget saved picks.
+/// [`normalize`] with numbers spelled out; scoring only, since memory keys stay normalized.
 fn spoken(text: &str) -> String {
     normalize(text)
         .split(' ')
@@ -78,9 +47,7 @@ fn spoken(text: &str) -> String {
         .join(" ")
 }
 
-/// A number up to 99 written out, so the "seventeen" speech-to-text hears
-/// matches the "17" the catalog lists. Words rather than digits because the
-/// phonetic floor only reads letters: "won" must still find "One Dance".
+/// A number up to 99 in words, since the phonetic floor only reads letters ("won" finds "One Dance").
 fn spelled(word: &str) -> Option<String> {
     const ONES: [&str; 20] = [
         "zero",
@@ -118,7 +85,6 @@ fn spelled(word: &str) -> Option<String> {
     })
 }
 
-/// The words of a normalized string, with the release noise removed.
 fn noise_words(normalized: &str) -> Vec<&str> {
     normalized
         .split_whitespace()
@@ -145,13 +111,7 @@ fn noise_words(normalized: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Words that carry no identity in a spoken request.
-///
-/// These are excluded from the "unexplained" count, so a request padded with
-/// them is not penalised for a title that does not mention them. "play" is in
-/// the list because the parser normally strips it, but a paused command arrives
-/// as the trailing fragment alone and can still carry one, and counting it left
-/// every content word in "please play hello" unexplained.
+/// Words excluded from the "unexplained" count. "play" survives the parser in paused commands.
 fn is_filler(w: &str) -> bool {
     matches!(
         w,
@@ -159,15 +119,7 @@ fn is_filler(w: &str) -> bool {
     )
 }
 
-/// The phonetic key for a normalized string: one Double Metaphone code per word.
-///
-/// Only ASCII letters are encoded. Double Metaphone is built for English names
-/// and has nothing to say about Hangul or accented Latin, but it does not
-/// decline gracefully: `rphonetic` slices the input on byte boundaries that are
-/// not character boundaries and panics on "Échame". Any title the bot will
-/// actually meet — "Échame La Suya", "나비잠" — would take the whole process
-/// down. So non-ASCII words contribute nothing to the key, which leaves the
-/// phonetic floor silent for them and the edit-distance path carrying them.
+/// One Double Metaphone code per word, ASCII words only: `rphonetic` panics on "Échame".
 fn phonetic_key(s: &str) -> String {
     let dm = DoubleMetaphone::default();
     s.split_whitespace()
@@ -178,10 +130,7 @@ fn phonetic_key(s: &str) -> String {
 
 /// Similarity of two *normalized* strings, 0..=1.
 ///
-/// Length-aware edit similarity (spaces ignored, so "wonder wall" ==
-/// "wonderwall"), a Jaro-Winkler nudge that cannot exceed what the edit
-/// similarity supports (stops the Winkler prefix bonus from rating "hello"
-/// ~ "hello brother"), and a phonetic floor.
+/// Jaro-Winkler is capped by edit similarity so "hello" doesn't match "hello brother".
 pub fn sim(a: &str, b: &str) -> f32 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
@@ -224,11 +173,7 @@ pub struct Score {
     pub combined: f32,
 }
 
-/// Scores one catalog (artist, title) against the transcript.
-///
-/// The title score is cut by the share of spoken content words that neither the
-/// title nor the artist explains. That is what rejects "Lover" for "love story":
-/// one letter apart, but "story" is left over.
+/// Scores one catalog (artist, title); the title is cut by unexplained spoken words.
 pub fn score(transcript: &str, artist: &str, title: &str) -> Score {
     let tokens: Vec<String> = spoken(transcript)
         .split_whitespace()
@@ -252,11 +197,7 @@ pub fn score(transcript: &str, artist: &str, title: &str) -> Score {
         content.iter().filter(|&&i| !explained[i]).count() as f32 / content.len().max(1) as f32;
 
     let title_score = (ts * (1.0 - 0.8 * unexplained)).clamp(0.0, 1.0);
-    // Only a named artist should earn the artist term. A bare title still has
-    // some edit-distance overlap with every artist name -- "biome fest" and
-    // "Celestial Fury" share enough letters to score 0.27 -- and rewarding
-    // that put a 4k-play cover above the official recording. The same 0.75
-    // bar already decides whether the artist's words count as explained.
+    // Only a named artist scores; incidental letter overlap ranked covers above originals.
     let artist_score = if a_s >= 0.75 { a_s } else { 0.0 };
     Score {
         title: title_score,
@@ -276,18 +217,10 @@ pub enum Verdict<'a, T> {
     NoMatch,
 }
 
-/// Decides between hits. `key` returns (artist, title). Hits are de-duplicated on
-/// normalized (artist, title), so "Song (Live)" and "Song" are one song.
+/// Decides between hits, de-duplicated on normalized `key` (artist, title).
 ///
-/// Four conditions for [`Verdict::Confident`], each of which exists because a
-/// real request broke without it:
-/// - the **title** clears [`TITLE_GATE`] on its own, so the right artist with
-///   the wrong title can never win;
-/// - the combined score clears [`ACCEPT`];
-/// - the winner beats the best *different song* by [`MARGIN`], or is nearly
-///   perfect on its own;
-/// - no other artist has the same title within [`ARTIST_GAP`], because then the
-///   request did not say enough to tell them apart and guessing is a coin toss.
+/// Confident needs [`TITLE_GATE`], [`ACCEPT`], a [`MARGIN`] over other songs, and
+/// no same title by another artist within [`ARTIST_GAP`].
 pub fn decide<'a, T>(
     transcript: &str,
     hits: &'a [T],

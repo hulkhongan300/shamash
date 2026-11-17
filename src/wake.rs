@@ -1,22 +1,9 @@
 //! Listening: one wake gate per speaker, and the larger model it wakes.
 //!
-//! Each speaker's audio is cut into whole utterances by [`crate::segment`].
-//! While an utterance is in progress the small, always-resident model checks
-//! its most recent two seconds every half second for the wake word, so the
-//! speaker hears the acknowledgement while they are still talking. When the
-//! utterance ends, the **whole** of it — the wake word, whatever followed it in
-//! the same breath, and every quiet frame in between — goes to the larger
-//! model once.
-//!
-//! That is what fixes the two ways this used to lose requests. The old gate
-//! started recording only after the wake word was recognised, so the words
-//! said in the same breath ("groovy, play Drac…") were already gone; and it kept
-//! only frames above a loudness gate, so what it did record had its quiet parts
-//! spliced out.
-//!
-//! "groovy play" said on its own (then a pause) leaves the speaker *armed*: the
-//! pipeline plays the ready tone, and the speaker's next utterance is taken as
-//! the request without needing the wake word again. See [`Armed`].
+//! A small model checks a rolling window for the wake word mid-utterance; the
+//! **whole** utterance, quiet frames included, then goes to the larger model so
+//! words said in the same breath aren't lost. "groovy play" alone arms the
+//! speaker, so their next utterance is the request; see [`Armed`].
 
 use crate::config::AsrEngine;
 use crate::direct::DirectTranscriber;
@@ -32,18 +19,13 @@ use tokio::sync::mpsc::UnboundedReceiver;
 /// A voice stream's id within the call (an RTP SSRC). One per speaker.
 pub type Ssrc = u32;
 
-/// One tick of audio: every speaker's samples for it. A speaker the call knows
-/// about but who sent nothing this tick is given silence, so their utterance
-/// can end.
+/// One tick of every speaker's samples; silent speakers get silence so utterances can end.
 pub type Tick = Vec<(Ssrc, Vec<f32>)>;
 
 /// How much audio the small model looks at for the wake word.
 pub const WAKE_WINDOW: Duration = Duration::from_millis(2000);
 
-/// How often the small model runs while somebody is speaking.
-///
-/// This is the always-on stage's whole cost: one inference on the small model
-/// per hop per speaker.
+/// How often the small model runs while somebody speaks; the always-on cost.
 pub const WAKE_HOP: Duration = Duration::from_millis(250);
 
 /// How long a speaker who said only the wake word stays armed for the request.
@@ -56,17 +38,14 @@ fn samples(duration: Duration) -> usize {
 /// Something the pipeline has to act on.
 #[derive(Debug)]
 pub enum Heard {
-    /// The small model heard the wake word in an utterance still in progress.
-    /// Acknowledge now; the utterance itself follows.
+    /// Wake word heard mid-utterance; acknowledge now, the utterance follows.
     Wake { ssrc: Ssrc },
     /// A finished utterance worth transcribing with the larger model.
     Utterance {
         ssrc: Ssrc,
         audio: Vec<f32>,
-        /// The small model heard the wake word in it.
         woke: bool,
-        /// The speaker had said the wake word on its own just before, so this
-        /// is the request even if it carries no wake word.
+        /// Follows a bare wake word, so it is the request without one.
         armed: bool,
     },
 }
@@ -74,22 +53,17 @@ pub enum Heard {
 /// What one push asked the caller to do.
 #[derive(Debug)]
 pub enum Step {
-    /// Run the small model on `window` and hand the text to
-    /// [`WakeGate::transcribed`], with `closing` passed back unchanged.
+    /// Run the small model on `window`, then call [`WakeGate::transcribed`] with `closing`.
     Check {
         ssrc: Ssrc,
         window: Vec<f32>,
-        /// The finished utterance, when this is the final check on one that
-        /// no rolling check had woken on.
+        /// Set on the final check of an utterance no rolling check woke on.
         closing: Option<Vec<f32>>,
     },
-    /// Deliver this to the pipeline.
     Heard(Heard),
 }
 
-/// Speakers who said only the wake word and whose next utterance is the
-/// request. Shared between the gate, which consumes it, and the pipeline,
-/// which sets it once the larger model has heard a bare wake word.
+/// Speakers who said a bare wake word; their next utterance is the request.
 #[derive(Debug, Clone, Default)]
 pub struct Armed(Arc<Mutex<HashMap<Ssrc, Instant>>>);
 
@@ -115,9 +89,7 @@ impl Armed {
             .is_some_and(|deadline| Instant::now() < deadline)
     }
 
-    /// Disarms `ssrc` only if it is still armed with `deadline`, so a later
-    /// arming is not cancelled by an earlier one's timer. Returns whether it
-    /// was.
+    /// Disarms only if still armed with `deadline`, so an old timer can't cancel a newer arming.
     pub fn expire(&self, ssrc: Ssrc, deadline: Instant) -> bool {
         let mut all = self.lock();
         if all.get(&ssrc) == Some(&deadline) {
@@ -137,12 +109,9 @@ impl Armed {
     }
 }
 
-/// One speaker's state.
 struct Speaker {
     segmenter: Segmenter,
-    /// Samples since the last rolling check.
     since_check: usize,
-    /// The wake word was heard in the utterance in progress.
     woke: bool,
 }
 
@@ -216,9 +185,7 @@ impl WakeGate {
                             armed,
                         }));
                     } else {
-                        // The rolling checks may not have covered the last
-                        // stretch, and a wake word at the very end of what was
-                        // said is as valid as one at the start.
+                        // Rolling checks may have missed a wake word at the very end.
                         steps.push(Step::Check {
                             ssrc,
                             window: tail(&utterance, samples(WAKE_WINDOW)),
@@ -277,19 +244,13 @@ impl WakeGate {
     }
 }
 
-/// The last `len` samples of `audio`.
 fn tail(audio: &[f32], len: usize) -> Vec<f32> {
     audio[audio.len().saturating_sub(len)..].to_vec()
 }
 
 /// Consumes ticks until the channel closes, calling `on_heard` for each event.
 ///
-/// `locked` is asked on every tick: while it is true the audio is dropped and
-/// every speaker's state forgotten, so nothing said while listening was locked
-/// can be acted on once it is unlocked.
-///
-/// `on_heard` must not block: it hands the event to the pipeline's own task, so
-/// a request that takes seconds to resolve never delays hearing the next one.
+/// While `locked()`, audio and speaker state are dropped. `on_heard` must not block.
 pub async fn run_wake_gate(
     mut gate: WakeGate,
     mut rx: UnboundedReceiver<Tick>,
@@ -341,10 +302,7 @@ pub async fn run_wake_gate(
     }
 }
 
-/// The larger model, loaded on the first wake word rather than at startup, then
-/// kept resident.
-///
-/// The first load blocks, so it belongs on a blocking pool.
+/// The larger model, loaded on first wake word then kept; the load blocks.
 pub struct BigModels {
     engine: AsrEngine,
     model: String,
@@ -369,10 +327,7 @@ impl BigModels {
         }
     }
 
-    /// The loaded model, loading it on the first call.
-    ///
-    /// The lock is held across the load, so the preload started by a wake word
-    /// and the request that follows it cannot both load the weights.
+    /// The loaded model; the lock spans the load so preload and request don't both load.
     pub fn get_or_load(&self) -> anyhow::Result<Arc<dyn Transcriber>> {
         let mut slot = self.lock();
         if let Some(loaded) = slot.as_ref() {

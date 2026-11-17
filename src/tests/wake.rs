@@ -45,7 +45,7 @@ fn speech_is_checked_on_a_rolling_window() {
         .chunks(320)
         .flat_map(|c| gate.push(1, c))
         .collect();
-    // 200 x 16 ms = 3.2 s of speech, one check per 500 ms.
+    // 200 x 16 ms = 3.2 s of speech.
     assert!(checks(&steps) >= 5, "{} checks", checks(&steps));
     for step in &steps {
         if let Step::Check { window, .. } = step {
@@ -54,8 +54,7 @@ fn speech_is_checked_on_a_rolling_window() {
     }
 }
 
-/// The fix for losing the words said with the wake word: the utterance
-/// handed over is the whole thing, from before the wake word to the end.
+/// Words said with the wake word must not be lost.
 #[test]
 fn a_woken_utterance_is_delivered_whole() {
     let armed = Armed::default();
@@ -85,7 +84,6 @@ fn ordinary_speech_is_not_delivered() {
     gate.push(1, &voice(40));
     assert!(gate.transcribed(1, "what is for lunch", None).is_empty());
     let steps = gate.push(1, &quiet(50));
-    // Only a final check on the tail, which also finds nothing.
     let Some(Step::Check {
         closing: Some(audio),
         window,
@@ -101,8 +99,6 @@ fn ordinary_speech_is_not_delivered() {
     );
 }
 
-/// No tone, and the music is not lowered, for a wake word that is only
-/// part of what someone is saying.
 #[test]
 fn a_wake_word_in_conversation_does_not_wake() {
     let armed = Armed::default();
@@ -147,7 +143,6 @@ fn one_utterance_wakes_only_once() {
     gate.push(1, &voice(40));
     assert_eq!(gate.transcribed(1, "groovy play", None).len(), 1);
     assert!(gate.transcribed(1, "groovy play", None).is_empty());
-    // And no more rolling checks once woken.
     assert_eq!(checks(&gate.push(1, &voice(100))), 0);
 }
 
@@ -197,7 +192,6 @@ fn an_expired_arming_is_not_live() {
     let deadline = armed.arm(3);
     assert!(armed.expire(3, deadline));
     assert!(!armed.take(3));
-    // A newer arming survives an older timer.
     let old = Instant::now();
     armed.arm(3);
     assert!(!armed.expire(3, old));

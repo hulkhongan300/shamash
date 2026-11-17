@@ -23,8 +23,7 @@ fn extracts_title_and_artist() {
     assert_eq!(req.artist.as_deref(), Some("tame impala"));
 }
 
-/// Only "<wake word> play" starts a command: no near misses of either word,
-/// no greeting-only opener, nothing between them.
+/// Only an exact "<wake word> play" starts a command.
 #[test]
 fn only_the_wake_word_then_play_is_a_command() {
     let parser = parser();
@@ -50,7 +49,6 @@ fn only_the_wake_word_then_play_is_a_command() {
     }
 }
 
-/// The aside is dropped from the end of a request.
 #[test]
 fn a_trailing_come_on_is_dropped() {
     assert_eq!(
@@ -62,8 +60,7 @@ fn a_trailing_come_on_is_dropped() {
     );
 }
 
-/// A title that is only the aside, or merely ends in those letters, is
-/// never eaten: "come on" and "welcome on" are both plausible queries.
+/// "come on" and "welcome on" are plausible titles, never eaten.
 #[test]
 fn a_title_that_looks_like_the_aside_is_kept() {
     assert_eq!(
@@ -108,9 +105,6 @@ fn splits_on_last_by_for_multi_word_artist() {
     assert_eq!(req.artist.as_deref(), Some("pink floyd"));
 }
 
-/// "by" belongs to more song titles than it separates artists, so the last
-/// " by " is only ever a guess. Every position is kept, best first, so the
-/// resolver can try them all.
 #[test]
 fn every_position_of_by_is_kept_as_a_reading() {
     for (heard, expected) in [
@@ -134,9 +128,7 @@ fn every_position_of_by_is_kept_as_a_reading() {
     }
 }
 
-/// The order is what the backwards-compatible `title`/`artist` fields use,
-/// and it has to stay last-" by "-first: "us and them by pink floyd" can
-/// only mean a two-word artist.
+/// Last " by " first: "us and them by pink floyd" needs a two-word artist.
 #[test]
 fn the_last_by_stays_the_primary_guess() {
     let req = parser()
@@ -147,8 +139,6 @@ fn the_last_by_stays_the_primary_guess() {
     assert_eq!(req.query, "stand by me by ben e king");
 }
 
-/// A phrase with no " by " at all has exactly one reading, so the guess is
-/// no guess: nothing is split, and the whole phrase is the title.
 #[test]
 fn a_request_with_no_by_has_no_splits() {
     let req = parser().parse("shamash play despacito").unwrap();
@@ -161,8 +151,6 @@ fn a_request_with_no_by_has_no_splits() {
     assert_eq!(readings, vec![(None, Some("despacito".to_string()))]);
 }
 
-/// "by" at either end is not a separator at all: there is nothing on one
-/// side of it.
 #[test]
 fn a_by_with_nothing_on_one_side_is_not_a_split() {
     for heard in ["by the way by daft punk", "hey jude by"] {
@@ -177,8 +165,7 @@ fn a_by_with_nothing_on_one_side_is_not_a_split() {
             req.splits
         );
     }
-    // "by the way by daft punk" has a leading "by" that produces no split,
-    // so only the one reading survives.
+    // A leading "by" produces no split.
     let req = parser()
         .parse("shamash play by the way by daft punk")
         .unwrap();
@@ -191,9 +178,7 @@ fn a_by_with_nothing_on_one_side_is_not_a_split() {
     assert!(req.splits.is_empty());
 }
 
-/// "By the Way" is a title that begins with "by" and nothing else, so the
-/// reading where the whole phrase is the title has to be available even
-/// when a " by " split exists.
+/// "By the Way" needs the whole-phrase reading even when a split exists.
 #[test]
 fn the_whole_phrase_is_always_one_of_the_readings() {
     let readings = readings("by the way by daft punk");
@@ -207,9 +192,7 @@ fn the_whole_phrase_is_always_one_of_the_readings() {
     );
 }
 
-/// The readings are deduplicated in order, so a phrase like "stand by me"
-/// -- where splitting at either "by" gives the same pair -- does not send
-/// the resolver the same query twice.
+/// Avoids sending the resolver the same query twice.
 #[test]
 fn duplicate_readings_are_collapsed() {
     let readings = readings("stand by me");
@@ -263,16 +246,13 @@ fn exposes_configured_wake_words() {
     assert!(words.contains("groovy"));
 }
 
-/// Wake words are lowercased when configured, so a capitalised entry is not
-/// a second word and does not change what is heard.
 #[test]
 fn a_capitalised_wake_word_is_the_same_word() {
     let parser = CommandParser::new(["Groovy".to_string()]);
     assert!(parser.parse("groovy play despacito").is_some());
 }
 
-/// A short wake word must be heard exactly. "bot" used to answer to one
-/// swapped vowel too, which made every "but" in a conversation wake it.
+/// "bot" once matched one swapped vowel, so every "but" woke it.
 #[test]
 fn a_short_wake_word_must_be_heard_exactly() {
     let parser = CommandParser::new(["bot".to_string()]);
@@ -335,8 +315,7 @@ fn a_paused_request_without_a_wake_word_is_still_a_request() {
     );
 }
 
-/// The rewriting stage is handed whole sentences, wake word included, so the
-/// grammar has to be reusable on what comes back from a model.
+/// The rewriter returns whole sentences, wake word included.
 #[test]
 fn stripping_the_command_leaves_the_request() {
     let parser = parser();
@@ -405,8 +384,7 @@ fn command_needs_play_after_a_wake_word_mid_sentence() {
     );
 }
 
-/// "play" somewhere later in the sentence is not enough mid-sentence: that
-/// is someone describing a request, not making one.
+/// A mid-sentence "play" is describing a request, not making one.
 #[test]
 fn a_later_play_mid_sentence_is_not_a_request() {
     for heard in [
@@ -422,7 +400,6 @@ fn a_later_play_mid_sentence_is_not_a_request() {
     }
 }
 
-/// The first wake word heard is not the only one tried.
 #[test]
 fn a_later_wake_word_is_still_heard() {
     assert_eq!(
@@ -432,8 +409,7 @@ fn a_later_wake_word_is_still_heard() {
             .query,
         "dracula"
     );
-    // A wake word and "play" with the title still to come arms the
-    // speaker, even after a wake word that was only conversation.
+    // Arms even after a wake word that was only conversation.
     assert_eq!(
         parser().command("the groove so groovy play"),
         Err(ParseMiss::EmptyRequest)
@@ -471,7 +447,6 @@ fn album_of(spoken: &str) -> Option<String> {
     album_request(&request).map(|album| album.query)
 }
 
-/// Saying "album" asks for the album, wherever it is said.
 #[test]
 fn saying_album_names_the_album() {
     for (spoken, album) in [
@@ -501,8 +476,7 @@ fn saying_album_names_the_album() {
     }
 }
 
-/// Without "album", it is a request like any other, and whether it is an
-/// album is for the catalog to say.
+/// Without "album", the catalog decides.
 #[test]
 fn a_request_without_album_is_not_named_as_one() {
     for spoken in [
@@ -516,7 +490,6 @@ fn a_request_without_album_is_not_named_as_one() {
     }
 }
 
-/// Typed words come out as the same query the same words spoken do.
 #[test]
 fn a_typed_request_reads_like_the_same_words_spoken() {
     let p = parser();
@@ -543,7 +516,6 @@ fn the_gate_ignores_punctuation_and_case() {
     assert!(!parser().wakes_on("not now"));
 }
 
-/// And not on a wake word that is only part of what someone is saying.
 #[test]
 fn the_gate_does_not_wake_on_a_wake_word_in_conversation() {
     for window in [
@@ -556,7 +528,6 @@ fn the_gate_does_not_wake_on_a_wake_word_in_conversation() {
     }
 }
 
-/// Whatever the grammar takes as a command, the gate must have woken on.
 /// Otherwise the larger model never hears it.
 #[test]
 fn the_gate_wakes_on_everything_the_grammar_accepts() {

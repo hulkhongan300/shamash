@@ -20,8 +20,6 @@ fn quotes_and_trailing_punctuation_are_stripped() {
     );
 }
 
-/// A trailing full stop is left in place, because a name can end in one and
-/// a search query does not mind.
 #[test]
 fn a_trailing_full_stop_is_left_alone() {
     assert_eq!(
@@ -30,7 +28,7 @@ fn a_trailing_full_stop_is_left_alone() {
     );
 }
 
-/// The shape these models produce when the single-line format is missed.
+/// What models produce when they miss the single-line format.
 #[test]
 fn labelled_lines_are_combined() {
     assert_eq!(
@@ -52,8 +50,6 @@ fn a_dash_is_read_as_by() {
     );
 }
 
-/// A hyphen is part of the name, so it must not be translated the way an em
-/// or en dash is.
 #[test]
 fn a_hyphen_is_part_of_the_name() {
     assert_eq!(
@@ -62,8 +58,6 @@ fn a_hyphen_is_part_of_the_name() {
     );
 }
 
-/// Only the labelled parts of a reply with a heading are used, so the
-/// heading itself cannot end up in the search query.
 #[test]
 fn a_heading_is_not_mistaken_for_the_answer() {
     assert_eq!(
@@ -72,9 +66,6 @@ fn a_heading_is_not_mistaken_for_the_answer() {
     );
 }
 
-/// A model that explains itself has not answered the question, and passing
-/// its commentary on would aim the search at a sentence. Only the first line
-/// of a hedge is worth keeping, and only when the rest are labels.
 #[test]
 fn commentary_is_refused() {
     assert_eq!(clean(""), None);
@@ -95,8 +86,6 @@ fn an_empty_reply_is_no_answer() {
     assert_eq!(clean("Title:  \nArtist:  "), None);
 }
 
-/// The length bound is what stops a verbose reply becoming a query that
-/// matches nothing.
 #[test]
 fn a_runaway_reply_is_refused() {
     let rambling = "a".repeat(MAX_REPLY_CHARS + 1);
@@ -105,8 +94,7 @@ fn a_runaway_reply_is_refused() {
 
 #[tokio::test]
 async fn an_unreachable_endpoint_leaves_the_transcript_alone() {
-    // Port 1 is reserved and nothing listens on it, so the connection is
-    // refused immediately: the same path a model that is not running takes.
+    // Nothing listens on port 1, so the connection is refused at once.
     let http = reqwest::Client::new();
     let outcome = rewrite(&http, "http://127.0.0.1:1", "llama3.2", "hoolig bts").await;
     assert!(outcome.is_err(), "a dead endpoint is reported, not hidden");
@@ -114,8 +102,6 @@ async fn an_unreachable_endpoint_leaves_the_transcript_alone() {
 
 #[tokio::test]
 async fn an_empty_transcript_is_never_sent() {
-    // Nothing to ask about, so no request is made and no failure is
-    // reported; the caller keeps what it had.
     let http = reqwest::Client::new();
     let outcome = rewrite(&http, "http://127.0.0.1:1", "llama3.2", "   ")
         .await
@@ -123,13 +109,7 @@ async fn an_empty_transcript_is_never_sent() {
     assert!(outcome.is_none());
 }
 
-/// A failed HTTP status must be reported as itself.
-///
-/// The body used to be decoded before the status was looked at, so a 500
-/// from a proxy, an error page from a reverse proxy, or a 401 with an empty
-/// body all failed with "did not answer with a chat reply" -- a message that
-/// names the symptom rather than the cause, and sends you looking at the
-/// reply format instead of at the endpoint.
+/// Regression: the body used to be decoded first, hiding the status behind "chat reply".
 #[tokio::test]
 async fn a_failed_status_is_reported_as_itself() {
     let endpoint = one_shot_endpoint(500, "upstream exploded").await;
@@ -152,7 +132,6 @@ async fn a_failed_status_is_reported_as_itself() {
     );
 }
 
-/// And a 200 that is not a chat reply is still reported as what it is.
 #[tokio::test]
 async fn a_200_that_is_not_a_chat_reply_is_still_a_decode_failure() {
     let endpoint = one_shot_endpoint(200, "<html>hello</html>").await;
@@ -167,7 +146,6 @@ async fn a_200_that_is_not_a_chat_reply_is_still_a_decode_failure() {
     assert!(format!("{err:#}").contains("chat reply"), "{err:#}");
 }
 
-/// The happy path, so the status check above is not the only thing tested.
 #[tokio::test]
 async fn a_chat_reply_becomes_a_request() {
     let endpoint = one_shot_endpoint(
@@ -188,11 +166,7 @@ async fn a_chat_reply_becomes_a_request() {
     );
 }
 
-/// A throwaway HTTP server that answers every request with one fixed
-/// status and body.
-///
-/// Bound to an ephemeral port on loopback, so it cannot collide with
-/// anything and needs no configuration.
+/// Loopback server on an ephemeral port that answers once with a fixed status and body.
 async fn one_shot_endpoint(status: u16, body: &'static str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -201,7 +175,6 @@ async fn one_shot_endpoint(status: u16, body: &'static str) -> String {
     let address = listener.local_addr().expect("the bound address");
     tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("a request");
-        // Read the request far enough that the client has finished sending.
         let mut request = [0u8; 1024];
         let _ = stream.read(&mut request).await;
         let response = format!(

@@ -8,17 +8,14 @@ fn a_chooser_press_is_refused_only_for_a_reason_that_fits() {
     // Somebody else's `/play` is theirs; a spoken one is the channel's.
     assert_eq!(chooser_refusal(true, false, false), Some(NOT_YOURS));
     assert_eq!(chooser_refusal(true, true, false), Some(NOT_IN_VOICE));
-    // A list the bot no longer holds says so, rather than blaming the
-    // presser for not being in the voice channel.
+    // A stale list says so instead of blaming the presser's voice channel.
     assert_eq!(chooser_refusal(false, false, false), Some(NOT_ON_OFFER));
     assert_eq!(chooser_refusal(false, true, true), Some(NOT_ON_OFFER));
 }
 
 #[test]
 fn a_failed_pick_is_told_in_a_private_follow_up() {
-    // Issue #42: the press is acknowledged before the song is fetched, and a
-    // second response to it is rejected by Discord, so a failure was never
-    // shown. It is a follow-up, private to the presser, carrying the reason.
+    // Issue #42: the press is already acknowledged, so the error must be a private follow-up.
     let sent = serde_json::to_value(private_follow_up(
         "I couldn't play that song: could not download that song",
     ))

@@ -1,27 +1,7 @@
 //! Chooses which YouTube video to play for a spoken request.
 //!
-//! A YouTube search returns whatever matched the words: clips, live
-//! performances, lyric videos, 10-minute mixes. It also returns a *different
-//! song* with more views often enough to be the actual complaint, because a flat
-//! search has no way to tell "the studio recording" from "a remix of it" and
-//! popularity is all it has left to sort on.
-//!
-//! So the search is aimed at a known song rather than at a phrase. The
-//! transcript is first resolved against a music catalog (see
-//! [`crate::resolve`]), which supplies the song's canonical artist, title and
-//! running time. Those names are what the YouTube query is built from, and that
-//! running time is the strongest signal available when ranking the results:
-//!
-//! > Catalog: *Dracula* by Tame Impala, 205 s.
-//!
-//! | result | length | views | verdict |
-//! | --- | --- | --- | --- |
-//! | Official Video | 234 s | 75.5 M | wrong cut of the right song |
-//! | JENNIE Remix (Lyrics) | 210 s | 50.8 M | a different song entirely |
-//! | **Dracula** (artist channel) | **206 s** | 2.8 M | **the one asked for** |
-//!
-//! Ranking by views picks the 75 M video. Ranking by length alone picks the
-//! right one, and it does so from a number no uploader can misreport.
+//! The query is built from a catalog match (see [`crate::resolve`]), and results are ranked
+//! mainly by running time, which no uploader can misreport, rather than by views.
 
 use crate::library;
 use crate::matcher;
@@ -37,11 +17,7 @@ use tokio::process::Command;
 const MIN_DURATION_SECS: f64 = 30.0;
 /// Longer than this and it is a mix, compilation, or concert recording.
 const MAX_DURATION_SECS: f64 = 15.0 * 60.0;
-/// Title fragments that mark a result as "not the song itself".
-///
-/// "lyric" is deliberately absent. A lyric video carries the same recording as
-/// the official audio, and for less common songs it is sometimes the only
-/// upload at all, so rejecting it loses the song the listener asked for.
+/// Title fragments marking a result as not the song; "lyric" is absent since lyric videos carry the real recording.
 const NON_SONG_MARKERS: [&str; 13] = [
     "cover band",
     "cover version",
@@ -58,12 +34,7 @@ const NON_SONG_MARKERS: [&str; 13] = [
     "compilation",
 ];
 
-/// Title fragments that mean the upload is a video rather than just the audio.
-///
-/// The listener asked for a song, and an MV is a video first: it carries
-/// choreography, a title card, and edits that get in the way of the music.
-/// These are penalised rather than rejected, because for many songs the
-/// official MV is the best available recording of it.
+/// Title fragments marking a video upload; penalised, not rejected, since an MV is often the best recording.
 const VIDEO_MARKERS: [&str; 8] = [
     "official mv",
     "official m/v",
@@ -75,33 +46,18 @@ const VIDEO_MARKERS: [&str; 8] = [
     "dance cover",
 ];
 
-/// Title fragments that mean the upload is the audio on its own, which is what
-/// the listener asked for.
+/// Title fragments marking an audio-only upload.
 const AUDIO_MARKERS: [&str; 4] = ["official audio", "audio only", "audio", "official track"];
 
-/// Title fragments that mark a lyric video: video, but a still image over the
-/// song rather than anything that edits the music.
+/// Title fragments marking a lyric video: a still image over the same recording.
 const LYRIC_MARKERS: [&str; 2] = ["lyric video", "lyrics"];
 
-/// How far a candidate's length may be from the catalog's and still count as
-/// the same recording.
-///
-/// Four seconds absorbs the difference between an album track, an edited
-/// single and a video that runs a few seconds of silence at either end, which
-/// is normal and is not a different song.
+/// Max length gap still counted as the same recording (edits, silence at either end).
 pub const DURATION_TOLERANCE_SECS: f64 = 4.0;
 
-/// Words in a title that mean this is not the recording that was asked for.
+/// Title words costing [`PENALTY`] unless the request used them (asked-for "live" stays live).
 ///
-/// Each costs [`PENALTY`], unless the request itself used the word: someone who
-/// asked for the live version wants the live version, and penalising it would
-/// make the bot reliably play the studio cut instead.
-///
-/// Two matching rules keep the list honest. "mix" is matched as a whole word, so
-/// it does not also fire on "remix", which is listed separately and is a
-/// different mistake. "lyric" covers "lyrics" by prefix, so only one spelling is
-/// listed and a title reading "Lyrics [Lyric Video]" is charged once rather than
-/// twice for one fault.
+/// Single words match whole, so "mix" skips "remix"; "lyric" also covers "lyrics".
 const PENALTY_MARKERS: [&str; 13] = [
     "cover",
     "live",
@@ -118,20 +74,14 @@ const PENALTY_MARKERS: [&str; 13] = [
     "tutorial",
 ];
 
-/// Score awarded for a length within [`DURATION_TOLERANCE_SECS`] of the
-/// catalog's.
-///
-/// Large enough to outweigh everything else combined: it is the only signal
-/// that distinguishes the studio recording from every other version of the same
-/// title.
+/// Score for a length within tolerance; outweighs the rest, as only length separates the studio cut.
 const DURATION_EXACT: f64 = 100.0;
 /// Charged per second outside the tolerance.
 const DURATION_PENALTY_PER_SEC: f64 = 3.0;
 /// Ceiling on that penalty, so a 10-minute mix cannot dominate the arithmetic.
 const DURATION_PENALTY_MAX: f64 = 90.0;
 
-/// A "- Topic" channel is YouTube's own auto-generated artist channel, which is
-/// the most reliable provenance signal on the platform.
+/// A "- Topic" channel: YouTube's auto-generated artist channel, the best provenance signal.
 const CHANNEL_TOPIC: f64 = 45.0;
 /// The upload is on the artist's own channel.
 const CHANNEL_ARTIST: f64 = 30.0;
@@ -145,16 +95,13 @@ const RELEVANCE_MAX: f64 = 25.0;
 const MEDIA_AUDIO: f64 = 12.0;
 /// A lyric video: video-shaped, but the same recording under a still image.
 const MEDIA_LYRIC: f64 = 6.0;
-/// An official MV, visualizer or dance video: the wrong shape for a request to
-/// hear a song.
+/// An official MV, visualizer or dance video.
 const MEDIA_VIDEO: f64 = -6.0;
 /// Charged per penalty marker.
 const PENALTY: f64 = 30.0;
-/// Weight on popularity. Logarithmic and small on purpose: views break ties
-/// between equally good uploads, they do not choose the song.
+/// Popularity weight; small and logarithmic, so views only break ties.
 const VIEWS_WEIGHT: f64 = 1.0;
-/// Ceiling on the popularity term, so 75 M views cannot outvote a length
-/// mismatch.
+/// Popularity ceiling, so 75 M views cannot outvote a length mismatch.
 const VIEWS_MAX: f64 = 12.0;
 
 /// One entry of a YouTube search result.
@@ -162,11 +109,7 @@ const VIEWS_MAX: f64 = 12.0;
 pub struct Candidate {
     /// Video title as shown on YouTube.
     pub title: Option<String>,
-    /// Canonical watch URL.
-    ///
-    /// `url` and not `webpage_url`, and deliberately not an alias for either:
-    /// a flat listing carries *both* keys, so an alias makes serde report a
-    /// duplicate field and fail every result.
+    /// Watch URL. Not aliased to `webpage_url`: flat listings carry both and serde rejects the duplicate.
     pub url: String,
     /// View count, when YouTube reports one.
     pub view_count: Option<u64>,
@@ -174,10 +117,7 @@ pub struct Candidate {
     pub duration: Option<f64>,
     /// Uploading channel, used as the artist hint in logs.
     pub channel: Option<String>,
-    /// Bare video id, which the dashboard needs to build a thumbnail URL.
-    ///
-    /// Not every yt-dlp version reports it, so it may be absent even when the
-    /// id is recoverable from `url`.
+    /// Bare video id for thumbnails; some yt-dlp versions omit it.
     #[serde(default)]
     pub id: Option<String>,
 }
@@ -191,10 +131,7 @@ impl Candidate {
         self.channel.as_deref().unwrap_or("unknown channel")
     }
 
-    /// The video id, used to build the dashboard thumbnail URL.
-    ///
-    /// Prefers the reported id and falls back to reading it out of the URL,
-    /// which yt-dlp writes in a few shapes depending on version and mode.
+    /// The video id, from `id` or parsed out of `url`.
     pub fn video_id(&self) -> Option<&str> {
         if let Some(id) = self.id.as_deref().filter(|id| !id.is_empty()) {
             return Some(id);
@@ -202,13 +139,7 @@ impl Candidate {
         url_video_id(&self.url)
     }
 
-    /// The one upload a track that already knows its video stands for.
-    ///
-    /// Not a search result and never ranked against others: the provider named
-    /// this video as the song, so there is nothing to choose between and the
-    /// search is a second opinion nobody asked for. The catalog's own names
-    /// stand in for the title and channel, because they are what it said the
-    /// video is.
+    /// The one upload a provider already named for this track; never ranked.
     pub fn for_track(track: &CatalogTrack, video_id: &str) -> Self {
         Self {
             title: Some(track.title.clone()),
@@ -220,15 +151,9 @@ impl Candidate {
         }
     }
 
-    /// Whether the result looks like a song rather than a clip, cover, or mix.
     /// Whether this is worth ranking against `target`.
     ///
-    /// Length is judged unconditionally: a ten-second clip and a six-hour
-    /// upload are not songs under any request. The disqualifying markers are
-    /// judged against the request, for the same reason the penalties are --
-    /// filtering every live recording out of the results would mean that asking
-    /// for the live version plays the studio cut, which is the failure this
-    /// ranking exists to prevent.
+    /// Markers are judged against the request, so asking for "live" keeps live recordings.
     fn is_song_for(&self, target: &Target) -> bool {
         let plausible_length = match self.duration {
             Some(duration) => (MIN_DURATION_SECS..=MAX_DURATION_SECS).contains(&duration),
@@ -256,21 +181,9 @@ impl Candidate {
             .to_ascii_lowercase()
     }
 
-    /// How close this upload is to being the song's audio on its own.
+    /// How audio-like the title claims to be: 3 audio, 2 lyric video, 1 ordinary, 0 MV/visualizer.
     ///
-    /// Read from the title, because that is all a flat search reports: yt-dlp
-    /// does not fetch stream details until asked, and asking per candidate
-    /// costs a round trip on every search. It is not exact -- an "Official
-    /// Audio" upload still reports a video codec, because YouTube wraps a
-    /// still image in one -- so this ranks the title's claim rather than
-    /// checking the file.
-    ///
-    /// Ordered so that a request for a song lands on its audio:
-    ///
-    /// - 3 the audio on its own, which is what was asked for
-    /// - 2 a lyric video: a static image over the same recording
-    /// - 1 an ordinary upload, which may be either
-    /// - 0 an official MV, visualizer, or dance video, which is video first
+    /// Title-based because a flat search reports no stream details.
     fn media_rank(&self) -> u8 {
         let title = self.title_lowercase();
         if VIDEO_MARKERS.iter().any(|m| title.contains(m)) {
@@ -295,21 +208,13 @@ fn non_empty(text: &str) -> Option<String> {
     (!text.trim().is_empty()).then(|| text.to_string())
 }
 
-/// A form with spacing and punctuation removed, for containment tests.
-///
-/// An artist channel is as likely to be `TameImpala` as `Tame Impala`, and
-/// neither is something a band chose carefully, so neither can be relied on.
+/// Text without spaces or punctuation, since channels may be `TameImpala` or `Tame Impala`.
 fn squashed(text: &str) -> String {
     matcher::normalize(text).replace(' ', "")
 }
 
-/// Whether a title or request contains `needle`.
-///
-/// Multi-word needles match as a substring, because "sped up" and "1 hour" are
-/// phrases. Single words match whole words only, so "mix" does not fire on
-/// "remix" -- a different mistake, penalised separately -- and "live" does not
-/// fire on "delivery". A longer word also matches its own extensions, so
-/// "lyric" catches "lyrics" and "remix" catches "remixes".
+/// Phrases match by substring, words whole ("mix" skips "remix", "live" skips "delivery");
+/// words over 4 chars also match extensions ("lyric" -> "lyrics").
 fn contains_marker(haystack: &str, needle: &str) -> bool {
     if needle.contains(' ') {
         return haystack.contains(needle);
@@ -319,23 +224,12 @@ fn contains_marker(haystack: &str, needle: &str) -> bool {
         .any(|word| word == needle || (needle.len() > 4 && word.starts_with(needle)))
 }
 
-/// A reference recording, as far as it is known, to score uploads against.
-///
-/// Built from a catalog match when there is one, and from the raw transcript
-/// when there is not. The two cases score differently because a request with no
-/// catalog match has no length to compare, which removes the strongest signal
-/// and has to be reflected in the threshold rather than silently ignored.
+/// A reference recording to score uploads against, from a catalog match or the raw transcript.
 #[derive(Debug, Clone)]
 pub struct Target {
     pub artist: Option<String>,
     pub title: Option<String>,
-    /// Every running time the catalog reported for this song.
-    ///
-    /// A set rather than one number, because providers disagree: one counts the
-    /// outro and one does not, and an upload is the right recording if it matches
-    /// *any* of them. The smallest gap to any of them is the score, so a
-    /// straggling provider cannot drag the comparison away from the recording
-    /// the others agree on.
+    /// Every running time the catalog reported; the closest scores, since providers disagree on outros.
     pub durations: Vec<f64>,
     /// The whole request, kept so a requested "live" is not penalised.
     pub requested: String,
@@ -355,13 +249,7 @@ impl Target {
         }
     }
 
-    /// A target from the transcript alone, used when no catalog match cleared
-    /// the bar.
-    ///
-    /// The request doubles as the title, because the parser only reports a
-    /// title when it heard "by" and most requests do not contain one. Without
-    /// this the title term would be zero for those requests, leaving relevance
-    /// -- the only signal left once there is no catalog length -- doing nothing.
+    /// A target from the transcript alone; the request doubles as the title so relevance still counts.
     pub fn from_request(request: &PlayRequest) -> Self {
         Self {
             artist: request.artist.clone(),
@@ -372,10 +260,7 @@ impl Target {
         }
     }
 
-    /// What to search YouTube for.
-    ///
-    /// Prefers the canonical `"<artist> <title>"`, which is how the song is
-    /// actually titled on YouTube, and falls back to the transcript otherwise.
+    /// What to search YouTube for: `"<artist> <title>"` when known, else the transcript.
     pub fn search_query(&self) -> String {
         match (&self.artist, &self.title) {
             (Some(artist), Some(title)) => format!("{artist} {title}"),
@@ -384,10 +269,7 @@ impl Target {
         }
     }
 
-    /// The threshold that applies to this target.
-    ///
-    /// See [`UNRESOLVED_MATCH_THRESHOLD`]: the two cases are scored on
-    /// different scales, so one threshold cannot serve both.
+    /// The threshold for this target; uncatalogued targets score on a different scale.
     pub fn effective_threshold(&self, threshold: f64) -> f64 {
         if self.catalogued {
             threshold
@@ -399,19 +281,8 @@ impl Target {
 
 /// The bar for a request the catalog could not resolve, in points.
 ///
-/// A separate constant rather than a fraction of
-/// [`crate::config::DEFAULT_MATCH_THRESHOLD`], because the two cases are not
-/// the same scale: with a catalog match a candidate can earn about 190 points,
-/// and without one the most it can earn is the 125 that do not depend on
-/// running time. A fraction would move this bar every time the weights in
-/// [`score`] were retuned, silently.
-///
-/// It decides the *order* the chooser offers its options in, and nothing else.
-/// With no catalog match there is no verified running time, so the strongest
-/// signal is gone and the score cannot be trusted to identify a song at all:
-/// `relevance` alone is 18.0 for any upload title sharing one word with the
-/// transcript, which is why this bar used to admit almost anything. An
-/// unverified best result is therefore never played on its own.
+/// Not a fraction of the default: without a length the max is ~125, not ~190.
+/// It only orders the chooser; an unverified result is never autoplayed.
 const UNRESOLVED_MATCH_THRESHOLD: f64 = 20.0;
 
 /// A candidate's score, broken down so it can be logged and tuned.
@@ -427,10 +298,7 @@ pub struct ScoreParts {
 }
 
 impl ScoreParts {
-    /// The total, with one penalty per distinct marker.
-    ///
-    /// Markers are de-duplicated before charging so a title reading
-    /// "Lyrics (Lyric Video)" is not billed twice for the same fault.
+    /// The total, one penalty per distinct marker.
     pub fn total(&self) -> f64 {
         self.duration + self.channel + self.relevance + self.media + self.views
             - PENALTY * self.penalties.len() as f64
@@ -482,11 +350,7 @@ pub struct Choice {
     pub confident: bool,
     /// The threshold that was applied, for logging.
     pub threshold: f64,
-    /// The catalog match the query was built from, when there was one.
-    ///
-    /// Kept so the caller can say what it thinks was asked for, which is the
-    /// difference between "picked the wrong song" and "I could not tell which
-    /// song you meant".
+    /// The catalog match the query was built from, so the caller can say what it thinks was asked for.
     pub resolved: Option<resolve::CatalogTrack>,
     /// What the request was understood as.
     pub requested: String,
@@ -497,28 +361,19 @@ impl Choice {
         self.ranked.first()
     }
 
-    /// The best `count` results, for the chooser.
-    ///
-    /// Includes the top result: when the bot is not sure enough to play, the
-    /// most likely answer is still the first button.
+    /// The best `count` results for the chooser, top result included.
     pub fn top(&self, count: usize) -> Vec<&ScoredCandidate> {
         self.ranked.iter().take(count).collect()
     }
 }
 
-/// Scores one candidate against a target.
-///
-/// The terms are deliberately lopsided. Length is worth more than everything
-/// else combined because it is the only signal that survives a correct title in
-/// a wrong place, and popularity is worth least because it is what made the old
-/// ranking wrong.
+/// Scores one candidate; length outweighs everything, views count least.
 pub fn score(candidate: &Candidate, target: &Target) -> ScoreParts {
     let mut parts = ScoreParts::default();
     let title = candidate.title_lowercase();
 
     if let (Some(found), true) = (candidate.duration, !target.durations.is_empty()) {
-        // The closest any provider came, so one that counts the outro does not
-        // drag the comparison away from the recording the others agree on.
+        // Closest provider wins, so one counting the outro cannot drag it away.
         let delta = target
             .durations
             .iter()
@@ -602,37 +457,22 @@ pub fn pick(candidates: &[Candidate], target: &Target, threshold: f64) -> Choice
         ranked,
         confident,
         threshold,
-        // Filled in by `choose_match`, which is the only place the request and
-        // the catalog match are known.
+        // Filled in by `choose_match`, which knows the request and catalog match.
         resolved: None,
         requested: target.requested.clone(),
     }
 }
 
-/// How long a yt-dlp search may take before it is treated as having failed.
-///
-/// Generous: this is metadata for a handful of results and normally returns in
-/// about a second. It has to be bounded regardless, because `Player::play`
-/// holds the guild's request ordering while it runs, and a yt-dlp that hangs on
-/// a stalled connection would leave that guild unable to skip or stop.
+/// Bound on a yt-dlp search; `Player::play` holds the guild's ordering meanwhile, so a hang blocks skip/stop.
 const YOUTUBE_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Searches YouTube via `yt-dlp` and returns the raw candidates.
 ///
-/// Metadata only: `--flat-playlist` reads the search page without opening each
-/// video, which is what keeps a spoken command's latency at about a second
-/// instead of half a minute.
-///
-/// Deliberately not `music.youtube.com`. Its flat search does return cleaner
-/// titles, but it reports `channel`, `duration` and `view_count` as null, which
-/// is exactly the data this module ranks on; recovering those means dropping
-/// `--flat-playlist`, at roughly 5 s per result.
+/// `--flat-playlist` keeps it to ~1 s. Not `music.youtube.com`: its flat search nulls duration, channel and views.
 pub async fn youtube_candidates(query: &str, count: usize) -> anyhow::Result<Vec<Candidate>> {
     anyhow::ensure!(count > 0, "need at least one search candidate");
 
-    // `kill_on_drop` matters as much as the timeout: without it, dropping the
-    // future on timeout would leave the yt-dlp process running, holding the
-    // network and eventually answering a socket nobody is reading.
+    // `kill_on_drop` so a timeout does not leave yt-dlp running.
     let mut command = Command::new("yt-dlp");
     command
         .kill_on_drop(true)
@@ -663,12 +503,7 @@ pub async fn youtube_candidates(query: &str, count: usize) -> anyhow::Result<Vec
         .collect::<Result<_, _>>()
 }
 
-/// Where the YouTube candidates come from.
-///
-/// The seam exists so the selection path can be exercised without yt-dlp, a
-/// network, or a real search result: [`choose_match`] is the only consumer, and
-/// the behaviour worth testing there is what happens when the catalog says
-/// nothing, which cannot be arranged by talking to YouTube.
+/// Where YouTube candidates come from; a seam so selection is testable without yt-dlp.
 #[async_trait::async_trait]
 pub trait VideoSearch: Send + Sync {
     async fn candidates(&self, query: &str, count: usize) -> anyhow::Result<Vec<Candidate>>;
@@ -684,33 +519,22 @@ impl VideoSearch for YtDlpSearch {
     }
 }
 
-/// What a request turned into.
-///
-/// The catalog answers this, not the video search. The principle is that a
-/// wrong confident answer is worse than asking: the listener hears a song
-/// nobody asked for and has no way to tell it from a right one.
+/// What a request turned into; a wrong confident answer is worse than asking.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Resolved {
-    /// One song, confirmed by the catalog.
-    ///
-    /// Carries every running time the catalog reported, because the upload
-    /// search is ranked against the whole set: providers disagree, and an upload
-    /// is the right recording if it matches any of them.
+    /// One song confirmed by the catalog, with every running time it reported.
     Track {
         track: CatalogTrack,
         durations: Vec<f64>,
     },
-    /// More than one song answers to what was said, and the request did not say
-    /// enough to choose between them. Ask, in songs rather than in videos.
+    /// Several songs fit and the request cannot choose; ask, in songs not videos.
     Ask(Vec<CatalogTrack>),
     /// Nothing believable. The caller plays a miss tone and says so.
     Unknown,
 }
 
 impl From<matcher::Verdict<'_, resolve::Hit>> for Resolved {
-    /// A verdict with no popularity policy applied. Used for the library's own
-    /// history, where the songs are the guild's own and there is no ambiguity to
-    /// settle by popularity.
+    /// A verdict with no popularity policy, for the guild's own history.
     fn from(verdict: matcher::Verdict<'_, resolve::Hit>) -> Self {
         match verdict {
             matcher::Verdict::NoMatch => Self::Unknown,
@@ -735,11 +559,7 @@ impl Resolved {
     }
 }
 
-/// The most-played recording among the options sharing the winner's title.
-///
-/// `auto` still settles only the question `decide` called ambiguous: one
-/// title, several artists. Popularity may break that tie; it never makes a
-/// different song win, and with no counts it leaves the matcher's order alone.
+/// The most-played option sharing the winner's title; popularity breaks ties, never picks another song.
 fn most_played_same_title<'a>(options: &[&'a resolve::Hit]) -> Option<&'a resolve::Hit> {
     let top = *options.first()?;
     let title = matcher::normalize(&top.title);
@@ -756,13 +576,9 @@ fn most_played_same_title<'a>(options: &[&'a resolve::Hit]) -> Option<&'a resolv
     Some(best)
 }
 
-/// What the bot is going to ask, when it is going to ask.
+/// Whether `winner` is at least 3x more popular than any other artist's rival (`AMBIGUOUS_POLICY=popular`).
 ///
-/// Default `ask`. With `popular`, a title two artists have recorded is settled
-/// by how much bigger one of them is, which is the behaviour the README
-/// described before the catalog could tell two recordings of one title apart.
-/// It is off by default because it is a guess: popularity is a fact about
-/// YouTube and not about which of them the listener meant.
+/// Off by default: popularity is a guess about which one the listener meant.
 pub fn popular_beats_a_rival(winner: &CatalogTrack, rivals: &[CatalogTrack]) -> bool {
     let Some(top) = winner.popularity else {
         return false;
@@ -773,28 +589,16 @@ pub fn popular_beats_a_rival(winner: &CatalogTrack, rivals: &[CatalogTrack]) -> 
         .filter_map(|rival| rival.popularity)
         .max()
     else {
-        // No rival has a popularity, so there is nothing to compare against and
-        // nothing to be three times bigger than.
+        // No rival popularity to compare against.
         return false;
     };
     top >= best_rival.saturating_mul(3)
 }
 
-/// Turns a spoken request into a song, or into a question, or into nothing.
+/// Turns a spoken request into a song, a question, or nothing. Never fails.
 ///
-/// Never fails. Every provider failing is the same outcome as no provider
-/// finding anything: [`Resolved::Unknown`], which the caller reports rather
-/// than playing whatever YouTube ranked first.
-///
-/// `rewrite` is an optional second transcript from the transcript-rewriting
-/// stage. It is tried alongside the words that were heard and the better verdict
-/// wins, but the rewrite can only ever *propose* a transcript: it is scored
-/// against the same catalog hits by the same matcher, so it cannot bypass
-/// verification.
-///
-/// An exact phrase the song memory knows is not looked up here: the caller
-/// asks [`remembered`] first, because a remembered song is shown as one.
-/// `library` only lends this the guild's play history.
+/// `rewrite` is scored by the same matcher, so it cannot bypass verification.
+/// The caller checks [`remembered`] first.
 pub async fn resolve_request(
     request: &PlayRequest,
     catalog: &resolve::Catalog,
@@ -805,8 +609,7 @@ pub async fn resolve_request(
 ) -> Resolved {
     let heard = request.query.clone();
 
-    // The target carries every reading of the phrase, which is what the query
-    // plan is built from; the caller keeps the request for its own text.
+    // The target carries every reading of the phrase for the query plan.
     let mut hits = timing
         .stage(
             "catalog.hits",
@@ -814,10 +617,7 @@ pub async fn resolve_request(
         )
         .await;
 
-    // Songs this guild has played before are candidates too, judged by the same
-    // matcher as the catalog's own. They are added *after* the catalog so a
-    // remembered song can win, but it cannot make one up: it still has to
-    // explain the request.
+    // Guild history joins the catalog hits: it can win, but must still explain the request.
     if let Some(library) = library {
         let remembered = library.history_hits(guild_id.get());
         let confident = matches!(
@@ -845,9 +645,7 @@ pub async fn resolve_request(
         let alternative = matcher::decide(&rewritten, &rewritten_hits, |hit: &resolve::Hit| {
             (hit.artist.as_str(), hit.title.as_str())
         });
-        // Only a *confident* answer from the rewrite displaces the words as
-        // heard. If the heard transcript also resolved, that is evidence for
-        // it, and the rewrite is the speculative one.
+        // Only a confident rewrite displaces the heard words, and only if they matched nothing.
         if matches!(verdict, matcher::Verdict::NoMatch)
             && matches!(alternative, matcher::Verdict::Confident(_))
         {
@@ -862,10 +660,7 @@ pub async fn resolve_request(
     decide(&verdict)
 }
 
-/// The song this exact phrase was taught to mean, as a resolved song.
-///
-/// An alias hit skips the catalog entirely: the same misheard phrase cost the
-/// same lookup every time it was heard, and this is what stops it.
+/// The song this exact phrase was taught to mean; skips the catalog lookup.
 pub fn remembered(library: &library::Library, heard: &str) -> Option<Resolved> {
     let track = library.recall(heard)?;
     tracing::info!(said = %heard, track = %track.label(), "recalled from the song library");
@@ -952,12 +747,7 @@ fn decide(verdict: &matcher::Verdict<'_, resolve::Hit>) -> Resolved {
 
 /// Finds the upload to play for a catalog track, and ranks the alternatives.
 ///
-/// A confident catalog track makes the result confident only if the best upload
-/// clears [`crate::config::DEFAULT_MATCH_THRESHOLD`]. That is deliberately
-/// stricter than the catalog verdict: the catalog proved *which song*, and this
-/// still has to find *which recording of it*. If nothing clears the bar the
-/// caller offers the closest uploads of that song, so the user is choosing
-/// between recordings of the right thing rather than between different songs.
+/// Confident only if the best upload clears the threshold: the catalog proved the song, not the recording.
 pub async fn find_video(
     resolved: &Resolved,
     requested: &str,
@@ -969,8 +759,7 @@ pub async fn find_video(
     let Resolved::Track { track, durations } = resolved else {
         anyhow::bail!("find_video needs a resolved song, not a question or nothing");
     };
-    // The provider already named the upload. Searching again could only pick a
-    // different one, so the catalog's video is played as-is.
+    // The provider already named the upload, so play it as-is.
     if let Some(video_id) = track.video_id.as_deref().filter(|id| !id.is_empty()) {
         return Ok(Choice {
             ranked: vec![ScoredCandidate {
@@ -1004,12 +793,7 @@ pub async fn find_video(
     Ok(choice)
 }
 
-/// Finds the uploads for a request that no catalog track answers to.
-///
-/// Only ever called when the operator has asked for it. Nothing found this way
-/// is ever played on its own: without a catalog there is no verified running
-/// time, so the scorer has a title similarity and a view count and nothing
-/// else, which is how the wrong song gets played with no feedback.
+/// Finds uploads for a request no catalog track answers; never autoplayed, as nothing verifies it.
 pub async fn find_unverified(
     request: &PlayRequest,
     searcher: &dyn VideoSearch,
@@ -1033,9 +817,7 @@ pub async fn find_unverified(
 
     let mut choice = pick(&candidates, &target, threshold);
     choice.requested = request.query.clone();
-    // Said here rather than left to the caller, because the rule is absolute:
-    // these results were never verified against a catalog and are never
-    // autoplayed, whatever the caller forgets to do about it.
+    // Enforced here: unverified results are never autoplayed.
     choice.confident = false;
     log_choice(&choice, &query);
     Ok(choice)
@@ -1062,11 +844,7 @@ fn log_choice(choice: &Choice, query: &str) {
     );
 }
 
-/// Reads the video id out of a YouTube URL.
-///
-/// Handles the bare id that `--flat-playlist` search emits, the `watch?v=`
-/// form, and the `youtu.be/` and `/shorts/` paths, so a thumbnail can be built
-/// whichever shape a given yt-dlp version produces.
+/// Reads the video id out of a YouTube URL (bare id, `watch?v=`, `youtu.be/`, `/shorts/`).
 pub fn url_video_id(url: &str) -> Option<&str> {
     const PREFIXES: [&str; 4] = [
         "https://www.youtube.com/watch?v=",

@@ -25,37 +25,23 @@ use tokio::task::AbortHandle;
 
 /// Length of the acknowledgement tone.
 const BEEP_DURATION: Duration = Duration::from_millis(150);
-/// Songbird mixes at 48 kHz stereo, so the tone is encoded in that format
-/// and needs no resampling.
+/// Songbird mixes at 48 kHz stereo, so the tone needs no resampling.
 const BEEP_SAMPLE_RATE: u32 = 48_000;
 const BEEP_CHANNELS: u16 = 2;
 
-/// Which acknowledgement tone to play back.
-///
-/// The stages answer different questions -- "did it hear me?", "is it ready for
-/// what I am about to say?", and "sorry, that did not become a song" -- and a
-/// speaker who says the next word before the second tone finishes needs to tell
-/// them apart by ear. They are a tone apart rather than a melody, so the set
-/// stays recognisable as the same acknowledgement instead of becoming something
-/// to wait for.
+/// Which acknowledgement tone to play; a tone apart so speakers can tell the stages apart by ear.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
     /// The wake word was heard. The first model is done listening.
     Wake,
     /// The larger model is loaded and ready for the request.
     Ready,
-    /// Nothing became of the request: no match, no search result, or a fetch
-    /// that failed.
+    /// Nothing became of the request: no match, no result, or a failed fetch.
     Miss,
 }
 
 impl Tone {
-    /// The tone's frequency in Hz: A5, the next one up, and A4.
-    ///
-    /// The miss tone is *below* the other two rather than between or above
-    /// them: a failure answer should not sound like the start of an
-    /// acknowledgement, and dropping an octave from A5 to A4 is a larger,
-    /// easier-to-hear gap than the semitone the ready tone sits above.
+    /// A5, the next one up, and A4: the miss drops an octave so it can't pass for an ack.
     pub fn frequency(self) -> f32 {
         match self {
             Self::Wake => 880.0,
@@ -65,26 +51,19 @@ impl Tone {
     }
 }
 
-/// What became of a request once it had been resolved and downloaded.
-///
-/// Carried out of [`Player::resolve_and_queue`] rather than logged inside it, so
-/// the Discord-facing part of a request (drawing the dashboard, posting the
-/// chooser) is separable from the part that decides which song it was.
+/// What became of a resolved request, returned so the Discord side stays separate from song choice.
 #[derive(Debug)]
 pub enum Outcome {
-    /// The song joined the queue. `starting` says whether nothing was playing,
-    /// in which case playback begins now rather than when the queue reaches it.
+    /// Queued; `starting` means nothing was playing, so it begins now.
     Played { starting: bool },
-    /// Nothing was convincing enough to play; the caller should offer these,
-    /// after the album when the words also named one.
+    /// Nothing was convincing enough; offer these, after the album when one was named.
     Asked {
         tracks: Vec<resolve::CatalogTrack>,
         album: Option<resolve::CatalogAlbum>,
     },
     /// The words named an album and no song: every track of it is queued.
     Album(resolve::CatalogAlbum),
-    /// Uploads of one known song, none of which the scorer was sure enough
-    /// about. Offering them is a choice between *recordings*, not between songs.
+    /// Uploads of one known song, none certain enough: a choice between recordings, not songs.
     Uploads(search::Choice),
     /// Nothing matched at all.
     Unknown,
@@ -92,12 +71,7 @@ pub enum Outcome {
     Cancelled,
 }
 
-/// Why a request could not be turned into a song.
-///
-/// The speaker gets a tone and a message for each of these. Previously every
-/// failure was a `println!` nobody in the voice channel can see, so the
-/// complaint was silence: the person who said "play X" heard nothing back and
-/// no idea whether the bot had not heard them or could not find the song.
+/// Why a request could not become a song; each gets a tone and a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Problem {
     /// Nothing in the catalog or on YouTube was convincing enough.
@@ -110,10 +84,7 @@ pub enum Problem {
     NoAlbum,
 }
 
-/// A failure, and what to tell the listener about it.
-///
-/// Carried as its own type rather than inferred from the message so the wording
-/// of an error can change without changing which message the listener reads.
+/// A failure as its own type, so message wording can change without changing which one is shown.
 #[derive(Debug)]
 pub struct Failure {
     pub problem: Problem,
@@ -131,11 +102,7 @@ impl Failure {
         Self { problem, error }
     }
 
-    /// What the listener is told, in one place so every failure reads the same.
-    ///
-    /// Echoes back what was heard, because the two things a person needs in
-    /// order to fix this are what the bot thought it heard and what to say
-    /// instead.
+    /// The listener's message, echoing what was heard so they know what to say instead.
     fn message(&self, heard: &str) -> String {
         match self.problem {
             Problem::NoMatch => format!(
@@ -162,29 +129,21 @@ pub struct Player {
     pub manager: Arc<Songbird>,
     /// The per-guild play queues, shared with the interaction handler.
     pub queues: Queues,
-    /// Serialises the work for one guild.
-    ///
-    /// Two commands handled at once would each download and then start a
-    /// track, and the second would replace the first mid-flight, so the song
-    /// that was asked for would be heard as the one before it.
-    /// How requests in flight and playback controls share this guild.
+    /// Serialises requests and playback controls per guild.
     coordination: Coordination,
     /// The track playing per guild, needed to pause and resume it.
     tracks: Tracks,
-    /// Where each guild's dashboard lives, so a new song edits the existing
-    /// message instead of posting another one beside it.
+    /// Each guild's dashboard, so a new song edits it instead of posting another.
     dashboards: Dashboards,
     /// The timer per guild that moves the dashboard's progress bar along.
     refreshes: Refreshes,
     /// Resolves a spoken request to a real song before YouTube is searched.
     catalog: Arc<resolve::Catalog>,
-    /// The "which one did you mean" buttons currently on offer.
-    /// The outstanding `/play` search per guild.
+    /// The outstanding chooser per guild.
     asks: Asks,
     /// Who has the music lowered while they talk to the bot.
     ducks: Ducks,
-    /// What the bot remembers, or `None` when it has been given no place to
-    /// remember in.
+    /// What the bot remembers, or `None` without a place to store it.
     pub library: Option<Arc<crate::library::Library>>,
     /// Queued songs waiting to be judged: kept, or skipped too fast to trust?
     pending: PendingLearn,
@@ -196,18 +155,10 @@ pub struct Player {
     autocomplete_cache: AutocompleteCache,
 }
 
-/// Turns a search result into a queued song.
-///
-/// Behind a trait so the download can be made slow, slow-and-failing, or
-/// instant in tests: the bug this seam exists for is about *when* the download
-/// happens relative to the locks, which cannot be observed with a real yt-dlp.
+/// Turns a search result into a queued song; a trait so tests control when the download happens.
 #[serenity::async_trait]
 pub trait AudioFetcher: Send + Sync {
-    /// Downloads `found` and returns the song to queue.
-    ///
-    /// `in_use` names the audio already playing or queued, which the download
-    /// cache must not prune: songbird reads a queued song's file when it starts,
-    /// so deleting it plays silence instead of the song.
+    /// Downloads `found`; `in_use` files must not be pruned, or songbird plays silence.
     async fn fetch(
         &self,
         guild_id: GuildId,
@@ -229,11 +180,9 @@ impl AudioFetcher for YtDlpFetch {
         in_use: &[std::path::PathBuf],
         timing: &Timing,
     ) -> anyhow::Result<Queued> {
-        // A video with no id cannot be cached or given a thumbnail, but the
-        // audio is still worth playing.
+        // No id means no cache or thumbnail, but the audio still plays.
         let video_id = found.video_id().unwrap_or_default().to_string();
-        // Resolved before the song joins the queue, so a failed fetch leaves
-        // the queue and whatever is playing alone.
+        // Fetched before queueing, so a failure leaves the queue alone.
         let source = fetch::fetch(
             &video_id,
             &found.url,
@@ -251,42 +200,26 @@ impl AudioFetcher for YtDlpFetch {
             url: found.url.clone(),
             video_id,
             duration_secs: found.duration.filter(|d| *d > 0.0),
-            // The caller says otherwise when it was not a spoken request.
+            // Callers override this for non-spoken requests.
             origin: crate::queue::Origin::Voice,
-            // The caller says so when the song memory chose it.
+            // Set by the caller when the song memory chose it.
             remembered: None,
         })
     }
 }
 
-/// How long a miss notice stays up before the bot cleans it away.
-///
-/// Long enough for the person who spoke to look over and read what went wrong;
-/// short enough that the channel is not a wall of past failures.
+/// How long a miss notice stays up: long enough to read, short enough not to pile up.
 const NOTICE_TTL: Duration = Duration::from_secs(30);
 
-/// How long a chooser stays up before the bot clears it away.
-///
-/// Long enough to read the list and press something; short enough that an
-/// unanswered question does not sit in the channel as a stale set of buttons.
+/// How long a chooser stays up before it is cleared.
 const ASK_TTL: Duration = Duration::from_secs(30);
 
-/// A pending question, and what each of its buttons would play.
-///
-/// What one button on a chooser would play.
-///
-/// Two kinds, because there are two questions. A catalog question offers
-/// *songs* — "Stand By Me" by Ben E. King or by Oasis — and pressing one means
-/// going and finding that song's upload, so the button stores the track rather
-/// than a video. A video question offers *uploads of one known song*, and
-/// pressing one plays it directly.
+/// What one chooser button plays: a catalog song (upload found on press) or a specific upload.
 #[derive(Debug, Clone)]
 enum Offer {
     /// A specific upload, from a search nothing catalog-backed produced.
     Video(search::Candidate),
-    /// A catalog song. The user has already chosen the song by pressing it, so
-    /// its best upload is taken even when the upload's own score is modest: the
-    /// hard part, deciding which song it is, has already been answered.
+    /// A catalog song the user already picked, so its best upload is taken even at a modest score.
     Song {
         track: resolve::CatalogTrack,
         requested: String,
@@ -295,19 +228,14 @@ enum Offer {
     Album(resolve::CatalogAlbum),
 }
 
-/// How a chosen song was asked for: shown on the dashboard, and, for a pick
-/// from a chooser, the words to remember it by.
+/// How a chosen song was asked for: shown on the dashboard, and for a pick, the words to remember.
 #[derive(Debug, Clone, Copy)]
 struct Via<'a> {
     said: Option<&'a str>,
     origin: crate::queue::Origin,
 }
 
-/// Who may answer an outstanding question.
-///
-/// The two ways into the same chooser have different owners, and the difference
-/// is not incidental. A typed search is one person's question; a spoken one is
-/// the channel's, because the bot hears a voice and cannot tell who spoke it.
+/// Who may answer: a typed search is the typer's, a spoken one the channel's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Owner {
     /// Whoever typed `/play`.
@@ -316,32 +244,19 @@ enum Owner {
     Voice,
 }
 
-/// An outstanding question, one per guild.
-///
-/// Every page is a window onto one list rather than a fresh search, so turning
-/// the page never asks the catalog again and never reshuffles what the asker
-/// has already looked at.
-///
-/// Holds the same thing `/play` offers and the same thing a spoken request
-/// offers when it is not confident enough to play on its own: catalog songs, or
-/// -- where no catalog matched at all -- raw uploads, which are only ever played
-/// because someone pressed one.
+/// An outstanding question; pages are windows onto one list, so paging never re-searches.
 #[derive(Debug, Clone)]
 struct Ask {
-    /// The words that were typed or heard, echoed in the message and used for
-    /// the upload search of whichever song gets picked.
+    /// The words typed or heard, echoed and used for the picked song's upload search.
     query: String,
-    /// The words a pick from this chooser is remembered by, cleaned the way a
-    /// spoken request is (see [`crate::parser::typed_request`]). Absent when
-    /// there is nothing to remember it by, such as a link.
+    /// The cleaned words a pick is remembered by; `None` for e.g. a link.
     said: Option<String>,
     /// Everything on offer, in rank order.
     offers: Vec<Offer>,
     /// Which window is on screen.
     page: usize,
     owner: Owner,
-    /// Where the chooser message is, so turning the page edits it in place
-    /// rather than posting a second one. Absent until the first send lands.
+    /// Where the chooser was posted, so paging edits it; `None` until sent.
     posted: Option<(ChannelId, MessageId)>,
 }
 
@@ -370,9 +285,7 @@ impl Ask {
 }
 
 impl Offer {
-    /// How this offer is drawn in the chooser: a song shows its artist, an
-    /// upload the channel that put it up, because for an upload those are the
-    /// only things telling two of them apart.
+    /// A song shows its artist, an upload its channel: the only things telling uploads apart.
     fn option(&self) -> dashboard::ChoiceOption<'_> {
         match self {
             Offer::Video(candidate) => dashboard::ChoiceOption {
@@ -403,10 +316,7 @@ impl Offer {
     }
 }
 
-/// The outstanding question per guild.
-///
-/// One per guild, and asking again replaces the previous one: a question nobody
-/// answered must not outlive the question it was for.
+/// The outstanding question per guild; asking again replaces it.
 #[derive(Debug, Clone, Default)]
 struct Asks(Arc<Mutex<HashMap<GuildId, Ask>>>);
 
@@ -424,11 +334,7 @@ impl Asks {
         self.lock().remove(&guild_id).is_some()
     }
 
-    /// Clears the entry only if it is still the message the timer was set for.
-    ///
-    /// A page turn rewrites the same message, so it keeps expiring on the
-    /// original clock; a newer chooser has its own message and must not have
-    /// its entry removed by the old one's timer.
+    /// Clears only if still the timer's message, so an old timer cannot clear a newer chooser.
     fn clear_if(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId) -> bool {
         let mut asks = self.lock();
         if asks
@@ -447,15 +353,12 @@ impl Asks {
     }
 }
 
-/// Which voice streams currently have the music lowered, per guild. The music
-/// is low while any of them does, so one speaker finishing does not bring it
-/// back up under another who is still talking.
+/// Voice streams lowering the music per guild; it stays low while any of them is talking.
 #[derive(Debug, Clone, Default)]
 struct Ducks(Arc<Mutex<HashMap<GuildId, std::collections::HashSet<u32>>>>);
 
 impl Ducks {
-    /// Records `ssrc` lowering (or releasing) the music; returns whether the
-    /// guild's music should now be low.
+    /// Records `ssrc` lowering or releasing; returns whether the music should now be low.
     fn set(&self, guild_id: GuildId, ssrc: u32, on: bool) -> bool {
         let mut all = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let holders = all.entry(guild_id).or_default();
@@ -518,23 +421,12 @@ impl Busy {
     }
 }
 
-/// Per-guild coordination between the requests in flight and the playback
-/// controls.
-///
-/// Split out of `Player` because `Songbird` cannot be constructed without a
-/// voice connection, and the thing that went wrong here is entirely about which
-/// lock is held when -- which needs no connection to test.
+/// Per-guild coordination of requests and playback controls; testable without a voice connection.
 #[derive(Debug, Clone, Default)]
 struct Coordination {
-    /// Held for a whole request: the catalog lookup, the video search and the
-    /// download. Two commands spoken at once would each start a track, and the
-    /// second would replace the first mid-flight, so the song that was asked
-    /// for would be heard as the one before it. It is FIFO, so requests are
-    /// served in the order they were spoken.
+    /// Held for a whole request; FIFO, so concurrent requests play in the order spoken.
     order: Busy,
-    /// Held only while the queue changes: `commit`, `skip`, `stop` and the
-    /// follower that plays songs on. Nothing slow ever holds it, which is what
-    /// keeps Skip and Stop answering during a three-minute download.
+    /// Held only while the queue changes, never across anything slow, so Skip and Stop stay live.
     busy: Busy,
     /// Bumped by Stop, so a request still downloading knows it was cancelled.
     generations: Generations,
@@ -557,8 +449,7 @@ pub struct PlaylistQueued {
 }
 
 impl PlaylistQueued {
-    /// What was queued, in a sentence or three: the reply to `/play`, and the
-    /// notice a spoken album request posts.
+    /// What was queued, as the `/play` reply or a spoken album notice.
     pub fn summary(&self) -> String {
         let others = self.queued - 1;
         let first = dashboard::markdown_escape(&self.first);
@@ -606,9 +497,6 @@ enum Commit {
 }
 
 /// One guild's cancellation counter.
-///
-/// Named rather than spelled out at each use, because the type of the thing
-/// being compared is not the point of any of these comparisons.
 #[derive(Debug, Default)]
 struct Cancellation(std::sync::atomic::AtomicU64);
 
@@ -623,9 +511,6 @@ impl Cancellation {
 }
 
 /// A queued song waiting to be judged: kept, or skipped too fast to trust.
-///
-/// Keyed by the video URL, so the judgement lands on the right song however
-/// many are queued behind it. Bounded by the queue, which is bounded.
 #[derive(Debug, Clone)]
 struct Pending {
     /// What was asked for, as heard.
@@ -634,8 +519,7 @@ struct Pending {
     track: crate::library::Track,
 }
 
-/// What a chooser pick is remembered as: the catalog song when the pick was
-/// one, otherwise the upload itself, with the video that was played either way.
+/// What a chooser pick is remembered as: the catalog song, else the upload, with the played video.
 fn picked_track(
     song: Option<&resolve::CatalogTrack>,
     candidate: &search::Candidate,
@@ -657,11 +541,7 @@ fn picked_track(
     })
 }
 
-/// The words a pick from a typed `/play` search is remembered by.
-///
-/// Cleaned exactly the way a spoken request is, so a phrase taught by typing is
-/// found when spoken, and the other way round. A link is never remembered: it
-/// names one video already, and its cleaned-up letters mean nothing to say.
+/// The words a typed pick is remembered by, cleaned like speech; links are never remembered.
 fn remembered_as(typed: &str) -> Option<String> {
     let is_link = typed.split_whitespace().any(|word| {
         let word = word.to_ascii_lowercase();
@@ -674,16 +554,14 @@ fn remembered_as(typed: &str) -> Option<String> {
     crate::parser::typed_request(typed).map(|request| request.query)
 }
 
-/// Moves `song` to the front of `tracks`, adding it when the catalog did not
-/// find it this time.
+/// Moves `song` to the front of `tracks`, adding it if missing.
 fn put_first(tracks: &mut Vec<resolve::CatalogTrack>, song: resolve::CatalogTrack) {
     let same = |track: &resolve::CatalogTrack| {
         crate::matcher::normalize(&track.artist) == crate::matcher::normalize(&song.artist)
             && crate::matcher::normalize(&track.title) == crate::matcher::normalize(&song.title)
     };
     let song = match tracks.iter().position(same) {
-        // The remembered video wins over the catalog's own: it is the one that
-        // was picked and played.
+        // The remembered video wins: it is the one that was picked and played.
         Some(at) => {
             let found = tracks.remove(at);
             resolve::CatalogTrack {
@@ -696,8 +574,7 @@ fn put_first(tracks: &mut Vec<resolve::CatalogTrack>, song: resolve::CatalogTrac
     tracks.insert(0, song);
 }
 
-/// Typed or remembered words as a request, read the way a spoken one is, so
-/// "dracula by tame impala" searches the catalog as if it had been said.
+/// Typed or remembered words, read as a spoken request would be.
 fn request_for(words: &str) -> PlayRequest {
     PlayRequest {
         query: words.to_string(),
@@ -710,9 +587,7 @@ fn request_for(words: &str) -> PlayRequest {
     }
 }
 
-/// The songs to offer again after the memory picked `wrong` for those words:
-/// all of them but that one. The wrong song stays when it is the only one,
-/// because a single choice is still a question and an empty one is not.
+/// The songs to offer again without `wrong`, unless it is the only one.
 fn without_wrong(
     tracks: Vec<resolve::CatalogTrack>,
     wrong: Option<&crate::library::Track>,
@@ -733,11 +608,7 @@ fn without_wrong(
         .collect()
 }
 
-/// The songs waiting to be judged, by video URL.
-///
-/// The URL rather than the audio file, because the file is not a stable name
-/// for a song: a streamed song has no file until its first play finishes, and
-/// one video can be fetched twice into two of them.
+/// Songs waiting to be judged, keyed by video URL since the audio file is not a stable name.
 #[derive(Debug, Clone, Default)]
 struct PendingLearn(Arc<Mutex<HashMap<String, Pending>>>);
 
@@ -749,8 +620,7 @@ impl PendingLearn {
             .insert(url, pending);
     }
 
-    /// Takes the judgement for a song, so it is made once however the song
-    /// ended.
+    /// Takes a song's judgement, so it is made once however the song ended.
     fn take(&self, url: &str) -> Option<Pending> {
         self.0
             .lock()
@@ -779,12 +649,7 @@ impl StartedAt {
     }
 }
 
-/// A per-guild counter bumped whenever playback is cancelled.
-///
-/// A `stop` bumps it; a request still downloading compares against the number
-/// it started with and drops its result rather than queueing a song into a
-/// queue the listener just emptied. This is what makes Stop actually cancel a
-/// pending request rather than merely clearing what is there now.
+/// A per-guild counter bumped by `stop`, so a request still downloading drops its result.
 #[derive(Debug, Clone, Default)]
 struct Generations(Arc<Mutex<HashMap<GuildId, Arc<Cancellation>>>>);
 
@@ -801,12 +666,8 @@ impl Generations {
 }
 
 impl Coordination {
-    /// Claims the right to resolve one request for `guild_id`.
-    ///
-    /// The returned guard is held for the whole request and must be dropped at
-    /// the end of it; `started_at` is the cancellation number to hand back to
-    /// [`Self::commit`]. Read *after* the lock is taken, so a Stop that lands
-    /// while this request waits its turn still counts against it.
+    /// Claims one request for `guild_id`; hold the guard and pass the number to [`Self::commit`].
+    /// Read after locking, so a Stop while waiting still counts.
     async fn begin(&self, guild_id: GuildId) -> (OwnedMutexGuard<()>, u64) {
         let order = self.order.get(guild_id);
         let guard = order.lock_owned().await;
@@ -824,10 +685,7 @@ impl Coordination {
         self.generations.bump(guild_id);
     }
 
-    /// Adds an already-downloaded song to the queue.
-    ///
-    /// The only place a spoken request takes the playback lock, and it is taken
-    /// after the search and the download rather than around them.
+    /// Queues an already-downloaded song; the only place a request takes the playback lock.
     async fn commit(
         &self,
         guild_id: GuildId,
@@ -844,8 +702,7 @@ impl Coordination {
             .await
     }
 
-    /// The body of [`Self::commit`], split out so the timing wrapper cannot be
-    /// skipped by one of the early returns inside it.
+    /// Body of [`Self::commit`], split so early returns cannot skip the timing wrapper.
     async fn commit_locked(
         &self,
         guild_id: GuildId,
@@ -864,8 +721,7 @@ impl Coordination {
             return Commit::Cancelled;
         }
 
-        // An empty queue means nothing is playing, so this is the first song
-        // and should start rather than wait.
+        // An empty queue means nothing is playing, so this one starts.
         let starting = queue.is_idle();
         if !queue.push(song.clone()) {
             return Commit::QueueFull;
@@ -881,10 +737,7 @@ impl Coordination {
     }
 }
 
-/// The playing track per guild.
-///
-/// Pausing and resuming go through a [`TrackHandle`] rather than the call, so
-/// the handle has to be kept.
+/// The playing track per guild, kept because pause and resume need its handle.
 #[derive(Debug, Clone, Default)]
 struct Tracks(Arc<Mutex<HashMap<GuildId, TrackHandle>>>);
 
@@ -909,12 +762,7 @@ impl Tracks {
 /// Where a guild's dashboard is, and what it is showing.
 type Dashboard = (ChannelId, MessageId, Page);
 
-/// The channel, message id and page of each guild's dashboard.
-///
-/// Only the ids are kept; the dashboard is rebuilt from the queue every time,
-/// so a cached copy of the message would go stale. The page is kept because a
-/// redraw must not yank the view away from someone who opened the queue to
-/// read it -- a song ending while they are looking has to leave them looking.
+/// Each guild's dashboard ids and page; the page is kept so a redraw doesn't leave the queue view.
 #[derive(Debug, Clone, Default)]
 struct Dashboards(Arc<Mutex<HashMap<GuildId, Dashboard>>>);
 
@@ -957,17 +805,10 @@ impl Dashboards {
     }
 }
 
-/// How often the dashboard of a playing song is redrawn to move its progress
-/// bar along.
-///
-/// Discord does not update a message by itself, and every redraw is an edit
-/// against the channel's rate limit, so the bar steps rather than glides.
+/// How often a playing dashboard redraws its bar; each redraw is a rate-limited edit.
 const REFRESH_EVERY: Duration = Duration::from_secs(15);
 
-/// The progress bar timer running for each guild.
-///
-/// At most one per guild: every redraw replaces it, so the next step is always
-/// a whole interval after the last edit, whoever made it.
+/// The progress bar timer per guild; each redraw replaces it.
 #[derive(Debug, Clone, Default)]
 struct Refreshes(Arc<Mutex<HashMap<GuildId, AbortHandle>>>);
 
@@ -991,17 +832,12 @@ impl Refreshes {
     }
 }
 
-/// Whether a dashboard just drawn is worth redrawing for its progress bar.
-///
-/// Only the now-playing view of a song that is moving has a bar that moves: a
-/// paused song's bar is frozen until resume redraws it, and the queue view and
-/// the idle dashboard have no bar at all.
+/// Whether a fresh dashboard has a moving bar: now-playing, unpaused, with a bar.
 fn worth_refreshing(page: Page, has_bar: bool, paused: bool) -> bool {
     page == Page::NowPlaying && has_bar && !paused
 }
 
-/// What drawing a dashboard reads and keeps, owned so a refresh timer can
-/// outlive the call that started it.
+/// What drawing a dashboard needs, owned so a refresh timer can outlive the caller.
 #[derive(Clone)]
 struct Board {
     dashboards: Dashboards,
@@ -1040,8 +876,7 @@ impl Player {
         }
     }
 
-    /// Brings the music back to full volume whoever lowered it, as when
-    /// listening is locked and nobody is going to finish their request.
+    /// Restores full volume whoever lowered it, e.g. when listening is locked.
     pub fn release_duck(&self, guild_id: GuildId) {
         self.ducks.clear(guild_id);
         if let Some(handle) = self.tracks.get(guild_id) {
@@ -1049,10 +884,7 @@ impl Player {
         }
     }
 
-    /// Lowers (or restores) the music while `ssrc` is talking to the bot.
-    ///
-    /// Someone without headphones feeds the song back into their microphone,
-    /// and the model then transcribes the lyrics along with the request.
+    /// Lowers the music while `ssrc` talks, so an open mic does not feed lyrics to the model.
     pub fn duck(&self, guild_id: GuildId, ssrc: u32, on: bool) {
         let low = self.ducks.set(guild_id, ssrc, on);
         if let Some(handle) = self.tracks.get(guild_id) {
@@ -1060,13 +892,7 @@ impl Player {
         }
     }
 
-    /// Plays a short tone so the speaker knows the wake word and command were
-    /// both understood, without stopping whatever is currently playing.
-    ///
-    /// The tone is given time to finish before the music starts, so it is not
-    /// cut off by the song that follows. That wait happens even for the wake
-    /// tone, which precedes a model load rather than a song: back to back tones
-    /// would otherwise run into one another and read as a single beep.
+    /// Plays an ack tone over the music and waits for it, so back-to-back tones don't merge.
     pub async fn acknowledge(&self, guild_id: GuildId, tone: Tone) -> anyhow::Result<()> {
         let call = self
             .manager
@@ -1080,17 +906,7 @@ impl Player {
         Ok(())
     }
 
-    /// Finds the song the request means and adds it to the back of the
-    /// guild's queue.
-    ///
-    /// The request is resolved against the catalog first, so the YouTube search
-    /// is aimed at a known song rather than at whatever words were heard, and
-    /// the results are scored against that song rather than by popularity. See
-    /// [`crate::search`] for why the last point matters.
-    ///
-    /// When the best result is not convincing enough the bot posts the closest
-    /// few in the alert channel and plays nothing, rather than picking a song
-    /// the listener did not ask for.
+    /// Resolves the request against the catalog and queues it, or asks when nothing is convincing.
     pub async fn play(
         self: &Arc<Self>,
         ctx: &SerenityContext,
@@ -1124,9 +940,7 @@ impl Player {
                 self.play_album(ctx, config, guild_id, &request.query, &album)
                     .await
             }
-            // Nothing was verified. Say so, and offer unverified results only if
-            // the operator asked for them -- clearly labelled, and never played
-            // on their own.
+            // Nothing verified: offer unverified results only if the operator opted in.
             Ok(Outcome::Unknown) => {
                 let failure = Failure::new(
                     Problem::NoMatch,
@@ -1146,8 +960,7 @@ impl Player {
             Ok(Outcome::Played { starting: true }) => {
                 self.start_next(ctx, config, guild_id, timing).await;
             }
-            // Either way the dashboard is redrawn: a played song needs naming,
-            // and a cancelled one may have moved the queue along underneath it.
+            // Redraw either way: a cancelled request may have moved the queue.
             Ok(_) => self.draw_dashboard(ctx, config, guild_id).await,
             Err(failure) => {
                 self.report(ctx, config, guild_id, &heard, &failure).await;
@@ -1157,11 +970,7 @@ impl Player {
         Ok(())
     }
 
-    /// Tells the listener their request did not become a song.
-    ///
-    /// A tone first, because the person who spoke is standing in a voice
-    /// channel and may not be reading the text channel at all; then a message
-    /// saying what was heard, which is the part they can act on.
+    /// Tells the listener the request failed: a tone first, then a message with what was heard.
     async fn report(
         &self,
         ctx: &SerenityContext,
@@ -1190,8 +999,7 @@ impl Player {
         .await;
     }
 
-    /// Posts a short message in the text channel, which takes itself away
-    /// after [`NOTICE_TTL`]: it is worth reading once, not keeping as a record.
+    /// Posts a short notice that deletes itself after [`NOTICE_TTL`].
     async fn post_notice(
         &self,
         ctx: &SerenityContext,
@@ -1233,8 +1041,7 @@ impl Player {
         }
     }
 
-    /// Plays the album a request named as one ("play the album 17 by
-    /// xxxtentacion"), or asks which one when several answer to it.
+    /// Plays the album a request named, or asks which when several match.
     async fn play_named_album(
         self: &Arc<Self>,
         ctx: &SerenityContext,
@@ -1269,11 +1076,7 @@ impl Player {
         }
     }
 
-    /// Queues every track of `album` and says so in the text channel.
-    ///
-    /// The tracks are listed and queued exactly as a pasted album link is: the
-    /// first now, the rest in the background, and a Stop drops whatever has
-    /// not been queued yet.
+    /// Queues every track of `album` like a pasted album link: first now, the rest in background.
     async fn play_album(
         self: &Arc<Self>,
         ctx: &SerenityContext,
@@ -1311,12 +1114,7 @@ impl Player {
     }
 
     /// Turns a spoken request into a queued song, without touching Discord.
-    ///
-    /// The catalog lookup, the video search and the download all run here, and
-    /// none of them holds the playback lock. Only
-    /// [`Coordination::commit`] takes it, for the one step that changes the
-    /// queue -- so a three-minute download cannot make Skip or Stop stop
-    /// answering.
+    /// Only [`Coordination::commit`] takes the playback lock, so downloads never block Skip.
     async fn resolve_and_queue(
         &self,
         config: &Config,
@@ -1326,8 +1124,7 @@ impl Player {
         timing: &Timing,
     ) -> Result<Outcome, Failure> {
         let queue = self.queues.get(guild_id);
-        // Checked before searching, so a full queue fails without a download.
-        // `commit` checks again, since another request may have filled it.
+        // Fail fast before downloading; `commit` checks again.
         if queue.is_full() {
             return Err(Failure::new(
                 Problem::QueueFull,
@@ -1335,13 +1132,9 @@ impl Player {
             ));
         }
 
-        // Claims the request ordering lock and reads the cancellation number to
-        // hand back to `commit`. Read after the lock is taken, so a Stop that
-        // lands while this request waits its turn still counts against it.
         let (_serialised, started_at) = self.coordination.begin(guild_id).await;
 
-        // A phrase the song memory was taught plays what it was taught, and the
-        // song says so on the dashboard, with the button that untaught it.
+        // A taught phrase plays what it was taught.
         let remembered = self
             .library
             .as_deref()
@@ -1350,8 +1143,7 @@ impl Player {
         let resolved = match remembered {
             Some(resolved) => resolved,
             None => {
-                // Looked up as a song and as an album at once, so asking about
-                // albums adds no wait. See `crate::album` for which one wins.
+                // Song and album looked up together, so albums add no wait; see `crate::album`.
                 let album_query = crate::album::query(request);
                 let (resolved, albums) = tokio::join!(
                     search::resolve_request(
@@ -1414,9 +1206,7 @@ impl Player {
             ));
         };
         if !choice.confident {
-            // The song is known; the upload is not. Offering the closest
-            // uploads of *this* song is a much better question than asking which
-            // song, and the answer is never wrong about which song it is.
+            // Song known, upload uncertain: ask which upload, not which song.
             return Ok(Outcome::Uploads(choice));
         }
 
@@ -1427,9 +1217,7 @@ impl Player {
             .map_err(|e| Failure::new(Problem::FetchFailed, e))?;
         song.remembered = recalled.then(|| request.query.clone());
 
-        // The request is being committed; record it for the learning that
-        // happens when the song finishes (or is skipped). Recorded only once
-        // the fetch succeeded, so a failed one leaves nothing behind.
+        // Recorded only after a successful fetch, for judging when the song stops.
         self.pending.set(
             best.candidate.url.clone(),
             Pending {
@@ -1438,9 +1226,7 @@ impl Player {
                     artist: track.artist.clone(),
                     title: track.title.clone(),
                     duration_secs: track.duration_secs,
-                    // The upload that was chosen, not the catalog's: it is the
-                    // one that played, so a phrase heard again can go straight
-                    // to it.
+                    // The played upload, so the phrase can go straight to it next time.
                     video_id: best.candidate.video_id().map(str::to_string),
                 },
             },
@@ -1449,8 +1235,7 @@ impl Player {
             .outcome(guild_id, &queue, song, started_at, timing)
             .await;
         if matches!(outcome, Outcome::Cancelled) {
-            // Never queued, so it never stops and is never judged; left in
-            // place it would judge a later play of the same video by these words.
+            // Never queued, so drop it before it misjudges a later play of this video.
             self.pending.take(&best.candidate.url);
         }
         Ok(outcome)
@@ -1482,11 +1267,7 @@ impl Player {
         }
     }
 
-    /// Posts "which song did you mean" in the alert channel.
-    ///
-    /// The options are *songs* — "Stand By Me" by Ben E. King or by Oasis —
-    /// because that is the question the listener was actually asking. Offering
-    /// video titles instead answers a question about uploads they never asked.
+    /// Posts "which song did you mean", offering songs rather than uploads.
     async fn offer_songs(
         &self,
         ctx: &SerenityContext,
@@ -1508,13 +1289,7 @@ impl Player {
             .await;
     }
 
-    /// Offers raw YouTube results for a request nothing matched.
-    ///
-    /// These were never checked against a catalog, so they are labelled
-    /// unverified and are never played on their own -- the user pressing one is
-    /// the only thing that can start it. Better than silence when the catalog
-    /// has never heard of the song, and worse than silence would be if any of
-    /// them could start playing by themselves.
+    /// Offers unverified YouTube results; only a button press can play one.
     async fn offer_unverified(
         &self,
         ctx: &SerenityContext,
@@ -1545,8 +1320,7 @@ impl Player {
         }
     }
 
-    /// Puts raw uploads on offer for a song the catalog named but no upload
-    /// matched well enough to play on its own.
+    /// Offers uploads of a catalog song when none matched well enough to auto-play.
     async fn offer_uploads(
         &self,
         ctx: &SerenityContext,
@@ -1558,8 +1332,7 @@ impl Player {
         let offers: Vec<Offer> = choice
             .top(dashboard::ASK_PAGE)
             .iter()
-            // Without a video id there is nothing to play and nothing to key
-            // the button on, so it cannot be offered.
+            // No video id: nothing to play or key the button on.
             .filter(|scored| scored.candidate.video_id().is_some())
             .map(|scored| Offer::Video(scored.candidate.clone()))
             .collect();
@@ -1571,18 +1344,12 @@ impl Player {
     pub async fn skip(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
         let lock = self.coordination.busy(guild_id);
         let _guard = lock.lock().await;
-        // Not part of any request, so nothing is timed: a song starting because
-        // the one before it ended is not anybody's time to first audio.
+        // Not part of a request, so nothing is timed.
         self.start_next(ctx, config, guild_id, &Timing::default())
             .await;
     }
 
-    /// Pauses the current song, or resumes it.
-    ///
-    /// Takes the state the button asked for rather than flipping it, so two
-    /// quick presses of Pause do not pause and then resume.
-    /// Returns whether the song is now paused, or `None` when nothing is
-    /// playing to pause.
+    /// Sets the asked-for pause state (not a toggle, so double presses are safe); `None` if idle.
     pub async fn set_paused(&self, guild_id: GuildId, paused: bool) -> Option<bool> {
         let handle = self.tracks.get(guild_id)?;
         let queue = self.queues.get(guild_id);
@@ -1600,12 +1367,7 @@ impl Player {
     }
 
     /// Stops playback and clears the queue.
-    ///
-    /// The cancellation counter is bumped *before* the lock is taken, so a
-    /// request still downloading will already see itself as cancelled by the
-    /// time it tries to queue its song. Taking the lock first would leave a
-    /// window in which a download commits and is then cleared anyway, which
-    /// works but wastes the download.
+    /// Cancels before locking, so an in-flight download drops itself instead of committing.
     pub async fn stop(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
         self.coordination.cancel(guild_id);
         let lock = self.coordination.busy(guild_id);
@@ -1619,12 +1381,8 @@ impl Player {
         self.draw_dashboard(ctx, config, guild_id).await;
     }
 
-    /// The Wrong song button: forgets the phrase that recalled the song now
-    /// playing, skips it, and asks "Which one?" again for the same words, so
-    /// the right pick is learned in its place.
-    ///
-    /// Returns false when the song playing was not chosen by the song memory,
-    /// which is a press on a dashboard that has since moved on.
+    /// Wrong song: forgets the phrase, skips, and asks again for the same words.
+    /// Returns false when the song wasn't chosen by the memory (a stale press).
     pub async fn wrong_song(
         &self,
         ctx: &SerenityContext,
@@ -1632,8 +1390,7 @@ impl Player {
         guild_id: GuildId,
     ) -> bool {
         let (said, forgotten) = {
-            // Checked and skipped under the lock Skip takes, so a song ending
-            // at the same moment cannot make this skip the one after it.
+            // Under Skip's lock, so a song ending now cannot make this skip the next one.
             let lock = self.coordination.busy(guild_id);
             let _guard = lock.lock().await;
             let Some(song) = self.queues.get(guild_id).current() else {
@@ -1647,8 +1404,7 @@ impl Player {
                 library.save();
                 forgotten
             });
-            // Already judged, by the listener: the skip below must not also
-            // count as a quick one.
+            // Already judged by the listener; the skip must not count as quick too.
             self.pending.take(&song.url);
             tracing::info!(guild_id = %guild_id, said = %said, "wrong song; asking again");
             self.start_next(ctx, config, guild_id, &Timing::default())
@@ -1660,11 +1416,7 @@ impl Player {
         true
     }
 
-    /// Puts the "Which one?" chooser up again for words the memory got wrong.
-    ///
-    /// The same question a spoken request raises, owned by the voice channel, so
-    /// the pick is remembered for those words. The song it got wrong is left
-    /// out, unless it is all the catalog has.
+    /// Re-asks "Which one?" for words the memory got wrong, leaving out the wrong song if possible.
     async fn ask_again(
         &self,
         ctx: &SerenityContext,
@@ -1702,10 +1454,7 @@ impl Player {
             .await;
     }
 
-    /// Moves the queue on by one song and plays it.
-    ///
-    /// The song that was playing is stopped, whether it ended on its own or
-    /// was skipped.
+    /// Stops the current song and plays the next one queued.
     async fn start_next(
         &self,
         ctx: &SerenityContext,
@@ -1714,10 +1463,7 @@ impl Player {
         timing: &Timing,
     ) {
         let advanced = self.queues.get(guild_id).advance();
-        // Whatever just stopped is the last word on whether the request that
-        // queued it was a good one. Checked here rather than on a track event,
-        // because this runs for a skip and for a song that finished on its own
-        // alike, and songbird reports a skipped track as ended too.
+        // Here rather than on a track event: covers skips and natural ends alike.
         self.learn_from_stopped(guild_id, advanced.stopped.as_ref());
         if advanced.current.is_some() {
             self.started_at.set(guild_id, std::time::Instant::now());
@@ -1740,13 +1486,8 @@ impl Player {
         self.draw_dashboard(ctx, config, guild_id).await;
     }
 
-    /// Decides what a finished song says about the request that queued it.
-    ///
-    /// Only a pick from the chooser teaches the memory (see
-    /// [`Self::remember_pick`]); a song the bot chose by itself is never
-    /// remembered, however long it plays. What a finished song can still do is
-    /// count against a remembered phrase: skipped within
-    /// [`crate::library::KEPT_SECS`], twice, and the phrase is forgotten.
+    /// Lets a stopped song count against a remembered phrase (skipped within
+    /// [`crate::library::KEPT_SECS`] twice and it is forgotten); only picks teach the memory.
     fn learn_from_stopped(&self, guild_id: GuildId, stopped: Option<&Queued>) {
         let (Some(stopped), Some(library)) = (stopped, self.library.as_deref()) else {
             return;
@@ -1765,11 +1506,7 @@ impl Player {
         }
     }
 
-    /// Remembers that `said` meant the song just picked from the chooser, so the
-    /// same words play it straight away next time.
-    ///
-    /// Saved at once rather than debounced: picks are rare, and an update that
-    /// restarts the bot a minute later must not lose one.
+    /// Remembers that `said` meant the picked song; saved at once so a restart can't lose it.
     fn remember_pick(
         &self,
         guild_id: GuildId,
@@ -1793,11 +1530,7 @@ impl Player {
         library.save();
     }
 
-    /// Starts the next queued song once this one finishes on its own.
-    ///
-    /// Songbird reports a track ending both when it finishes and when it is
-    /// stopped, so a skip fires this callback too. The generation check makes
-    /// a superseded callback do nothing rather than drop a second song.
+    /// Starts the next song when this one ends; the generation check makes a skip's ending a no-op.
     fn follow_when_finished(
         &self,
         ctx: &SerenityContext,
@@ -1807,8 +1540,7 @@ impl Player {
         generation: u64,
     ) {
         let (tx, mut finished) = mpsc::unbounded_channel();
-        // The handler runs on a songbird thread, so it only wakes the task
-        // below rather than doing the work itself.
+        // Runs on a songbird thread, so it only wakes the task below.
         let _ = handle.add_event(Event::Track(TrackEvent::End), Ended(tx));
 
         let this = Follower {
@@ -1824,23 +1556,16 @@ impl Player {
         tokio::spawn(async move {
             let mut generation = generation;
             while finished.recv().await.is_some() {
-                // The same lock the commands take, so a song ending and a skip
-                // arriving together settle in one order or the other instead
-                // of interleaving.
+                // Same lock as the commands, so an ending and a skip don't interleave.
                 let lock = this.coordination.busy(guild_id);
                 let _held = lock.lock().await;
 
-                // A skip moves the queue on itself, so this song may already
-                // have been replaced. The check keeps a superseded ending
-                // harmless and gives the whole advance one atomic step.
+                // A skip may have advanced already; the check makes a stale ending harmless.
                 let Some(advanced) = this.queues.get(guild_id).advance_if_current(generation)
                 else {
                     return;
                 };
-                // The next ending is checked against the advance that just
-                // happened, not the one before it. Reusing the old number would
-                // make the following song look superseded, and the queue would
-                // stop after a single song.
+                // Track the new generation, or the next song looks superseded and the queue stops.
                 generation = advanced.generation;
 
                 match start_track(
@@ -1854,16 +1579,11 @@ impl Player {
                 {
                     Some(handle) => {
                         this.tracks.set(guild_id, handle.clone());
-                        // Watch the new song in turn, so the queue keeps
-                        // moving until it runs dry.
+                        // Watch the new song so the queue keeps moving.
                         let (tx, rx) = mpsc::unbounded_channel();
                         let _ = handle.add_event(Event::Track(TrackEvent::End), Ended(tx));
                         finished = rx;
-                        // Drawn here rather than only after the loop: every
-                        // advance starts a different song, so waiting until the
-                        // whole queue drained left the dashboard naming the song
-                        // that had already ended for as long as the next one
-                        // played.
+                        // Redraw per advance, or the dashboard names a song that already ended.
                         this.draw_dashboard().await;
                     }
                     None => break,
@@ -1873,19 +1593,13 @@ impl Player {
         });
     }
 
-    /// Treats a pressed dashboard as the guild's dashboard.
-    ///
-    /// The ids live only in memory, so after a restart (or a duplicate post)
-    /// the pressed message would otherwise never be edited and a new one posted.
+    /// Adopts a pressed dashboard, since ids are lost on restart.
     pub fn adopt_dashboard(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId) {
         let page = self.dashboards.page(guild_id);
         self.dashboards.set(guild_id, channel_id, message_id, page);
     }
 
-    /// Creates or updates the guild's dashboard in the alert channel.
-    ///
-    /// Safe to call when no channel is available; feedback is then skipped
-    /// rather than failing the command.
+    /// Creates or updates the guild's dashboard; skipped silently without a channel.
     pub async fn draw_dashboard(&self, ctx: &SerenityContext, config: &Config, guild_id: GuildId) {
         draw(&self.board(), ctx, config, guild_id, None).await;
     }
@@ -1913,10 +1627,7 @@ impl Player {
         .await;
     }
 
-    /// Removes or moves the waiting song `id`, then redraws the queue view.
-    ///
-    /// The song is named by id, so a song that started playing or was removed
-    /// since it was picked is left alone rather than whatever took its place.
+    /// Removes or moves waiting song `id` and redraws; by id, so a stale pick touches nothing else.
     pub async fn edit_queue(
         &self,
         ctx: &SerenityContext,
@@ -1963,8 +1674,7 @@ impl Player {
         draw(&self.board(), ctx, config, guild_id, Some(Page::NowPlaying)).await;
     }
 
-    /// Turns repeat-one on or off and redraws, so the button says which way it
-    /// went. Returns the new setting.
+    /// Toggles repeat-one and redraws; returns the new setting.
     pub async fn toggle_repeat(
         &self,
         ctx: &SerenityContext,
@@ -1976,13 +1686,7 @@ impl Player {
         repeat
     }
 
-    /// Answers a `/play` search: looks the words up in the catalog and posts the
-    /// first page of songs for the asker to choose from.
-    ///
-    /// The catalog answers rather than YouTube, because the buttons name *songs*
-    /// and the upload for the chosen one is found afterwards. A catalog has many
-    /// more songs under a query than there are uploads worth offering, which is
-    /// what makes a second page worth having at all.
+    /// Answers a `/play` search with the first page of catalog songs to choose from.
     pub async fn search_and_ask(
         &self,
         ctx: &SerenityContext,
@@ -1991,8 +1695,7 @@ impl Player {
         query: &str,
         asker: UserId,
     ) -> anyhow::Result<usize> {
-        // Its own request, and its own summary line: a `/play` search is a
-        // catalog lookup and a message, not a half-finished playback.
+        // Its own request with its own summary line.
         let timing = Timing::default();
         let searched = self
             .search_and_ask_inner(ctx, config, guild_id, query, asker, &timing)
@@ -2010,9 +1713,6 @@ impl Player {
         asker: UserId,
         timing: &Timing,
     ) -> anyhow::Result<usize> {
-        // Typed words go through the same reading logic a spoken request does, so
-        // "dracula by tame impala" searches the catalog the way it would have
-        // if it had been said rather than typed.
         let request = request_for(query);
         let mut tracks: Vec<resolve::CatalogTrack> = timing
             .stage(
@@ -2024,9 +1724,7 @@ impl Player {
             .map(|hit| hit.to_track())
             .collect();
 
-        // Words a pick was remembered for, typed or said, put that song first.
-        // Still a question rather than playing it: whoever typed `/play` asked
-        // to choose.
+        // A remembered pick goes first, but still as a question: `/play` asked to choose.
         let said = remembered_as(query);
         let recalled = said
             .as_deref()
@@ -2119,14 +1817,9 @@ impl Player {
         });
     }
 
-    /// Turns to the next page of a `/play` search, redrawing the same message.
-    ///
-    /// Returns whether it moved, so the caller only answers when it did.
+    /// Turns to the next page of a `/play` search; returns whether it moved.
     pub async fn next_page(&self, ctx: &SerenityContext, guild_id: GuildId) -> bool {
-        // Bumped on a copy and stored once, only if the redraw landed. Reading
-        // the page, rendering from it and writing it back in three steps let a
-        // second press render one page behind, and left the stored page wrong
-        // when the edit failed.
+        // Bumped on a copy and stored only if the redraw landed, so racing presses stay consistent.
         let Some(mut ask) = self.ask_for(guild_id) else {
             return false;
         };
@@ -2164,7 +1857,7 @@ impl Player {
                 .await;
             return Ok(());
         }
-        // A pick is remembered for the words that asked, typed or spoken.
+        // Remembered for the words that asked, typed or spoken.
         let said = ask.said.as_deref();
         let origin = match ask.owner {
             Owner::Voice => crate::queue::Origin::Voice,
@@ -2179,20 +1872,13 @@ impl Player {
         self.ask_for(guild_id).is_some()
     }
 
-    /// Whether the outstanding question came from speech rather than `/play`.
-    ///
-    /// The caller needs this to know whose rule applies: a spoken one is answered
-    /// by the voice channel, a typed one by the person who typed it.
+    /// Whether the question came from speech (channel answers) rather than `/play` (typer answers).
     pub fn ask_is_spoken(&self, guild_id: GuildId) -> bool {
         self.ask_for(guild_id)
             .is_some_and(|ask| matches!(ask.owner, Owner::Voice))
     }
 
-    /// Puts `offers` on offer for a spoken request and posts the chooser.
-    ///
-    /// The same question `/play` asks, drawn the same way and paged the same
-    /// way. Only the owner differs: the channel, because the bot cannot tell
-    /// who spoke.
+    /// Offers `offers` for a spoken request; same chooser as `/play`, owned by the channel.
     async fn offer_choices(
         &self,
         ctx: &SerenityContext,
@@ -2217,10 +1903,7 @@ impl Player {
         }
     }
 
-    /// Plays whatever an offered choice stands for.
-    ///
-    /// Split out because the two ways into the chooser -- a typed search and a
-    /// spoken one -- are the same job from here on.
+    /// Plays whatever an offered choice stands for, typed or spoken.
     async fn play_offer(
         &self,
         ctx: &SerenityContext,
@@ -2247,10 +1930,7 @@ impl Player {
         via: Via<'_>,
         timing: &Timing,
     ) -> anyhow::Result<(String, bool)> {
-        // The user has already chosen the song by pressing this button or
-        // selecting from autocomplete, so the best upload of it is taken even
-        // when the upload's own score is modest. The hard part -- deciding
-        // which song it is -- was answered by the catalog and by them.
+        // The user already chose the song, so take its best upload even at a modest score.
         let (candidate, song_track) = match offer {
             Offer::Video(candidate) => (candidate, None),
             Offer::Song { track, requested } => {
@@ -2279,10 +1959,7 @@ impl Player {
             }
         };
 
-        // The download runs outside the playback lock for the same reason the
-        // spoken path does: a press on "1" must not freeze the Skip button.
-        // In line with spoken requests, so a press and a request heard at the
-        // same moment cannot both decide they are the one that starts playback.
+        // Outside the playback lock so Skip never freezes; ordered so only one starts playback.
         let (_serialised, started_at) = self.coordination.begin(guild_id).await;
         let mut song = self
             .fetch
@@ -2338,16 +2015,9 @@ impl Player {
         tracks
     }
 
-    /// Queues every track of a playlist or album, for `/play <playlist link>`.
+    /// Queues every track of a playlist or album for `/play <link>`.
     ///
-    /// Slash command only: a spoken request never reaches this.
-    ///
-    /// The first track is queued before this returns, so the reply can say it
-    /// is playing. The rest follow in the background, in playlist order, each
-    /// one downloaded and queued like a picked song. A Stop, the bot leaving,
-    /// or the queue filling ends that early. A playlist longer than the room
-    /// left in the queue is cut at the end, so an album still starts at its
-    /// first track.
+    /// The first is queued before returning, the rest in the background until Stop or a full queue.
     pub async fn play_playlist(
         self: &Arc<Self>,
         ctx: &SerenityContext,
@@ -2376,8 +2046,7 @@ impl Player {
             crate::queue::MAX_QUEUE
         );
         self.asks.clear(guild_id);
-        // Anything that bumps this after now, a Stop above all, ends the
-        // background queuing.
+        // Anything that bumps this, a Stop above all, ends the background queuing.
         let generation = self.coordination.generations.get(guild_id).now();
 
         let mut tracks = playlist.tracks.into_iter().take(room);
@@ -2452,8 +2121,7 @@ impl Player {
         tracing::info!(guild_id = %guild_id, added, total, "the rest of the playlist is queued");
     }
 
-    /// Downloads one playlist track and queues it, exactly as a picked
-    /// `/play` suggestion is: the track *is* the song, so nothing is searched.
+    /// Downloads one playlist track and queues it; the track is the song, so nothing is searched.
     async fn play_track(
         &self,
         ctx: &SerenityContext,
@@ -2542,12 +2210,7 @@ impl Player {
         self.asks.clear(guild_id)
     }
 
-    /// Whether `user` may answer the question this guild is holding.
-    ///
-    /// A typed search answers one person's question and is theirs alone. A
-    /// spoken one belongs to the voice channel, which the caller has already
-    /// checked; it returns true here rather than asking again, because the bot
-    /// cannot tell who spoke and has nobody to compare against.
+    /// Whether `user` may answer; a spoken question is the channel's, checked by the caller.
     pub fn ask_belongs_to(&self, guild_id: GuildId, user: UserId) -> bool {
         match self.ask_for(guild_id).map(|ask| ask.owner) {
             Some(Owner::User(asker)) => asker == user,
@@ -2561,8 +2224,7 @@ impl Player {
         self.asks.lock().get(&guild_id).cloned()
     }
 
-    /// Edits the outstanding search's message in place, the way the dashboard
-    /// is edited, rather than posting a second one.
+    /// Edits the outstanding search's message in place.
     async fn redraw_ask(
         &self,
         ctx: &SerenityContext,
@@ -2585,8 +2247,7 @@ impl Player {
     }
 }
 
-/// The parts of the player a songbird ending needs, owned so the callback can
-/// outlive the call that set it up.
+/// What a songbird ending needs, owned so the callback can outlive its caller.
 struct Follower {
     manager: Arc<Songbird>,
     queues: Queues,
@@ -2605,10 +2266,7 @@ impl Follower {
     }
 }
 
-/// Wakes the advancement task when a track ends.
-///
-/// Songbird runs handlers on its own thread, so this only sends on a channel;
-/// the queue is advanced on a normal async task where it can be awaited.
+/// Wakes the advance task when a track ends; songbird's thread only sends on a channel.
 struct Ended(mpsc::UnboundedSender<()>);
 
 #[async_trait]
@@ -2619,21 +2277,10 @@ impl EventHandler for Ended {
     }
 }
 
-/// Stops the song that was playing and starts the next one an advance chose.
+/// Stops the playing song and starts the next, caching its audio as it plays.
 ///
-/// Plays the audio where it is: off YouTube for a song whose stream is still
-/// usable, off disk otherwise. Either way the audio is written to the cache as
-/// it goes, so the next time this song is asked for it does not wait for
-/// YouTube at all.
-///
-/// Returns `None` when the queue has run dry, the bot has left the voice
-/// channel, or the audio could not be fetched at all. The finished song's file
-/// is left on disk: `fetch::prune` removes what is neither queued nor among the
-/// newest few, so deleting it here would only undo the cache that makes a
-/// repeated request instant.
-///
-/// The call is locked with `await` rather than `blocking_lock`, which panics
-/// when it is reached from inside a runtime thread.
+/// Returns `None` when the queue is dry, the bot left, or the fetch failed. The old
+/// file is left for `fetch::prune`; locks with `await` since `blocking_lock` panics here.
 async fn start_track(
     manager: &Songbird,
     guild_id: GuildId,
@@ -2644,9 +2291,7 @@ async fn start_track(
     let started = std::time::Instant::now();
     let call = manager.get(guild_id)?;
     let song = advanced.current.as_ref()?;
-    // Stopped before the source is resolved, because resolving one can mean a
-    // download: the song the listener skipped has to stop being audible at once
-    // rather than when the next one is ready.
+    // Stop first: resolving the next source may mean a download.
     call.lock().await.stop();
 
     let in_use = queue.in_use();
@@ -2663,11 +2308,7 @@ async fn start_track(
         }
     };
 
-    // Filled while the song plays, so a repeat or a later request for it finds
-    // it on disk. Detached because nobody is waiting on the cache: playback has
-    // already begun by the time this finishes. It is a second transfer of audio
-    // songbird is already receiving, which is the price of a repeat being
-    // instant.
+    // Cache while playing so a repeat is instant; detached since nobody waits on it.
     if let Some(stream) = fetch::Streamable::of(&song.source) {
         let Source::Stream { cache, .. } = &song.source else {
             unreachable!("a stream always carries a cache path")
@@ -2696,10 +2337,7 @@ async fn start_track(
         } => {
             let mut request =
                 HttpRequest::new_with_headers(reqwest::Client::new(), url.clone(), headers.clone());
-            // The one thing that makes this URL work at all: YouTube serves it
-            // only for a closed range, and songbird only sends one when it
-            // knows how long the audio is. Without this every stream is a 403
-            // and every song falls back to being downloaded.
+            // YouTube serves this URL only for a closed range, which songbird needs a length for.
             request.content_length = Some(*length);
             (Input::from(request), "stream")
         }
@@ -2720,11 +2358,7 @@ async fn start_track(
     Some(handle)
 }
 
-/// Reports how long a song took to produce its first audio.
-///
-/// `Playable` is the first moment songbird has decoded the source and has audio
-/// to mix, which is what "time to first audio" means here: the request's own
-/// summary line stops when the track is handed over, and this is the rest of it.
+/// Logs time to first audio: when songbird has decoded the source and can mix it.
 struct FirstAudio {
     started: std::time::Instant,
     /// `stream` or `file`, so the log says which path the number came from.
@@ -2745,17 +2379,10 @@ impl EventHandler for FirstAudio {
     }
 }
 
-/// Draws or updates a guild's dashboard message, and keeps its progress bar
-/// moving while a song plays.
+/// Draws the dashboard and keeps its progress bar moving.
 ///
-/// `page` is None to keep whichever page the dashboard is already on, which is
-/// what every ordinary redraw wants: a song ending should not pull someone out
-/// of the queue they opened.
-///
-/// Any refresh timer is stopped before drawing, so it cannot paint an older
-/// state over this one, and a new one is started only when the bar drawn is
-/// one that moves. That is what stops the refreshing on pause, on the queue
-/// view, and when nothing is playing.
+/// `page` None keeps the current page. Any timer is stopped first so it can't paint
+/// stale state; a new one starts only for a moving bar.
 async fn draw(
     board: &Board,
     ctx: &SerenityContext,
@@ -2779,9 +2406,7 @@ async fn draw(
     board.refreshes.set(guild_id, timer.abort_handle());
 }
 
-/// Draws or updates a guild's dashboard message once.
-///
-/// Returns whether what it drew is worth redrawing later for its progress bar.
+/// Draws a guild's dashboard once; returns whether its bar is worth refreshing.
 async fn paint(
     board: &Board,
     ctx: &SerenityContext,
@@ -2797,8 +2422,7 @@ async fn paint(
     let queue = board.queues.get(guild_id);
     let current = queue.current();
     let paused = queue.is_paused();
-    // Asked of songbird rather than worked out from when the song started,
-    // because songbird's clock stops while the song is paused.
+    // From songbird, whose clock stops while paused.
     let position = match (&current, board.tracks.get(guild_id)) {
         (Some(song), Some(track)) if page == Page::NowPlaying && song.duration_secs.is_some() => {
             track
@@ -2831,9 +2455,7 @@ async fn paint(
             // Remember the page, or the next song ending flips the queue back.
             Ok(_) => dashboards.set(guild_id, channel, message_id, page),
             Err(e) => {
-                // The message was deleted or access was lost, so post a new
-                // dashboard rather than going quiet for the rest of the
-                // session. The old one goes, so its buttons don't linger.
+                // Message deleted or access lost: post a new one and delete the old.
                 tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "failed to update the dashboard");
                 dashboards.forget(guild_id);
                 let _ = channel.delete_message(&ctx.http, message_id).await;
@@ -2854,10 +2476,7 @@ async fn paint(
     worth_refreshing(page, position.is_some(), paused)
 }
 
-/// Builds the acknowledgement tone as an in-memory 16-bit PCM WAV.
-///
-/// Songbird accepts a byte buffer directly as an input, so the tone needs no
-/// file on disk. The attack and release are faded to keep it from clicking.
+/// Builds the tone as an in-memory 16-bit PCM WAV, faded to avoid clicks.
 fn beep_wav(frequency: f32) -> Vec<u8> {
     let frames = (BEEP_SAMPLE_RATE as f32 * BEEP_DURATION.as_secs_f32()).round() as usize;
     let bytes_per_frame = BEEP_CHANNELS as usize * 2;
@@ -2893,8 +2512,7 @@ fn beep_wav(frequency: f32) -> Vec<u8> {
     wav
 }
 
-/// Picks the text channel used for feedback: the configured alert channel,
-/// else the guild's system channel, else the first text channel.
+/// The feedback channel: configured alert channel, else system channel, else first text channel.
 fn resolve_alert_channel(
     ctx: &SerenityContext,
     config: &Config,

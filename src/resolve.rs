@@ -1,26 +1,6 @@
-//! Resolves a spoken request against YouTube Music's catalogue, to get a
-//! canonical spelling of the song before any video search happens.
+//! Resolves a spoken request against YouTube Music's catalogue for a canonical song before any video search.
 //!
-//! The problem this solves: speech-to-text mishears proper nouns, so "hoolig"
-//! reaches the search layer and gets a flat YouTube query. Fixing that with more
-//! string matching on YouTube titles is guessing, because those titles are
-//! written by uploaders and are not a list of songs.
-//!
-//! A music catalog *is* a list of songs. YouTube Music's songs search is one
-//! unauthenticated POST, and it returns the artist's own spelling of the title
-//! plus the track's real running time. That running time is the valuable part:
-//! it is the one number nobody can lie about, and it is what lets
-//! [`crate::search::score`] tell the studio recording from a 10-minute remix or
-//! a 30-second clip without guessing from the title. It also carries the video
-//! id, so a hit is playable without searching for it again.
-//!
-//! The search still goes out as several queries under one deadline, so a
-//! misheard word is not a syntax error: free text for discovery, the artist's
-//! name when it was heard correctly and the title was not, and the title alone
-//! when no artist was named.
-//!
-//! The provider sits behind [`CatalogProvider`] so a different catalog can be
-//! added without touching the caller.
+//! Uploader titles are not a song list; the catalog gives the real spelling, running time and video id.
 
 use crate::matcher;
 use crate::parser::PlayRequest;
@@ -37,23 +17,11 @@ use tokio::time::{Instant as TokioInstant, timeout_at};
 pub struct CatalogTrack {
     pub artist: String,
     pub title: String,
-    /// The track's running time, when this provider reports one.
-    ///
-    /// This is the most reliable signal available: a studio single is within a
-    /// second or two across every source, whereas titles lie about what a video
-    /// contains.
+    /// Running time; the most reliable signal, unlike titles.
     pub duration_secs: Option<f64>,
-    /// The provider's own popularity, when it has one.
-    ///
-    /// Used only to settle `AMBIGUOUS_POLICY=popular`, never to choose a song
-    /// outright. YouTube Music reports this as a per-video play count.
+    /// Provider popularity (YouTube Music play count); only settles `AMBIGUOUS_POLICY=popular`.
     pub popularity: Option<u32>,
-    /// The YouTube video this song *is*, when a provider knows it.
-    ///
-    /// Not the same as a search result: a video id found by searching YouTube
-    /// is one upload somebody put up, which is why the search has to rank
-    /// several of them. A video id a provider reports is the song itself, so
-    /// the rest of the pipeline can use it and never search for it.
+    /// The video this song *is* per the provider, unlike a search hit, so it is never searched for.
     pub video_id: Option<String>,
 }
 
@@ -69,15 +37,12 @@ impl CatalogTrack {
 pub enum ReleaseKind {
     Album,
     Ep,
-    /// One song, sometimes with a B-side or an instrumental. YouTube Music
-    /// lists most songs as a single of their own, so a single is only ever
-    /// played as an album when it was asked for as one.
+    /// One song; YouTube Music lists most songs as singles, so only played as an album when asked.
     Single,
 }
 
 impl ReleaseKind {
-    /// The kind as YouTube Music writes it in a row, or `None` for anything
-    /// that is not a music release (an audiobook, a podcast).
+    /// The kind as YouTube Music writes it, or `None` for non-music (audiobooks, podcasts).
     fn from_label(label: &str) -> Option<Self> {
         match label.trim() {
             "Album" => Some(Self::Album),
@@ -123,11 +88,7 @@ impl CatalogAlbum {
     }
 }
 
-/// One way of asking the catalog about a request.
-///
-/// Free text is what YouTube Music takes, and free text is also what survives a
-/// misspelt field: a fielded query returns nothing for `artist:"tam impala"`,
-/// so it can confirm but never discover.
+/// One way of asking the catalog; free text, since a fielded query cannot survive a misspelling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogQuery {
     /// Free text, for discovery.
@@ -153,12 +114,7 @@ impl CatalogQuery {
     }
 }
 
-/// Why a provider could not answer.
-///
-/// Typed rather than an [`anyhow::Error`] because the caller does not want the
-/// message -- it wants to know whether to open the breaker, whether to count a
-/// rate limit against the provider's budget, or simply to carry on. A provider
-/// that fails is not an error for the request; it is one less opinion.
+/// Why a provider could not answer; typed so the caller can drive the breaker. Never fails the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderError {
     /// The provider could not be reached, or answered with something unusable.
@@ -180,10 +136,7 @@ impl std::fmt::Display for ProviderError {
     }
 }
 
-/// How often a provider may be asked.
-///
-/// Sized to how much traffic the endpoint tolerates; exceeding a public API's
-/// rate is how you get blocked from it for everyone behind you.
+/// How often a provider may be asked; exceeding a public API's rate gets everyone blocked.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rate {
     /// How many requests may arrive at once.
@@ -198,13 +151,7 @@ impl Rate {
     }
 }
 
-/// A provider's rate limiter and circuit breaker.
-///
-/// Both live here because both are about *not asking too often*: the limiter
-/// spreads requests out, and the breaker stops asking a provider that is
-/// refusing. Neither is about correctness, which is why a request that runs out
-/// of budget waiting for a token is answered with "no hits" rather than an
-/// error.
+/// A provider's rate limiter and circuit breaker; running out of budget means "no hits", not an error.
 #[derive(Debug)]
 pub struct Guard {
     rate: Rate,
@@ -226,18 +173,10 @@ struct Breaker {
     opened: Option<tokio::time::Instant>,
 }
 
-/// Consecutive failures before the breaker opens.
-///
-/// Three rather than one: a single failed request is a dropped packet, and
-/// opening on it would stop a provider that was working a moment ago.
+/// Consecutive failures before the breaker opens; one failure is just a dropped packet.
 const BREAKER_FAILURES: u32 = 3;
 
-/// How long the breaker stays open before letting one request through.
-///
-/// Jittered by [`BreAKER_JITTER`], because the providers here fail together --
-/// a network partition takes out all of them at the same moment, and a breaker
-/// set that all reopens on the same second is a small stampede against a service
-/// that is only just well again.
+/// How long the breaker stays open, plus [`BREAKER_JITTER`] so providers failing together do not reopen together.
 const BREAKER_OPEN: Duration = Duration::from_secs(30);
 const BREAKER_JITTER: Duration = Duration::from_secs(30);
 
@@ -271,20 +210,13 @@ impl Guard {
         }
     }
 
-    /// How long this breaker stays shut, including its share of the jitter.
-    ///
-    /// Derived from the guard's address rather than stored, because a stored
-    /// value would have to be generated with an RNG and the point of the jitter
-    /// is only that two breakers for different providers do not agree.
+    /// Open duration, jittered by the guard's address so breakers disagree without an RNG.
     fn open_for(&self) -> Duration {
         let skew = (self as *const Guard as usize % 7) as u32;
         BREAKER_OPEN + BREAKER_JITTER * skew / 6
     }
 
-    /// Waits until a token is available, or until `deadline` passes.
-    ///
-    /// Returns false when the budget ran out, which the caller reports as "this
-    /// provider had nothing" -- never as an error.
+    /// Waits for a token until `deadline`; false means "no hits", never an error.
     pub async fn take(&self, deadline: tokio::time::Instant) -> bool {
         loop {
             let wait = {
@@ -341,35 +273,18 @@ pub trait CatalogProvider: Send + Sync {
         Rate::new(2.0, 2.0)
     }
 
-    /// Asks about one query.
-    ///
-    /// Implementations return their best results in the order the provider ranks
-    /// them; [`crate::matcher::decide`] reorders them by how well they explain
-    /// what was heard.
+    /// Asks about one query; results in provider order, [`crate::matcher::decide`] reorders them.
     async fn search(&self, query: &CatalogQuery) -> Result<Vec<CatalogTrack>, ProviderError>;
 
-    /// Asks which releases (albums, EPs, singles) answer to a query, best
-    /// first. A provider that knows no albums has none.
+    /// Releases (albums, EPs, singles) answering a query, best first.
     async fn albums(&self, _query: &str) -> Result<Vec<CatalogAlbum>, ProviderError> {
         Ok(Vec::new())
     }
 }
 
-/// YouTube Music's own songs search: a *catalog* that is also the *source* of
-/// the audio.
+/// YouTube Music's songs search: a catalog that is also the audio source, so hits need no upload search.
 ///
-/// A songs-filtered result is an official track on an artist's own release,
-/// with the video id that carries its audio and the running time of that
-/// recording. So a hit from here needs nothing further -- no upload search, no
-/// duration scoring to work out which upload is the song (see
-/// [`crate::search::find_video`]) -- and it corrects a misheard name itself,
-/// because it is the same spell-correcting search the listener would have used
-/// by hand.
-///
-/// Keyless in the sense that matters: no account and no per-user credential. The
-/// `key` below is the public InnerTube client key that YouTube ships inside every
-/// web page, the same one `music.youtube.com` sends; it identifies the web client
-/// and grants nothing.
+/// Needs no account; `key` is the public InnerTube web client key and grants nothing.
 pub struct YtMusic {
     client: reqwest::Client,
 }
@@ -379,25 +294,15 @@ const YTMUSIC_ENDPOINT: &str = "https://music.youtube.com/youtubei/v1/search";
 
 /// The web client key, which is public and grants nothing.
 ///
-/// shortcut: a hardcoded key and client version. Both go stale when YouTube
-/// ships, and a stale pair fails as a 400, which this provider reports as
-/// `Unavailable` and the fan-out treats as "no opinion". Bump both, or scrape a
-/// fresh pair from music.youtube.com, when songs start coming back empty.
+/// shortcut: hardcoded key and client version go stale (400 -> `Unavailable`); bump them when songs come back empty.
 const YTMUSIC_KEY: &str = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
 const YTMUSIC_CLIENT: &str = "WEB_REMIX";
 const YTMUSIC_CLIENT_VERSION: &str = "1.20240101.00.00";
 
-/// The `params` blob that asks for songs rather than videos, albums or
-/// playlists.
-///
-/// Read out of the filter chips in an ordinary search response rather than
-/// written from memory: the well-known `EgWKAQIYAWoK...` value that most of the
-/// web still quotes now selects *albums*, which is a list of albums and exactly
-/// the thing this provider exists to avoid.
+/// The `params` blob for songs; the widely quoted `EgWKAQIYAWoK...` now selects albums.
 const YTMUSIC_SONGS_FILTER: &str = "EgWKAQIIAWoSEAQQAxAKEAUQCRAREBAQFRAO";
 
-/// The `params` blob that asks for albums, EPs and singles. Read out of the
-/// "Albums" filter chip of a search response, the same way as the songs one.
+/// The `params` blob for albums, EPs and singles, from the "Albums" filter chip.
 const YTMUSIC_ALBUMS_FILTER: &str = "EgWKAQIYAWoQEAkQBRADEAQQEBAVEBEQCg==";
 
 impl YtMusic {
@@ -415,15 +320,12 @@ impl CatalogProvider for YtMusic {
     }
 
     fn rate(&self) -> Rate {
-        // InnerTube publishes no limit. Two a second with a burst of five is a
-        // self-imposed ceiling: it keeps a burst of whispers from looking like
-        // scraping, and the plan only ever asks a handful of queries.
+        // InnerTube publishes no limit; self-imposed so bursts do not look like scraping.
         Rate::new(5.0, 2.0)
     }
 
     async fn search(&self, query: &CatalogQuery) -> Result<Vec<CatalogTrack>, ProviderError> {
-        // Free text only. YouTube Music has one field for a query and no
-        // artist-only mode worth spending a request on.
+        // Free text only: YouTube Music has one query field.
         let body = self.post(&query.text(), YTMUSIC_SONGS_FILTER).await?;
         Ok(parse_songs(&body))
     }
@@ -464,10 +366,7 @@ impl YtMusic {
         if !status.is_success() {
             return Err(ProviderError::Unavailable);
         }
-        // Decoded as a tree rather than into a typed body: InnerTube is a
-        // renderer tree whose shape changes with the site's experiments, and a
-        // hand-written struct would reject the whole response the first time a
-        // field moved rather than reading the songs still in there.
+        // A tree, not a typed body: InnerTube's shape shifts and a struct would reject it whole.
         response
             .json()
             .await
@@ -475,21 +374,12 @@ impl YtMusic {
     }
 }
 
-/// Every song in an InnerTube response, best first, in the order YouTube ranked
-/// them.
-///
-/// The song rows live at different depths in different responses -- a
-/// `musicShelfRenderer` one end of a songs-filtered search, an
-/// `itemSectionRenderer` in between when a card is inserted -- so the tree is
-/// walked rather than addressed. The walk is linear in a ~600 kB response, which
-/// is nothing next to the HTTP round trip it replaces.
+/// Every song in an InnerTube response, in YouTube's order; rows sit at varying depths, so the tree is walked.
 pub(crate) fn parse_songs(body: &serde_json::Value) -> Vec<CatalogTrack> {
     rows(body).into_iter().filter_map(song).collect()
 }
 
-/// Every album, EP and single in an albums-filtered InnerTube response, in the
-/// order YouTube ranked them. Rows that are not music (audiobooks) or have no
-/// playlist to play are left out.
+/// Every music release with a playlist in an albums-filtered response, in YouTube's order.
 pub(crate) fn parse_albums(body: &serde_json::Value) -> Vec<CatalogAlbum> {
     rows(body).into_iter().filter_map(album).collect()
 }
@@ -497,9 +387,7 @@ pub(crate) fn parse_albums(body: &serde_json::Value) -> Vec<CatalogAlbum> {
 /// Every `musicResponsiveListItemRenderer` in a response, in order.
 fn rows(body: &serde_json::Value) -> Vec<&serde_json::Value> {
     fn walk<'a>(node: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
-        // A response is a tree of objects *and* arrays: the shelf that holds
-        // the rows is an array, so a walk that only descends into objects
-        // finds nothing at all.
+        // The shelf holding rows is an array, so arrays must be walked too.
         if let Some(items) = node.as_array() {
             for item in items {
                 walk(item, out);
@@ -522,11 +410,7 @@ fn rows(body: &serde_json::Value) -> Vec<&serde_json::Value> {
     out
 }
 
-/// One album search row as a release.
-///
-/// The subtitle reads "Album • XXXTENTACION • 2017": the kind, the artist (or
-/// several, "A & B"), and the year. It is split on the separator rather than
-/// read run by run, because a list of artists is several runs of its own.
+/// One album row; the subtitle ("Album • A & B • 2017") is split on the bullet since artists span several runs.
 fn album(row: &serde_json::Value) -> Option<CatalogAlbum> {
     let title = column(row, 0)?;
     let subtitle: String = row
@@ -558,10 +442,7 @@ fn album(row: &serde_json::Value) -> Option<CatalogAlbum> {
 /// One `musicResponsiveListItemRenderer` as a track, when it is a song.
 fn song(row: &serde_json::Value) -> Option<CatalogTrack> {
     let title = column(row, 0)?;
-    // The subtitle is runs, not one string: "Ben E. King • Don't Play That Song
-    // • 2:56". The artist is the first run and the running time the last one
-    // that looks like a time, because the album name in between can be
-    // anything at all and sometimes is not a name but a count.
+    // Subtitle runs: artist first, running time the last clock-like run; the album between can be anything.
     let subtitle = runs(row, 1)?;
     let artist = subtitle.first()?.trim().to_string();
     let duration = subtitle
@@ -569,16 +450,12 @@ fn song(row: &serde_json::Value) -> Option<CatalogTrack> {
         .rev()
         .find_map(|run| run.trim().parse_clock().ok())
         .map(|clock| clock.as_secs_f64());
-    // A row with no video id is an album or a playlist wearing a song row's
-    // shape; there is no audio to play and nothing to hand the fetch layer.
+    // No video id means an album or playlist in a song row's shape.
     let video_id = row.pointer("/playlistItemData/videoId")?.as_str()?;
     if artist.is_empty() {
         return None;
     }
-    // YouTube Music puts the play count in a column of its own ("217M plays").
-    // It is a fact about this video rather than a canonical song popularity,
-    // but it is the only number the provider publishes and it is what
-    // `AMBIGUOUS_POLICY=popular` compares.
+    // The play count ("217M plays") is per video, but it is all the provider publishes.
     let popularity = (1..4)
         .filter_map(|index| runs(row, index))
         .flatten()
@@ -592,11 +469,7 @@ fn song(row: &serde_json::Value) -> Option<CatalogTrack> {
     })
 }
 
-/// Every run of one `flexColumns` entry, in order, with the empty ones dropped.
-///
-/// Kept as a list rather than a joined string because a row's subtitle is
-/// several runs carrying different facts -- artist, album, running time -- and
-/// the caller has to tell them apart.
+/// Every non-empty run of one `flexColumns` entry; kept separate since runs carry different facts.
 fn runs(row: &serde_json::Value, index: usize) -> Option<Vec<String>> {
     let text: Vec<String> = row
         .pointer(&format!(
@@ -611,10 +484,7 @@ fn runs(row: &serde_json::Value, index: usize) -> Option<Vec<String>> {
     (!text.is_empty()).then_some(text)
 }
 
-/// The play count YouTube Music prints in a row, as a number.
-///
-/// The site writes "217M plays", "33K plays", "2.2M plays" and "1,234 plays".
-/// A row without a count, or one that says "No plays", gives `None`.
+/// A row's play count ("217M plays", "2.2M plays", "1,234 plays") as a number.
 fn parse_plays(text: &str) -> Option<u32> {
     let text = text.trim();
     let count = text
@@ -640,12 +510,7 @@ fn column(row: &serde_json::Value, index: usize) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// A `m:ss` or `h:mm:ss` running time, as seconds.
-///
-/// YouTube writes every one of these with at least a minutes field, so
-/// "183" is never a duration here and a single bare number is refused rather
-/// than read as seconds -- a wrong duration is worse than none, because the
-/// upload scorer trusts it completely.
+/// A `m:ss` or `h:mm:ss` running time; a bare number is refused, as the scorer fully trusts durations.
 trait Clock {
     fn parse_clock(&self) -> std::result::Result<Duration, ()>;
 }
@@ -669,12 +534,7 @@ impl Clock for str {
     }
 }
 
-/// The shared HTTP client the provider builds from.
-///
-/// Held rather than built per call: `reqwest::Client` owns a connection pool,
-/// and a client dropped at the end of each search throws the pool away with it
-/// -- so every spoken command would pay for a fresh TCP and TLS handshake to
-/// look up one song.
+/// The shared HTTP client; held so its connection pool survives between searches.
 fn catalog_http_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(crate::config::HTTP_USER_AGENT)
@@ -682,17 +542,10 @@ fn catalog_http_client() -> anyhow::Result<reqwest::Client> {
         .context("failed to build the catalog HTTP client")
 }
 
-/// What a spoken request asked for, before the catalog corrected it.
-///
-/// The request is kept as a *list* of readings rather than one title and one
-/// artist, because " by " belongs to more song titles than it separates
-/// artists: *Stand By Me*, *Take Me By The Hand*, *By The Way*. Each reading
-/// is tried in turn, so a phrase the last-" by "-split reads badly still has
-/// the right reading available behind it.
+/// A request's readings before catalog correction; a list, since " by " is often inside titles (*Stand By Me*).
 #[derive(Debug, Clone)]
 pub struct Target {
-    /// Plausible readings, most likely first, never empty for a non-empty
-    /// request.
+    /// Plausible readings, most likely first; never empty for a non-empty request.
     pub readings: Vec<Reading>,
     /// The whole request text.
     pub raw: String,
@@ -709,11 +562,7 @@ pub struct Reading {
     pub query: String,
 }
 
-/// How many readings one request may ask the catalog about.
-///
-/// Three is generous: a phrase with more than three " by " in it is being read
-/// as a conversation, not a song title, and the readings past this point are
-/// increasingly absurd.
+/// Max readings per request; past three " by "s it is a conversation, not a title.
 const MAX_READINGS: usize = 3;
 
 impl Reading {
@@ -750,11 +599,7 @@ impl Target {
     }
 }
 
-/// Adds a reading unless it says the same thing as one already there.
-///
-/// Duplicates matter more than they look: "stand by me" splits identically at
-/// either " by ", and asking the same question twice costs a request for
-/// nothing.
+/// Adds a reading unless its query duplicates one ("stand by me" splits alike at either " by ").
 fn push_reading(out: &mut Vec<Reading>, reading: Reading) {
     if out.len() >= MAX_READINGS {
         return;
@@ -764,27 +609,18 @@ fn push_reading(out: &mut Vec<Reading>, reading: Reading) {
     }
 }
 
-/// A song after merging what the catalog said about it.
-///
-/// The same song can arrive from several queries with different lengths, and a
-/// disagreement is worth flagging rather than averaging.
+/// A song after merging provider results; length disagreements are flagged, not averaged.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub artist: String,
     pub title: String,
-    /// Every running time reported for it. The shortest is the recording: a
-    /// provider that reports a longer one is counting the outro.
+    /// Every running time reported; the shortest is the recording, longer ones count the outro.
     pub durations: Vec<f64>,
-    /// Whether providers disagreed about the length by more than
-    /// [`search::DURATION_TOLERANCE_SECS`], in which case neither is to be
-    /// trusted for ranking uploads.
+    /// Providers disagreed by more than [`crate::search::DURATION_TOLERANCE_SECS`], so no length is trusted.
     pub duration_uncertain: bool,
     /// The highest popularity any provider reported.
     pub popularity: Option<u32>,
-    /// The YouTube video this song is on, when a provider knew it.
-    ///
-    /// Carried all the way to the fetch so the song is downloaded directly
-    /// rather than searched for first. See [`CatalogTrack::video_id`].
+    /// The provider-known YouTube video, carried to the fetch to skip searching. See [`CatalogTrack::video_id`].
     pub video_id: Option<String>,
 }
 
@@ -793,8 +629,7 @@ impl Hit {
         format!("{} — {}", self.artist, self.title)
     }
 
-    /// The running time to rank YouTube uploads against, when there is one to
-    /// trust.
+    /// The running time to rank uploads against, when trustworthy.
     pub fn duration_secs(&self) -> Option<f64> {
         if self.duration_uncertain {
             return None;
@@ -806,11 +641,7 @@ impl Hit {
             .filter(|seconds| *seconds > 0.0)
     }
 
-    /// The catalog track to hand the rest of the pipeline.
-    ///
-    /// Keeps the video id, and names the provider it came from, so a song that
-    /// a provider could place on YouTube is downloaded from that video instead
-    /// of being searched for.
+    /// The catalog track for the rest of the pipeline, video id included.
     pub fn to_track(&self) -> CatalogTrack {
         CatalogTrack {
             artist: self.artist.clone(),
@@ -836,8 +667,7 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// A catalog over several providers, with an explicit budget in
-    /// milliseconds.
+    /// A catalog over several providers, with a budget in milliseconds.
     pub fn with_budget(providers: Vec<Box<dyn CatalogProvider>>, budget_ms: u64) -> Self {
         Self {
             providers: providers
@@ -859,22 +689,12 @@ impl Catalog {
         ))
     }
 
-    /// The queries to ask, in the order they are worth asking.
+    /// Up to four free-text queries, in order of worth (each costs quota):
     ///
-    /// Four at most, because each one costs a request against a shared quota:
-    ///
-    /// 1. the whole phrase, loose -- the only query that can find a song nobody
-    ///    has heard of yet, and the only one that survives a mangled artist;
-    /// 2. `"<artist> <title>"` for each of up to two readings -- " by " is
-    ///    inside more song titles than it is between an artist and one, so the
-    ///    guess is often wrong and another reading may be right;
-    /// 3. the artist's own catalogue, when one was heard at all -- this is the
-    ///    query that rescues a correct artist with a misheard title, because it
-    ///    does not need the title to be right;
-    /// 4. the title alone, for a request that named no artist.
-    ///
-    /// All free text: YouTube Music has one field, and a fielded query would
-    /// return nothing for a misspelt artist.
+    /// 1. the whole phrase, which finds unknown songs and survives a mangled artist;
+    /// 2. `"<title> <artist>"` for up to two readings, since " by " is often inside titles;
+    /// 3. the artist alone, which rescues a misheard title;
+    /// 4. the title alone, when no artist was named.
     pub fn plan(&self, target: &Target) -> Vec<CatalogQuery> {
         let mut queries: Vec<CatalogQuery> = Vec::new();
         let push = |query: CatalogQuery, queries: &mut Vec<CatalogQuery>| {
@@ -899,9 +719,7 @@ impl Catalog {
             let Some(artist) = reading.artist.as_deref() else {
                 continue;
             };
-            // Free text, not a fielded artist query: YouTube Music has one
-            // field, and this still rescues a correct artist with a misheard
-            // title because it does not need the title to be right.
+            // Rescues a correct artist with a misheard title.
             push(CatalogQuery::Loose(artist.to_string()), &mut queries);
         }
         if let Some(title) = target
@@ -915,12 +733,7 @@ impl Catalog {
         queries
     }
 
-    /// Every catalog hit, merged and de-duplicated.
-    ///
-    /// Never fails. Whatever has arrived by [`Self::budget`] is used, and a
-    /// provider that errors, stalls or answers with a quota notice is simply
-    /// one fewer opinion. Every query runs concurrently under the one deadline,
-    /// so the slowest of them does not set the wait.
+    /// Every catalog hit, merged; never fails, uses whatever arrived within the budget.
     pub async fn hits(&self, target: &Target) -> Vec<Hit> {
         let deadline = TokioInstant::now() + self.budget;
         let answers = futures::future::join_all(
@@ -932,16 +745,7 @@ impl Catalog {
         merge(answers.into_iter().flatten().collect())
     }
 
-    /// Runs one provider's queries, adding whatever it returned.
-    ///
-    /// All of a provider's queries go out at once rather than one after the
-    /// other, under the one shared budget. The plan holds the raw transcript and
-    /// every parser reading of it, and for a misheard phrase those are
-    /// independent questions whose answers do not depend on each other --
-    /// sending them in series would make the wait the sum of four round trips
-    /// when it only ever has to be the slowest one. The limiter still decides
-    /// which of them are actually served: a query with no token before the
-    /// deadline is skipped, not waited for.
+    /// Runs one provider's queries concurrently, so the wait is the slowest, not the sum; tokenless ones are skipped.
     async fn ask(
         &self,
         guarded: &Guarded,
@@ -983,12 +787,7 @@ impl Catalog {
         .await
     }
 
-    /// Every release whose title or artist answers to `query`, in the order the
-    /// provider ranked them.
-    ///
-    /// One query per provider, under the same budget and the same rate limit as
-    /// a song lookup, so asking about albums alongside songs costs no extra
-    /// wait. Never fails: a provider that errors or stalls has no albums.
+    /// Releases answering `query`, in provider order; same budget and limits as songs, never fails.
     pub async fn albums(&self, query: &str) -> Vec<CatalogAlbum> {
         let deadline = TokioInstant::now() + self.budget;
         let answers = futures::future::join_all(self.providers.iter().map(|guarded| async move {
@@ -1009,9 +808,7 @@ impl Catalog {
     }
 }
 
-/// Runs one call to a provider under its rate limit and the request's budget,
-/// recording how it went for the provider's breaker. Whatever goes wrong comes
-/// back as nothing at all: one provider failing is one fewer opinion.
+/// One provider call under its rate limit and budget, feeding the breaker; any failure is just no results.
 async fn guarded_call<T>(
     guarded: &Guarded,
     kind: &str,
@@ -1074,7 +871,6 @@ async fn guarded_call<T>(
 /// How many queries one provider is asked per request.
 const MAX_QUERIES_PER_PROVIDER: usize = 4;
 
-/// Merges provider results into one list, de-duplicated on the song.
 /// A title with nothing set aside in brackets and no featured artist.
 fn is_plain_title(title: &str) -> bool {
     let lower = title.to_lowercase();
@@ -1084,6 +880,7 @@ fn is_plain_title(title: &str) -> bool {
         && !lower.contains(" ft.")
 }
 
+/// Merges provider results into one list, de-duplicated on the song.
 fn merge(found: Vec<CatalogTrack>) -> Vec<Hit> {
     let mut hits: Vec<Hit> = Vec::new();
     let mut index: HashMap<(String, String), usize> = HashMap::new();
@@ -1111,10 +908,7 @@ fn merge(found: Vec<CatalogTrack>) -> Vec<Hit> {
         };
 
         let hit = &mut hits[slot];
-        // "Dracula (feat. JENNIE)" and "Dracula" normalize alike, but they are
-        // different recordings. The plain one is the song that was asked for,
-        // so it takes over a hit the decorated one opened, and a decorated row
-        // adds nothing to a plain hit: not its video, and not its length.
+        // "Dracula (feat. JENNIE)" normalizes like "Dracula" but is another recording; the plain one wins.
         match (is_plain_title(&hit.title), is_plain_title(&track.title)) {
             (false, true) => {
                 hit.title = track.title.clone();
@@ -1137,8 +931,7 @@ fn merge(found: Vec<CatalogTrack>) -> Vec<Hit> {
         {
             hit.durations.push(seconds);
         }
-        // The first video id reported wins: every row here comes from the same
-        // provider, and the first is the one it ranked highest.
+        // First video id wins: the provider ranked it highest.
         if hit.video_id.is_none()
             && let Some(id) = track.video_id.filter(|id| !id.is_empty())
         {

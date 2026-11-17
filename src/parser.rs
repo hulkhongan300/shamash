@@ -9,27 +9,17 @@ pub struct PlayRequest {
     pub title: Option<String>,
     /// The detected artist, when the transcript had "play <title> by <artist>".
     pub artist: Option<String>,
-    /// Every plausible reading of the request as "<title> by <artist>".
-    ///
-    /// `title`/`artist` are the last-" by "-split guess, which is wrong whenever
-    /// "by" belongs to the title. This is the full set, so the resolver can try
-    /// all of them instead of committing to the guess. Empty when the phrase
-    /// has no " by " in it.
+    /// Every "<title> by <artist>" reading, since "by" may belong to the title.
     pub splits: Vec<(String, String)>,
 }
 
 /// The command word that must come straight after the wake word.
 const PLAY_VERB: &str = "play";
 
-/// Spoken asides Whisper appends after the request, which are not its title.
-///
-/// "play look at me, come on" arrived as "late look at me. come on"; the
-/// trailing frustration made the catalog search and the matcher both worse.
-/// A title that is only the aside ("play come on") is left alone.
+/// Spoken asides Whisper appends after the request ("look at me. come on").
 const TRAILING_ASIDES: &[&str] = &["come on"];
 
-/// Drops a trailing aside, but only when a request precedes it and it starts
-/// on a word boundary, so "welcome on" does not become "wel".
+/// Drops a trailing aside only at a word boundary ("welcome on" stays).
 fn without_trailing_aside(text: &str) -> &str {
     let mut text = text.trim_end();
     loop {
@@ -110,13 +100,7 @@ impl CommandParser {
         self.command(transcript).ok()
     }
 
-    /// The request alone, with any wake word and "play" removed.
-    ///
-    /// A rewriting model asked to tidy a transcript tends to keep the wake word,
-    /// and the search would then be aimed at "groovy dracula" rather than
-    /// "Dracula". What comes back may be the whole command, the request on its
-    /// own, or the wake word with no "play", so a leading wake word and "play"
-    /// are dropped either way. `None` only when there is nothing to search for.
+    /// The request alone, with any wake word and "play" removed (rewriters keep them).
     pub fn strip_command(&self, transcript: &str) -> Option<String> {
         if let Ok(request) = self.command(transcript) {
             return Some(request.query);
@@ -135,19 +119,14 @@ impl CommandParser {
         build_request(&words.join(" ")).map(|request| request.query)
     }
 
-    /// Whether the wake model's window holds "<wake word> play", which is what
-    /// the acknowledgement tone and the lowered music promise.
+    /// Whether the wake model's window holds "<wake word> play".
     pub fn wakes_on(&self, window: &str) -> bool {
         let text = normalize(window);
         let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
         (0..words.len()).any(|at| self.starts_command(&words, at))
     }
 
-    /// The grammar applied to a whole utterance the wake gate woke on: the words
-    /// after the first "<wake word> play" are the request.
-    ///
-    /// [`ParseMiss::EmptyRequest`] is "groovy play" with nothing after it, which
-    /// the pipeline answers by waiting for the request.
+    /// The words after the first "<wake word> play" are the request.
     pub fn command(&self, transcript: &str) -> Result<PlayRequest, ParseMiss> {
         let text = normalize(transcript);
         let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
@@ -161,10 +140,7 @@ impl CommandParser {
         build_request(&words[at + 2..].join(" ")).ok_or(ParseMiss::EmptyRequest)
     }
 
-    /// The request in an utterance that followed "groovy play" and a pause.
-    ///
-    /// The speaker has already been acknowledged, so a repeated wake word or
-    /// "play" at the front is dropped rather than searched for.
+    /// The request after "groovy play" and a pause; a repeated wake word or "play" is dropped.
     pub fn armed_request(&self, transcript: &str) -> Option<PlayRequest> {
         let text = normalize(transcript);
         let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
@@ -176,28 +152,17 @@ impl CommandParser {
     }
 
     /// Builds a request from text spoken after a "play" that was already heard.
-    ///
-    /// A natural pause inside a command splits one sentence across two
-    /// utterances — "groovy play", pause, "lofi hip hop" — and the second half
-    /// arrives with no wake word in it. This turns that trailing half into the
-    /// request the first half was waiting for.
     pub fn request_from_query(&self, text: &str) -> Option<PlayRequest> {
         typed_request(text)
     }
 }
 
-/// Reads text that is already just the request, with no wake word or "play".
-///
-/// Cleaned exactly the way the request part of a spoken command is, so the same
-/// words typed into `/play` and said out loud come out as the same
-/// [`PlayRequest::query`]. The song memory keys on that query, which is what
-/// lets a phrase taught by typing be found when spoken, and the other way round.
+/// Parses a bare typed request, cleaned like a spoken one so song memory keys match.
 pub fn typed_request(text: &str) -> Option<PlayRequest> {
     build_request(&normalize(text))
 }
 
-/// Words that, said before the title, ask for a whole album: "play the album
-/// 17". Longest first, so "the full album" is not read as "the" + "full album".
+/// Album lead-ins before the title, longest first.
 const ALBUM_LEADS: &[&[&str]] = &[
     &["the", "full", "album"],
     &["the", "whole", "album"],
@@ -207,19 +172,7 @@ const ALBUM_LEADS: &[&[&str]] = &[
     &["album"],
 ];
 
-/// The album a request asks for by saying "album", if it does.
-///
-/// The speaker said what they want, so nothing has to be guessed: the bot goes
-/// straight to the albums. Three ways of saying it:
-///
-/// - before the title: "the album 17 by xxxtentacion", "the full album 17",
-///   "album called 17";
-/// - after the title: "the 17 album by xxxtentacion", "the slow rush album";
-/// - at the very end: "17 by xxxtentacion album".
-///
-/// `None` for anything else, including "the album" with no title after it,
-/// which is left to be searched for as words, and "the album version of …",
-/// which is a song.
+/// The album a request explicitly asks for ("the album 17", "the 17 album", "17 by x album").
 pub fn album_request(request: &PlayRequest) -> Option<PlayRequest> {
     let words: Vec<&str> = request.query.split(' ').filter(|w| !w.is_empty()).collect();
     if let Some(lead) = ALBUM_LEADS.iter().find(|lead| words.starts_with(lead)) {
@@ -264,11 +217,7 @@ fn build_request(rest: &str) -> Option<PlayRequest> {
     }
 
     let splits = splits(rest);
-    // The last " by " is the best guess and drives the query, because it is
-    // right whenever the speaker meant "<title> by <artist>" and a multi-word
-    // artist cannot be split any other way. It is only a guess: "stand by me"
-    // splits into title "stand" and artist "me", and the resolver is given
-    // every plausible split so it does not have to commit to that one.
+    // The last " by " drives the query; the resolver still gets every split.
     let best = splits.first().cloned();
     let (title, artist) = match best {
         Some((title, artist)) => (Some(title.to_string()), Some(artist.to_string())),
@@ -287,20 +236,7 @@ fn build_request(rest: &str) -> Option<PlayRequest> {
     })
 }
 
-/// Every plausible reading of a phrase as "<title> by <artist>", best first.
-///
-/// "by" is part of far more song titles than it is a separator: *Stand By Me*,
-/// *Take Me By The Hand*, *By The Way*, *Hey Jude By The Beatles*. Committing
-/// to the last " by " turns "play stand by me" into a search for "stand" by an
-/// artist called "me", which matches nothing and then plays whatever scores
-/// best. So every position of " by " is offered, plus the reading where the
-/// whole phrase is the title and no artist was named at all.
-///
-/// Ordered so the last " by " comes first, because that is the reading the
-/// query and the backwards-compatible `title`/`artist` fields use.
-///
-/// Returns an empty vec when the phrase has no " by " in it: the whole phrase
-/// is then the only reading, and there is nothing to choose between.
+/// Every "<title> by <artist>" split, last " by " first ("Stand By Me" needs the others).
 fn splits(phrase: &str) -> Vec<(String, String)> {
     let words: Vec<&str> = phrase.split_whitespace().collect();
     let mut out: Vec<(String, String)> = Vec::new();
@@ -322,12 +258,7 @@ fn splits(phrase: &str) -> Vec<(String, String)> {
     out
 }
 
-/// The readings of a phrase, including the whole phrase as its own title.
-///
-/// [`splits`] only answers "<title> by <artist>"; most requests name no artist
-/// at all, and the whole phrase is then the title. Returned as a single
-/// candidate rather than an `Option` so the resolver can treat every reading
-/// the same way.
+/// Every reading of a phrase: its [`splits`] plus the whole phrase.
 pub fn readings(phrase: &str) -> Vec<(Option<String>, Option<String>)> {
     let mut out: Vec<(Option<String>, Option<String>)> = Vec::new();
     for reading in splits(phrase)

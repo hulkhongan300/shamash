@@ -1,7 +1,6 @@
 use super::*;
 
-/// Opening the queue is a choice, and a song ending underneath it must not
-/// close that choice: the redraw keeps whichever page is showing.
+/// A song ending must not close the queue view someone opened.
 #[test]
 fn a_redraw_keeps_the_page_the_dashboard_is_on() {
     let guild = GuildId::new(11);
@@ -13,15 +12,12 @@ fn a_redraw_keeps_the_page_the_dashboard_is_on() {
     dashboards.set(guild, ChannelId::new(1), MessageId::new(2), queue);
     assert_eq!(dashboards.page(guild), queue, "and the song picked in it");
 
-    // Forgetting the dashboard is what happens when a message is deleted;
-    // the next post starts on now-playing rather than inheriting a page
-    // whose message no longer exists.
+    // After a deleted message, the next post starts on now-playing.
     dashboards.forget(guild);
     assert_eq!(dashboards.page(guild), Page::NowPlaying);
 }
 
-/// The bar only needs redrawing while it moves: not while paused, not
-/// behind the queue view, and not when there is no bar to move.
+/// Only a moving bar is redrawn: not paused, not behind the queue view, not without a bar.
 #[test]
 fn only_a_moving_progress_bar_is_refreshed() {
     assert!(worth_refreshing(Page::NowPlaying, true, false));
@@ -36,8 +32,7 @@ fn only_a_moving_progress_bar_is_refreshed() {
     );
 }
 
-/// A redraw replaces the guild's timer rather than adding a second one, so
-/// the edits never come faster than one per interval.
+/// A redraw replaces the guild's timer, so edits never come faster than one per interval.
 #[tokio::test]
 async fn a_new_refresh_timer_stops_the_old_one() {
     let refreshes = Refreshes::default();
@@ -60,15 +55,8 @@ async fn a_new_refresh_timer_stops_the_old_one() {
     assert!(other.await.unwrap_err().is_cancelled());
 }
 
-/// The bug this commit exists for: `play` held the playback lock across the
-/// catalog lookup, the YouTube search *and the whole download*, and `skip()`
-/// and `stop()` take the same lock. A slow download therefore froze every
-/// playback control for that guild.
-///
-/// `Songbird` cannot be constructed without a voice connection, so the
-/// coordination is exercised on its own. That is not a workaround: the
-/// whole bug is about which lock is held when, and none of it needs a
-/// connection to observe.
+/// Regression: `play` held the playback lock through the download, freezing Skip and Stop.
+/// Tested on `Coordination` alone, since the bug is only about which lock is held when.
 #[tokio::test]
 async fn a_request_in_flight_does_not_hold_the_playback_lock() {
     let guild = GuildId::new(7);
@@ -89,8 +77,7 @@ async fn a_request_in_flight_does_not_hold_the_playback_lock() {
     assert_eq!(queue.pending(), 0);
 }
 
-/// The same, from the fetcher's side: a download that takes the playback
-/// lock would block if the download were running inside it.
+/// A download can take the playback lock itself, so it never runs inside it.
 #[tokio::test]
 async fn a_download_can_take_the_playback_lock_itself() {
     let guild = GuildId::new(7);
@@ -109,8 +96,7 @@ async fn a_download_can_take_the_playback_lock_itself() {
         .unwrap();
 }
 
-/// Stop really cancels: a request that was still downloading when Stop was
-/// pressed must not queue its song afterwards.
+/// A request still downloading when Stop was pressed must not queue its song.
 #[tokio::test]
 async fn stop_cancels_a_request_that_is_still_downloading() {
     let guild = GuildId::new(7);
@@ -138,8 +124,7 @@ async fn stop_cancels_a_request_that_is_still_downloading() {
     assert!(queue.is_idle(), "the cancelled song must not be queued");
 }
 
-/// The other half: a request that was not cancelled still queues, and starts
-/// playing because nothing else is.
+/// An uncancelled request still queues, and starts since nothing else is playing.
 #[tokio::test]
 async fn an_uncancelled_request_still_queues_and_starts() {
     let guild = GuildId::new(7);
@@ -194,8 +179,7 @@ async fn a_second_song_waits_rather_than_starting() {
     assert_eq!(queue.pending(), 2);
 }
 
-/// Cancellation is per request, not per guild: a request that began after a
-/// Stop is unaffected by it.
+/// Cancellation is per request: one begun after a Stop is unaffected.
 #[tokio::test]
 async fn a_request_started_after_a_stop_is_not_cancelled_by_it() {
     let guild = GuildId::new(7);
@@ -218,8 +202,7 @@ async fn a_request_started_after_a_stop_is_not_cancelled_by_it() {
     );
 }
 
-/// Two requests for one guild do not overlap: the second waits its turn
-/// rather than both downloading and both starting a track.
+/// Two requests for one guild run in order rather than overlapping.
 #[tokio::test]
 async fn two_requests_for_one_guild_are_served_in_order() {
     let guild = GuildId::new(7);
@@ -235,7 +218,7 @@ async fn two_requests_for_one_guild_are_served_in_order() {
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
     });
-    // Wait until the first request is definitely holding the lock.
+    // Wait until the first request holds the lock.
     while order.lock().unwrap().is_empty() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -323,8 +306,7 @@ fn upload(title: Option<&str>, channel: Option<&str>, id: &str) -> search::Candi
     }
 }
 
-/// A picked catalog song is remembered under the catalog's names, with the
-/// video that was actually played.
+/// A picked catalog song is remembered under catalog names with the played video.
 #[test]
 fn a_picked_song_is_remembered_with_the_played_video() {
     let song = resolve::CatalogTrack {
@@ -343,8 +325,7 @@ fn a_picked_song_is_remembered_with_the_played_video() {
     assert_eq!(track.video_id.as_deref(), Some("playedvideo"));
 }
 
-/// A picked upload with no catalog song behind it is remembered as the
-/// upload; one without a title has nothing to remember it by.
+/// A picked upload is remembered as itself; an untitled one is not remembered.
 #[test]
 fn a_picked_upload_is_remembered_as_the_upload() {
     let track = picked_track(
@@ -362,8 +343,7 @@ fn a_picked_upload_is_remembered_as_the_upload() {
     assert_eq!(picked_track(None, &upload(None, None, "playedvideo")), None);
 }
 
-/// A typed search is remembered under the same words a spoken one is, so
-/// one taught by typing is found when spoken, and the other way round.
+/// A typed search is remembered under the same words as a spoken one.
 #[test]
 fn a_typed_search_is_remembered_like_the_same_words_spoken() {
     let parser = crate::parser::CommandParser::new(["bot".to_string()]);
@@ -402,8 +382,7 @@ fn catalog(artist: &str, title: &str, video_id: Option<&str>) -> resolve::Catalo
     }
 }
 
-/// A remembered song already in the results moves to the top, once, and
-/// keeps the video that was picked last time.
+/// A remembered song in the results moves to the top once, keeping its last video.
 #[test]
 fn a_recalled_song_found_again_moves_to_the_front() {
     let mut tracks = vec![
@@ -436,8 +415,7 @@ fn a_recalled_song_missing_from_the_results_is_added_first() {
     assert_eq!(empty.len(), 1);
 }
 
-/// Asking again after a wrong song leaves that song out, matched by name
-/// rather than by exact spelling.
+/// Asking again leaves out the wrong song, matched by name not exact spelling.
 #[test]
 fn asking_again_leaves_out_the_wrong_song() {
     let wrong = crate::library::Track {
@@ -456,8 +434,7 @@ fn asking_again_leaves_out_the_wrong_song() {
     assert_eq!(offered, vec![catalog("Madvillain", "All Caps", None)]);
 }
 
-/// The wrong song is still offered when the catalog has nothing else, and
-/// nothing is left out when there is no remembered song to leave out.
+/// The wrong song stays when it is the only option, and nothing is dropped without one.
 #[test]
 fn asking_again_never_leaves_an_empty_question() {
     let wrong = crate::library::Track {
@@ -505,13 +482,9 @@ fn u16_at(wav: &[u8], offset: usize) -> u16 {
         .unwrap()
 }
 
-/// The tone has to survive the same probe songbird runs on it.
+/// The tone must survive songbird's probe.
 ///
-/// Songbird depends on symphonia with `default-features = false` and exposes
-/// no feature to switch the format handlers back on, so its probe registry
-/// is empty unless symphonia is also a direct dependency of this crate. That
-/// build decodes nothing at all: every input fails with "no suitable format
-/// reader found", so the tone is silent and the music never starts.
+/// Songbird pulls symphonia without format features; our direct dependency is what makes it decode.
 #[test]
 fn songbird_can_probe_and_decode_the_tone() {
     use symphonia::core::codecs::DecoderOptions;
@@ -617,15 +590,8 @@ fn beep_fades_in_and_out_instead_of_clicking() {
     assert!(last < peak / 4, "ends at {last}, peak {peak}");
 }
 
-/// The frequency a tone actually contains, counted from its zero crossings.
-///
-/// A sine crosses zero twice per cycle, so the crossing rate over the
-/// measured span is twice its frequency. Two details make the count honest:
-/// the span is the middle 80%, because the fades at each end are what stops
-/// the tone clicking; and exact zeros are dropped first, because truncating
-/// the tone into i16 rounds the samples either side of a crossing to zero,
-/// and a zero next to a positive and then next to a negative reads as two
-/// crossings where the signal only makes one.
+/// The tone's frequency from its zero crossings, over the middle 80% (skipping fades)
+/// and ignoring exact zeros, which i16 rounding creates and would double-count.
 fn frequency_of(wav: &[u8]) -> f32 {
     let samples: Vec<i16> = wav[44..]
         .as_chunks::<2>()
@@ -642,9 +608,7 @@ fn frequency_of(wav: &[u8]) -> f32 {
     crossings as f32 / 2.0 / (BEEP_DURATION.as_secs_f32() * 0.8)
 }
 
-/// The second tone has to be told apart from the first by ear alone. If the
-/// two were the same, or too close to separate, a speaker who starts their
-/// request too early would have no way to tell which stage answered them.
+/// The two acknowledgement tones must be told apart by ear.
 #[test]
 fn the_two_acknowledgement_tones_are_distinguishable() {
     let wake = frequency_of(&beep_wav(Tone::Wake.frequency()));
@@ -664,11 +628,7 @@ fn the_two_acknowledgement_tones_are_distinguishable() {
     );
 }
 
-/// The miss tone has to be tellable from both acknowledgements, in either
-/// order. This is the whole point of adding it: a person who spoke and heard
-/// nothing has no way to tell the bot apart from one that did not hear them,
-/// so "I could not find that song" has to arrive as a sound and not only as
-/// a message in a text channel they may not be reading.
+/// The miss tone must be distinct from both acks, so a failure is heard and not only read.
 #[test]
 fn the_miss_tone_is_tellable_from_both_acknowledgements() {
     let miss = frequency_of(&beep_wav(Tone::Miss.frequency()));
@@ -684,13 +644,11 @@ fn the_miss_tone_is_tellable_from_both_acknowledgements() {
             "{miss} Hz and {their_frequency} Hz are too close to tell apart"
         );
     }
-    // And it is the odd one out, so it reads as "not an acknowledgement"
-    // rather than as a third step in the same sequence.
+    // Lowest, so it reads as "not an ack" rather than a third step.
     assert!(miss < Tone::Wake.frequency());
 }
 
-/// Every tone has to survive the same probe songbird runs on it, or a
-/// message that never arrives is worse than no message at all.
+/// Every tone must decode, or the message silently never arrives.
 #[test]
 fn every_tone_decodes() {
     use symphonia::core::formats::FormatOptions;
@@ -719,9 +677,7 @@ fn every_tone_decodes() {
     }
 }
 
-/// The listener has to be told what was heard: the bot's transcription is
-/// frequently wrong, and echoing it back is what lets them say the right
-/// thing next time.
+/// Every failure echoes what was heard, since the transcription is often wrong.
 #[test]
 fn every_failure_says_what_was_heard_and_what_to_do() {
     for (problem, expected) in [
@@ -746,8 +702,7 @@ fn every_failure_says_what_was_heard_and_what_to_do() {
     }
 }
 
-/// The three have to stay distinguishable as prose too, since a person
-/// reading them should not have to guess which went wrong.
+/// The three failures must read differently as prose too.
 #[test]
 fn the_three_failures_read_differently() {
     let heard = "dracula by tame impala";
@@ -757,8 +712,7 @@ fn the_three_failures_read_differently() {
     assert_ne!(said(Problem::FetchFailed), said(Problem::QueueFull));
 }
 
-/// The tone the second stage plays has to decode like the first, or a model
-/// that is ready would be announced in silence.
+/// The ready tone must decode too, or a ready model is announced in silence.
 #[test]
 fn the_ready_tone_decodes_too() {
     use symphonia::core::codecs::DecoderOptions;
@@ -823,8 +777,7 @@ fn titled(offer: &Offer) -> &str {
     }
 }
 
-/// The pages are windows onto one list, so the first song of page two is
-/// the tenth song and not the first one again.
+/// Pages are windows onto one list: page two starts at the tenth song.
 #[test]
 fn a_page_is_a_window_onto_the_whole_list() {
     let ask = ask_with(20, Owner::User(UserId::new(7)));
@@ -835,7 +788,7 @@ fn a_page_is_a_window_onto_the_whole_list() {
     let mut second = ask.clone();
     second.page = 1;
     let window = second.page();
-    // Songs 9 through 17: a full page, with songs 18 and 19 behind it.
+    // Songs 9 through 17: a full page, with 18 and 19 behind it.
     assert_eq!(window.len(), dashboard::ASK_PAGE, "page two is also full");
     assert_eq!(titled(&window[0]), "Song 9", "not the first song again");
 }
@@ -876,10 +829,7 @@ fn the_last_page_has_no_next_one() {
     }
 }
 
-/// A typed search belongs to whoever typed it, and a spoken one to the
-/// channel. They are the same buttons and the same chooser, and getting the
-/// owner wrong either lets anyone in the server queue music off someone
-/// else's search, or locks the channel out of its own.
+/// A typed search belongs to the typer, a spoken one to the channel.
 #[test]
 fn ownership_differs_between_a_typed_and_a_spoken_question() {
     let guild = GuildId::new(3);
@@ -892,15 +842,12 @@ fn ownership_differs_between_a_typed_and_a_spoken_question() {
     assert!(asks_answers(&asks, guild, asker));
     assert!(!asks_answers(&asks, guild, other), "someone else must not");
 
-    // A spoken one has nobody to compare against: the bot cannot tell who
-    // spoke it, so the channel's own check is the only one there is.
+    // The bot can't tell who spoke, so the channel's own check is the only one.
     asks.set(guild, ask_with(5, Owner::Voice));
     assert!(asks_answers(&asks, guild, other));
 }
 
-/// A question that expired on its timer must not clear a newer question
-/// that has replaced it, and replacing hands back the old question so its
-/// message can be cleared.
+/// An expired question's timer must not clear a newer one; replacing returns the old one.
 #[test]
 fn an_expired_question_does_not_clear_a_newer_one() {
     let guild = GuildId::new(3);

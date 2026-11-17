@@ -13,11 +13,7 @@ impl Resampler {
         }
     }
 
-    /// Re-samples `input`.
-    ///
-    /// Integer ratios use an averaging (box) filter that also acts as a cheap
-    /// anti-aliasing low-pass; non-integer ratios fall back to linear
-    /// interpolation.
+    /// Re-samples `input`: box filter (cheap anti-aliasing) for integer ratios, else linear.
     pub fn resample(&self, input: &[f32]) -> Vec<f32> {
         if self.input_rate == self.output_rate {
             return input.to_vec();
@@ -50,14 +46,9 @@ impl Resampler {
     }
 }
 
-/// Root-mean-square level of one frame, in the range 0.0..=1.0.
+/// Root-mean-square level of one frame, in 0.0..=1.0.
 ///
-/// This is the true RMS, not the mean square. The distinction matters for
-/// voice activity detection: speech oscillates around zero, so its mean square
-/// is roughly the square of its RMS and reads far quieter than a loud signal of
-/// the same peak level would. Thresholding the mean square therefore demands a
-/// much higher *amplitude* than the number suggests — enough to miss ordinary
-/// conversation entirely.
+/// True RMS, not mean square: gating on mean square misses ordinary speech.
 #[must_use]
 pub fn rms(frame: &[f32]) -> f32 {
     if frame.is_empty() {

@@ -45,8 +45,7 @@ fn an_album_named_with_its_artist_is_found() {
     );
 }
 
-/// Speech-to-text writes the number out, the catalog writes the digits,
-/// and "from" is said as often as "by".
+/// Speech-to-text spells numbers the catalog writes as digits; "from" means "by".
 #[test]
 fn a_spelled_out_number_and_from_still_find_the_album() {
     let mut albums = xxxtentacion();
@@ -61,8 +60,7 @@ fn a_spelled_out_number_and_from_still_find_the_album() {
     );
 }
 
-/// The song "Look at Me!" shares most of its name with an album, which
-/// must not make the song request a question.
+/// "Look at Me!" must not match *LOOK AT ME: THE ALBUM*.
 #[test]
 fn an_album_only_close_to_what_was_said_is_not_found() {
     assert_eq!(
@@ -80,8 +78,7 @@ fn a_misheard_album_title_is_still_found() {
     ));
 }
 
-/// "Dracula" is a single of its own on YouTube Music. Asked for as a song,
-/// it is the song.
+/// "Dracula" is listed as its own single.
 #[test]
 fn a_single_is_an_album_only_when_album_was_said() {
     let albums = [album("Tame Impala", "Dracula", ReleaseKind::Single)];
@@ -95,8 +92,6 @@ fn a_single_is_an_album_only_when_album_was_said() {
     ));
 }
 
-/// Two albums with one title by different artists: a question, but only
-/// when "album" was said.
 #[test]
 fn two_artists_with_one_album_title_are_a_question_when_album_was_said() {
     let albums = [
@@ -119,8 +114,7 @@ fn seventeen() -> Found {
     Found::One(album("XXXTENTACION", "17", ReleaseKind::Album))
 }
 
-/// The request in the issue: no song is called 17, the artist was named,
-/// so the album plays without a question.
+/// The issue's request: no song "17", artist named, so the album plays.
 #[test]
 fn no_song_and_a_named_artist_plays_the_album() {
     assert_eq!(
@@ -153,7 +147,7 @@ fn a_song_and_an_album_of_the_same_name_asks() {
             songs: vec![song("Michael Jackson", "Thriller")],
         }
     );
-    // With no artist named, the song the catalog was sure of plays.
+    // No artist named: the song plays.
     assert_eq!(
         settle("thriller", &track("Michael Jackson", "Thriller"), thriller),
         Settle::Song
@@ -187,8 +181,7 @@ fn no_album_leaves_the_song_alone() {
     }
 }
 
-/// The whole decision against the live catalog: songs and albums looked
-/// up the way a spoken request looks them up, then settled.
+/// End to end against the live catalog.
 #[tokio::test]
 #[ignore = "hits the live YouTube Music endpoint; run with --ignored"]
 async fn live_requests_settle_the_way_they_should() {
@@ -243,6 +236,7 @@ async fn live_requests_settle_the_way_they_should() {
         "{albums:?}"
     );
 }
+
 #[cfg(test)]
 mod probe {
     #[tokio::test]

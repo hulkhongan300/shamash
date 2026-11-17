@@ -1,36 +1,19 @@
 use anyhow::Context as _;
 use std::collections::HashSet;
 
-/// Wake words used when `WAKE_WORDS` is unset. A command is "groovy play
-/// <request>", with both words heard exactly.
+/// Wake words used when `WAKE_WORDS` is unset; a command is "groovy play <request>", both words exact.
 pub const DEFAULT_WAKE_WORDS: &[&str] = &["groovy"];
 
 /// Identifies the bot to the services it calls.
 pub const HTTP_USER_AGENT: &str = concat!("shamash/", env!("CARGO_PKG_VERSION"));
 
-/// How long the whole catalog lookup may take, in milliseconds.
-///
-/// One budget for every query, not one per query: this sits in front of the
-/// YouTube search, and the point of asking several queries at once is that the
-/// slowest of them does not set the wait. Two and a half seconds is generous
-/// for a handful of keyless HTTP POSTs and still leaves the search and the
-/// download to follow.
+/// Total budget for the whole catalog lookup (all queries), in milliseconds.
 pub const DEFAULT_RESOLVE_BUDGET_MS: u64 = 2_500;
 
-/// Whether unverified results are offered as a choice when nothing matched.
-///
-/// Default `true`, because it is a question rather than an answer: the options
-/// are labelled unverified and nothing is played until the listener presses one.
-/// With it off, a request that matched nothing produces only the miss tone and a
-/// message.
+/// Offer unverified results as a choice when nothing matched; safe since nothing plays unpicked.
 pub const DEFAULT_UNVERIFIED_CHOOSER: bool = true;
 
-/// Reads a boolean from the environment, falling back to `default`.
-///
-/// A malformed value is an error rather than a silent default, for the same
-/// reason [`env_f32`] refuses one: a typo in `UNVERIFIED_CHOOSER` that
-/// quietly became `false` would be invisible, and one that quietly became
-/// `true` would turn the bot back into playing whatever YouTube ranked first.
+/// Reads a boolean from the environment; a malformed value is an error, not the default.
 pub fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
     match std::env::var(name) {
         Err(_) => Ok(default),
@@ -38,9 +21,7 @@ pub fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
     }
 }
 
-/// One setting's value, without the environment, so the accepted spellings can
-/// be tested without `std::env::set_var` (unsafe in edition 2024, and the test
-/// threads run in parallel so a shared variable would be a race).
+/// Split out so tests avoid `std::env::set_var` (unsafe, and racy across test threads).
 fn parse_bool(name: &str, raw: &str) -> anyhow::Result<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -50,40 +31,18 @@ fn parse_bool(name: &str, raw: &str) -> anyhow::Result<bool> {
 }
 
 /// How many YouTube results a request is scored against.
-///
-/// The scorer's inputs are a title, an artist and a running time, so a short
-/// list is usually enough; the extra candidates only widen the pool the three
-/// offered choices are drawn from.
 pub const DEFAULT_SEARCH_CANDIDATES: usize = 8;
 
-/// The lowest score a candidate may reach and still be played without asking.
-///
-/// 90 is measured, not guessed: with a catalog match a candidate can earn about
-/// 190 points, and the Dracula case in the README plays at 124 while the lyric
-/// video it must not play sits at 101. A bar under that would pick the wrong
-/// song; a bar far above it would post choices for requests that were already
-/// confident.
+/// Lowest score played without asking; measured (README's Dracula: right 124, wrong 101).
 pub const DEFAULT_MATCH_THRESHOLD: f64 = 90.0;
 
-/// The model that listens for the wake word, when `WAKE_MODEL` is unset.
-///
-/// The small Parakeet, deliberately: it runs on every window of speech in the
-/// channel, so its cost is paid continuously rather than once per command, and
-/// it only has to hear one short word. `REQUEST_MODEL` is the opposite
-/// trade -- loaded once and run only after a wake word, so it can afford to be
-/// the stronger, much larger model.
+/// Wake-word model when `WAKE_MODEL` is unset; small because it runs continuously.
 pub const DEFAULT_WAKE_MODEL: &str = crate::model::SMALL_MODEL_ID;
 
 /// The Ollama model used to clean up a transcript, when `LLM_MODEL` is unset.
 pub const DEFAULT_LLM_MODEL: &str = "llama3.2";
 
-/// Reads a float from the environment, falling back to `default`.
-///
-/// A malformed value is an error rather than a silent default: a typo in
-/// `MATCH_THRESHOLD` that quietly became the default would be very hard to
-/// notice and very confusing to tune. `range` is checked for the same reason,
-/// and is passed in rather than inferred from the name so each setting's
-/// legitimate range is stated where the setting is defined.
+/// Reads a float from the environment; malformed or out-of-`range` values are errors.
 pub fn env_f32(
     name: &str,
     default: f32,
@@ -107,10 +66,7 @@ pub fn env_f32(
     }
 }
 
-/// Reads a count from the environment, falling back to `default`.
-///
-/// Same reasoning as [`env_f32`]: a typo in a count is a startup error, not a
-/// silent default.
+/// Reads a count from the environment; a malformed value is an error.
 pub fn env_usize(name: &str, default: usize) -> anyhow::Result<usize> {
     match std::env::var(name) {
         Err(_) => Ok(default),
@@ -136,8 +92,6 @@ impl AsrEngine {
         match value.as_str() {
             "direct" | "transcribe-cpp" | "tcpp" => Ok(Self::Direct),
             "handy" | "parakeet" => Ok(Self::Handy),
-            // Whisper used to be a separate engine here. It now runs through
-            // transcribe.cpp like every other model.
             "whisper" => anyhow::bail!(
                 "ASR_ENGINE=whisper is gone: the bundled whisper-rs engine cannot be \
                  linked alongside transcribe.cpp, which replaced it. Use \
@@ -154,43 +108,29 @@ pub struct Config {
     pub discord_token: String,
     pub voice_channel_id: u64,
     pub asr_engine: AsrEngine,
-    /// The larger model that transcribes a request: `REQUEST_MODEL`, or the
-    /// older name `PARAKEET_MODEL`, or [`crate::model::DEFAULT_MODEL_ID`].
+    /// `REQUEST_MODEL`, legacy `PARAKEET_MODEL`, or [`crate::model::DEFAULT_MODEL_ID`].
     pub request_model: String,
-    /// What the request model is prompted with, when it accepts a prompt.
-    /// `ASR_PROMPT`; `off` disables it.
+    /// `ASR_PROMPT` for models that accept one; `off` disables it.
     pub asr_prompt: Option<String>,
     pub asr_language: Option<String>,
     pub wake_words: HashSet<String>,
     pub alert_channel_id: Option<u64>,
-    /// How long the whole catalog fan-out may take.
     pub resolve_budget: std::time::Duration,
-    /// How many YouTube results a request is scored against.
     pub search_candidates: usize,
-    /// The lowest score a candidate may reach and still be played unasked.
     pub match_threshold: f64,
-    /// Whether unverified results are offered as a choice when nothing matched.
     pub unverified_chooser: bool,
-    /// The small model that listens for the wake word at all times.
     pub wake_model: String,
-    /// An Ollama-compatible endpoint that cleans up a transcript, or `None`.
-    ///
-    /// `None` leaves the raw transcript to the parser, which is the pre-LLM
-    /// behaviour and stays the default: the catalog already corrects most
-    /// mishearing, so this has to earn its place before it is switched on.
+    /// Ollama-compatible transcript cleanup; off by default, the catalog fixes most mishearing.
     pub llm_endpoint: Option<String>,
     pub llm_model: String,
-    /// Where the song memory is kept: what a spoken request meant, as picked
-    /// from the chooser. `LIBRARY_PATH`; `off` keeps nothing.
+    /// Song memory file (`LIBRARY_PATH`); `off` keeps nothing.
     pub library_path: Option<std::path::PathBuf>,
 }
 
-/// Where the song memory is kept unless `LIBRARY_PATH` says otherwise. The
-/// image sets it to `/data/library.json`, inside the volume.
+/// Song memory path unless `LIBRARY_PATH` is set; the image uses `/data/library.json`.
 pub const DEFAULT_LIBRARY_PATH: &str = "data/library.json";
 
-/// Reads `LIBRARY_PATH`: unset is the default, `off` (or `none`, `0`, `false`)
-/// keeps no memory.
+/// Reads `LIBRARY_PATH`; `off`/`none`/`0`/`false` keeps no memory.
 fn library_path(value: Option<String>) -> Option<std::path::PathBuf> {
     match value
         .map(|v| v.trim().to_string())
@@ -227,8 +167,7 @@ impl Config {
             Some(prompt) => Some(prompt),
             None => Some(crate::model::REQUEST_PROMPT.to_string()),
         };
-        // Only the models that cannot detect a language for themselves need
-        // this; Canary and Nemotron return empty text without it.
+        // Canary and Nemotron return empty text without it.
         let asr_language = std::env::var("ASR_LANGUAGE")
             .ok()
             .map(|s| s.trim().to_string())
@@ -295,9 +234,7 @@ impl AmbiguousPolicy {
         match value.map(str::trim) {
             Some(value) if value.eq_ignore_ascii_case("auto") => Self::Auto,
             Some(value) if value.eq_ignore_ascii_case("popular") => Self::Popular,
-            // A typo falls back to asking, which is the safe direction: the
-            // wrong reading of this setting is a wrong song rather than an
-            // extra click.
+            // A typo asks: an extra click beats a wrong song.
             _ => Self::Ask,
         }
     }
@@ -308,10 +245,7 @@ pub fn ambiguous_policy() -> AmbiguousPolicy {
     AmbiguousPolicy::parse(std::env::var("AMBIGUOUS_POLICY").ok().as_deref())
 }
 
-/// Parses an optional channel id, treating blank as unset.
-///
-/// Blank is treated as unset so a placeholder line left in `.env` falls back
-/// to the default channel rather than refusing to start on a parse error.
+/// Parses an optional channel id; blank (an `.env` placeholder) means unset.
 fn parse_optional_id(value: Option<String>) -> anyhow::Result<Option<u64>> {
     value
         .map(|value| value.trim().to_string())
@@ -321,12 +255,10 @@ fn parse_optional_id(value: Option<String>) -> anyhow::Result<Option<u64>> {
         .map_err(Into::into)
 }
 
-/// Reads a required variable, naming it when it is missing.
 fn required(name: &str) -> anyhow::Result<String> {
     non_empty(name).with_context(|| format!("{name} is not set; add it to .env"))
 }
 
-/// A variable's trimmed value, with blank treated as unset.
 fn non_empty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()

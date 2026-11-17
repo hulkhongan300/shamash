@@ -59,13 +59,8 @@ fn tone(frequency: f32, amplitude: f32) -> Vec<f32> {
         .collect()
 }
 
-/// A 20 ms frame of speech-like audio at `target_rms`: a low fundamental
-/// with a formant on top of it, so the signal oscillates around zero the
-/// way a voice does.
-///
-/// A constant frame such as `vec![0.5; 320]` cannot stand in for speech
-/// here. It never changes sign, so its mean square equals its RMS instead
-/// of half of it, and it hides any bug in the level metric.
+/// 20 ms of speech-like audio (fundamental + formant) that oscillates around zero.
+/// A constant frame would hide mean-square vs RMS bugs.
 fn raw_speech_frame() -> Vec<f32> {
     let fundamental = tone(180.0, 1.0);
     let formant = tone(900.0, 0.6);
@@ -100,9 +95,7 @@ fn rms_of_a_constant_frame_is_its_amplitude() {
 
 #[test]
 fn oscillating_audio_measures_far_below_its_peak() {
-    // The property that made the mean-square gate miss speech: an
-    // oscillating signal has a high crest factor, so its RMS sits well
-    // under its peak while a constant frame's RMS equals it.
+    // Why the mean-square gate missed speech: RMS sits well under the peak.
     let speech = speech_frame(0.05);
     let peak = speech.iter().map(|s| s.abs()).fold(0.0, f32::max);
     assert!(
