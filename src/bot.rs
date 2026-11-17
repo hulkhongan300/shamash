@@ -731,6 +731,7 @@ impl Handler {
             tracing::warn!("dashboard button pressed before the bot was ready");
             return;
         };
+        player.adopt_dashboard(guild_id, button.channel_id, button.message.id);
 
         let action = match press {
             Press::Action(action) => action,
@@ -743,7 +744,10 @@ impl Handler {
         };
         match action {
             dashboard::ACTION_PAUSE | dashboard::ACTION_RESUME => {
-                match player.toggle_pause(guild_id).await {
+                match player
+                    .set_paused(guild_id, action == dashboard::ACTION_PAUSE)
+                    .await
+                {
                     Some(true) => tracing::info!(guild_id = %guild_id, "paused"),
                     Some(false) => tracing::info!(guild_id = %guild_id, "resumed"),
                     None => tracing::info!(guild_id = %guild_id, "nothing to pause"),
