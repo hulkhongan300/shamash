@@ -1577,14 +1577,15 @@ impl Player {
             .await;
     }
 
-    /// Pauses the current song, or resumes it when already paused.
+    /// Pauses the current song, or resumes it.
     ///
+    /// Takes the state the button asked for rather than flipping it, so two
+    /// quick presses of Pause do not pause and then resume.
     /// Returns whether the song is now paused, or `None` when nothing is
     /// playing to pause.
-    pub async fn toggle_pause(&self, guild_id: GuildId) -> Option<bool> {
+    pub async fn set_paused(&self, guild_id: GuildId, paused: bool) -> Option<bool> {
         let handle = self.tracks.get(guild_id)?;
         let queue = self.queues.get(guild_id);
-        let paused = !queue.is_paused();
         let result = if paused {
             handle.pause()
         } else {
@@ -1870,6 +1871,15 @@ impl Player {
             }
             this.draw_dashboard().await;
         });
+    }
+
+    /// Treats a pressed dashboard as the guild's dashboard.
+    ///
+    /// The ids live only in memory, so after a restart (or a duplicate post)
+    /// the pressed message would otherwise never be edited and a new one posted.
+    pub fn adopt_dashboard(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId) {
+        let page = self.dashboards.page(guild_id);
+        self.dashboards.set(guild_id, channel_id, message_id, page);
     }
 
     /// Creates or updates the guild's dashboard in the alert channel.
@@ -2814,22 +2824,25 @@ async fn paint(
     };
 
     match dashboards.get(guild_id) {
-        Some(message_id) => {
-            if let Err(e) = channel
-                .edit_message(&ctx.http, message_id, view.clone().into_edit())
-                .await
-            {
+        Some(message_id) => match channel
+            .edit_message(&ctx.http, message_id, view.clone().into_edit())
+            .await
+        {
+            // Remember the page, or the next song ending flips the queue back.
+            Ok(_) => dashboards.set(guild_id, channel, message_id, page),
+            Err(e) => {
                 // The message was deleted or access was lost, so post a new
                 // dashboard rather than going quiet for the rest of the
-                // session.
+                // session. The old one goes, so its buttons don't linger.
                 tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "failed to update the dashboard");
                 dashboards.forget(guild_id);
+                let _ = channel.delete_message(&ctx.http, message_id).await;
                 match channel.send_message(&ctx.http, view.into_message()).await {
                     Ok(sent) => dashboards.set(guild_id, channel, sent.id, page),
                     Err(_) => return false,
                 }
             }
-        }
+        },
         None => match channel.send_message(&ctx.http, view.into_message()).await {
             Ok(sent) => dashboards.set(guild_id, channel, sent.id, page),
             Err(e) => {
