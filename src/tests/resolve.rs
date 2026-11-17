@@ -6,8 +6,10 @@ use super::*;
 /// official upload never reached the ranking.
 #[test]
 fn songs_are_read_from_a_real_youtube_music_response() {
-    let body: serde_json::Value =
-        serde_json::from_str(include_str!("../../tests/fixtures/ytmusic_songs_dracula.json")).unwrap();
+    let body: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/ytmusic_songs_dracula.json"
+    ))
+    .unwrap();
     let songs = parse_songs(&body);
     assert!(!songs.is_empty(), "no songs parsed");
 
