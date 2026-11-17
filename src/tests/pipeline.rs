@@ -15,17 +15,9 @@ fn a_request_in_the_same_breath_is_understood() {
 }
 
 #[test]
-fn play_is_not_needed_after_an_opening_wake_word() {
-    assert!(matches!(
-        understand(&parser(), "Shamash, Bohemian Rhapsody", false),
-        Understood::Request(_)
-    ));
-}
-
-#[test]
-fn a_bare_wake_word_waits_for_the_request() {
+fn a_bare_groovy_play_waits_for_the_request() {
     assert_eq!(
-        understand(&parser(), "Groovy.", false),
+        understand(&parser(), "Groovy, play.", false),
         Understood::WakeOnly
     );
 }
@@ -46,6 +38,7 @@ fn conversation_is_not_a_request() {
         "Okay but what about lunch",
         "I told groovy to play something",
         "That's so groovy.",
+        "Shamash, Bohemian Rhapsody",
     ] {
         assert!(
             matches!(understand(&parser(), heard, false), Understood::Nothing(_)),

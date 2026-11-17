@@ -530,9 +530,9 @@ pub fn queue_view(waiting: &[Waiting], selected: Option<u64>) -> View {
     }
 }
 
-/// "**bot**", "**bot** or **shamash**", "**a**, **b** or **c**".
+/// "**bot play**", "**bot play** or **shamash play**".
 fn either(words: &[String]) -> String {
-    let words: Vec<String> = words.iter().map(|w| format!("**{w}**")).collect();
+    let words: Vec<String> = words.iter().map(|w| format!("**{w} play**")).collect();
     match words.as_slice() {
         [] => String::new(),
         [one] => one.clone(),

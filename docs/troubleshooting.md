@@ -9,7 +9,7 @@ loaded:
 
 ```
 INFO shamash::direct: loaded ASR model model=... backend=Vulkan0 device=Vulkan0
-INFO shamash::bot: Shamash starting up request_model=... wake_model=... wake_words=groovy, shamash
+INFO shamash::bot: Shamash starting up request_model=... wake_model=... wake_words=groovy
 INFO shamash::pipeline: request heard guild_id=... user=... transcript="Groovy, play Dracula by Tame Impala."
 INFO shamash::pipeline: playing a request guild_id=... request="dracula by tame impala"
 ```

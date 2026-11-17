@@ -4,63 +4,12 @@ fn parser() -> CommandParser {
     CommandParser::new(["shamash", "groovy"].into_iter().map(str::to_string))
 }
 
-/// A parser with "play" acting as a wake word of its own.
-fn parser_with_play_wake_word() -> CommandParser {
-    CommandParser::new(["groovy", "play"].into_iter().map(str::to_string))
-}
-
-/// A parser configured with "bot" and its clipped "ut" and "ot" forms, as
-/// someone whose voice needs them might set `WAKE_WORDS`.
-fn parser_with_short_wake_words() -> CommandParser {
-    CommandParser::new(["bot", "play", "ut", "ot"].into_iter().map(str::to_string))
-}
-
-#[test]
-fn hears_a_wake_word_that_lost_its_first_letter() {
-    for heard in [
-        "ut play despacito",
-        "ot play despacito",
-        "bot play despacito",
-    ] {
-        let req = parser_with_short_wake_words()
-            .parse(heard)
-            .unwrap_or_else(|| panic!("{heard:?} should have been heard"));
-        assert_eq!(req.query, "despacito", "for {heard:?}");
-    }
-}
-
 #[test]
 fn a_clipped_wake_word_is_not_invented_when_not_configured() {
     let bot_only = CommandParser::new(["bot".to_string()]);
     assert_eq!(
-        bot_only.parse_with_reason("ut play despacito"),
+        bot_only.command("ut play despacito"),
         Err(ParseMiss::NoWakeWord)
-    );
-}
-
-#[test]
-fn play_alone_is_a_whole_command_when_it_is_a_wake_word() {
-    let req = parser_with_play_wake_word()
-        .parse("play dracula by tame impala")
-        .unwrap();
-    assert_eq!(req.query, "dracula by tame impala");
-    assert_eq!(req.title.as_deref(), Some("dracula"));
-    assert_eq!(req.artist.as_deref(), Some("tame impala"));
-}
-
-#[test]
-fn play_keeps_working_after_another_wake_word() {
-    let req = parser_with_play_wake_word()
-        .parse("groovy play despacito")
-        .unwrap();
-    assert_eq!(req.query, "despacito");
-}
-
-#[test]
-fn a_lone_play_wake_word_still_needs_a_query() {
-    assert_eq!(
-        parser_with_play_wake_word().parse_with_reason("play"),
-        Err(ParseMiss::EmptyRequest)
     );
 }
 
@@ -74,37 +23,42 @@ fn extracts_title_and_artist() {
     assert_eq!(req.artist.as_deref(), Some("tame impala"));
 }
 
+/// Only "<wake word> play" starts a command: no near misses of either word,
+/// no greeting-only opener, nothing between them.
 #[test]
-fn tolerates_greeting_words_after_wake_word() {
-    let req = parser()
-        .parse("Hey shamash, could you please play Bohemian Rhapsody!")
-        .unwrap();
-    assert_eq!(req.query, "bohemian rhapsody");
-    assert_eq!(req.title, None);
+fn only_the_wake_word_then_play_is_a_command() {
+    let parser = parser();
+    for heard in [
+        "groovy",
+        "hey groovy",
+        "groovy, dracula by tame impala",
+        "hey shamash please bohemian rhapsody",
+        "shamash could you play bohemian rhapsody",
+        "groovy please play dracula",
+        "groovy late look at me",
+        "groovy plate dracula",
+        "groovy lay dracula",
+        "groove play dracula",
+        "shemash play despacito",
+        "play dracula",
+    ] {
+        assert!(parser.command(heard).is_err(), "{heard:?} is not a command");
+        assert!(
+            !parser.wakes_on(heard),
+            "the gate should not wake on {heard:?}"
+        );
+    }
 }
 
-/// The live failure this pair of fixes came from: the wake gate fired on
-/// "late", Whisper ended the request with "come on", and nothing played.
+/// The aside is dropped from the end of a request.
 #[test]
-fn a_late_for_play_and_a_trailing_come_on_still_parse() {
-    let parser = CommandParser::new(["groovy", "play", "plate", "lay"].map(str::to_string));
-    let req = parser.parse("late look at me. come on").unwrap();
-    assert_eq!(req.query, "look at me");
-}
-
-/// A lone misheard verb must not arm the "next utterance is the title"
-/// path; only an exact "play" pause does that.
-#[test]
-fn a_lone_misheard_play_does_not_arm_the_next_utterance() {
-    let parser = CommandParser::new(["groovy", "play", "plate", "lay"].map(str::to_string));
-    assert_eq!(parser.parse_with_reason("late"), Err(ParseMiss::NoPlayVerb));
+fn a_trailing_come_on_is_dropped() {
     assert_eq!(
-        parser.parse_with_reason("i'm late"),
-        Err(ParseMiss::NoPlayVerb)
-    );
-    assert_eq!(
-        parser.parse_with_reason("play"),
-        Err(ParseMiss::EmptyRequest)
+        parser()
+            .parse("groovy play look at me. come on")
+            .unwrap()
+            .query,
+        "look at me"
     );
 }
 
@@ -290,35 +244,15 @@ fn empty_transcript_is_rejected() {
 fn reports_why_a_transcript_was_rejected() {
     let parser = parser();
     assert_eq!(
-        parser.parse_with_reason("what is the weather"),
+        parser.command("what is the weather"),
         Err(ParseMiss::NoWakeWord)
     );
     assert_eq!(
-        parser.parse_with_reason("shamash what is the weather"),
+        parser.command("shamash what is the weather"),
         Err(ParseMiss::NoPlayVerb)
     );
-    assert_eq!(
-        parser.parse_with_reason("shamash play"),
-        Err(ParseMiss::EmptyRequest)
-    );
-    assert!(parser.parse_with_reason("shamash play despacito").is_ok());
-}
-
-#[test]
-fn parse_agrees_with_parse_with_reason() {
-    let parser = parser();
-    for transcript in [
-        "shamash play dracula by tame impala",
-        "groovy play despacito",
-        "no wake word here",
-        "shamash play",
-        "  ",
-    ] {
-        assert_eq!(
-            parser.parse(transcript),
-            parser.parse_with_reason(transcript).ok()
-        );
-    }
+    assert_eq!(parser.command("shamash play"), Err(ParseMiss::EmptyRequest));
+    assert!(parser.command("shamash play despacito").is_ok());
 }
 
 #[test]
@@ -329,95 +263,12 @@ fn exposes_configured_wake_words() {
     assert!(words.contains("groovy"));
 }
 
-#[test]
-fn tolerates_one_letter_wake_word_mistakes() {
-    let parser = parser();
-    for heard in [
-        "shemash play despacito",
-        "samash play despacito",
-        "shammash play despacito",
-        "shamish play despacito",
-        "Shamash, play despacito",
-    ] {
-        assert!(parser.parse(heard).is_some(), "should accept {heard:?}");
-    }
-}
-
-/// "play" is a shipped default wake word, and a bare "play" stands in for
-/// the whole command so the shortest useful thing to say is "play lofi".
-///
-/// The cost is that ordinary speech about playing something is taken as a
-/// request. This is a deliberate trade rather than a bug: the shorter
-/// command is worth more than avoiding a few unwanted searches, and the
-/// queue makes a false trigger cheap to skip past.
-///
-/// These assertions exist so the behaviour is not "fixed" by someone who
-/// reads it as an oversight. A rejection list would only cover the phrases
-/// somebody thought of.
-#[test]
-fn a_bare_play_wake_word_takes_the_next_words_as_a_query() {
-    let parser = parser_with_play_wake_word();
-    for (heard, query) in [
-        ("play despacito", "despacito"),
-        ("play the game", "the game"),
-        ("play guitar", "guitar"),
-        ("play football tomorrow", "football tomorrow"),
-        ("play again", "again"),
-    ] {
-        let request = parser.parse(heard).unwrap_or_else(|| {
-            panic!(
-                "{heard:?} should parse, got {:?}",
-                parser.parse_with_reason(heard)
-            )
-        });
-        assert_eq!(request.query, query, "wrong query for {heard:?}");
-    }
-}
-
-/// The trade above does not extend to "play" with nothing after it, which
-/// is the case where there is no query to search for at all.
-#[test]
-fn a_bare_play_with_nothing_after_it_still_needs_a_title() {
-    assert_eq!(
-        parser_with_play_wake_word().parse_with_reason("play"),
-        Err(ParseMiss::EmptyRequest)
-    );
-}
-
-/// A wake word that is also a misheard "play" is both, so the common
-/// "lay despacito" and "late look at me" transcripts work.
-#[test]
-fn a_misheard_play_wake_word_is_also_the_verb() {
-    let parser = CommandParser::new(["lay", "plate"].into_iter().map(str::to_string));
-    assert_eq!(
-        parser.parse_with_reason("lay despacito").unwrap().query,
-        "despacito"
-    );
-    assert_eq!(
-        parser.parse_with_reason("plate despacito").unwrap().query,
-        "despacito"
-    );
-    // "a silver plate" does contain the wake word, so it gets as far as
-    // wanting a verb; it has none, so it is rejected.
-    assert!(parser.parse("a silver plate").is_none());
-    assert!(parser.parse("i was laying the table").is_none());
-    assert_eq!(
-        parser.parse("lay play despacito").unwrap().query,
-        "despacito"
-    );
-    assert_eq!(
-        parser.parse("plate play despacito").unwrap().query,
-        "despacito"
-    );
-}
-
 /// Wake words are lowercased when configured, so a capitalised entry is not
 /// a second word and does not change what is heard.
 #[test]
 fn a_capitalised_wake_word_is_the_same_word() {
-    let parser = CommandParser::new(["Plate", "LAY"].into_iter().map(str::to_string));
-    assert!(parser.parse("lay play despacito").is_some());
-    assert!(parser.parse("plate play despacito").is_some());
+    let parser = CommandParser::new(["Groovy".to_string()]);
+    assert!(parser.parse("groovy play despacito").is_some());
 }
 
 /// A short wake word must be heard exactly. "bot" used to answer to one
@@ -437,7 +288,7 @@ fn a_short_wake_word_must_be_heard_exactly() {
         "i will not play despacito today",
     ] {
         assert_eq!(
-            parser.parse_with_reason(heard).err(),
+            parser.command(heard).err(),
             Some(ParseMiss::NoWakeWord),
             "should reject {heard:?}"
         );
@@ -471,7 +322,7 @@ fn a_pause_with_nothing_after_it_is_not_a_request() {
 fn ignores_wake_words_that_are_too_far_off() {
     let parser = parser();
     assert_eq!(
-        parser.parse_with_reason("chameleon play despacito").err(),
+        parser.command("chameleon play despacito").err(),
         Some(ParseMiss::NoWakeWord)
     );
 }
@@ -517,12 +368,11 @@ fn stripping_the_command_leaves_the_request() {
 /// Whatever the grammar accepts, stripping and parsing must agree on.
 #[test]
 fn stripping_agrees_with_parsing() {
-    let parser = parser_with_play_wake_word();
+    let parser = parser();
     for transcript in [
         "groovy play dracula by tame impala",
-        "play despacito",
         "shamash play us and them by pink floyd",
-        "play",
+        "groovy play",
     ] {
         assert_eq!(
             parser.strip_command(transcript),
@@ -533,48 +383,10 @@ fn stripping_agrees_with_parsing() {
 }
 
 #[test]
-fn computes_edit_distance() {
-    assert_eq!(edit_distance("shamash", "shamash"), 0);
-    assert_eq!(edit_distance("shamash", "shemash"), 1);
-    assert_eq!(edit_distance("shamash", "shammash"), 1);
-    assert_eq!(edit_distance("shamash", "shamish"), 1);
-    assert_eq!(edit_distance("flaw", "lawn"), 2);
-    assert_eq!(edit_distance("kitten", "sitting"), 3);
-    assert_eq!(edit_distance("", "bot"), 3);
-}
-
-/// The request the old grammar threw away: "groovy", then the title with no
-/// "play" in between.
-#[test]
-fn command_does_not_need_play_when_the_wake_word_opens_the_sentence() {
-    let req = parser().command("Groovy, Dracula by Tame Impala").unwrap();
-    assert_eq!(req.title.as_deref(), Some("dracula"));
-    assert_eq!(req.artist.as_deref(), Some("tame impala"));
-    let req = parser()
-        .command("hey shamash please bohemian rhapsody")
-        .unwrap();
-    assert_eq!(req.query, "bohemian rhapsody");
-}
-
-#[test]
 fn command_still_understands_play() {
     assert_eq!(
         parser().command("groovy play dracula").unwrap().query,
         "dracula"
-    );
-    assert_eq!(
-        parser()
-            .command("shamash could you play bohemian rhapsody")
-            .unwrap()
-            .query,
-        "bohemian rhapsody"
-    );
-    assert_eq!(
-        parser_with_play_wake_word()
-            .command("play stand by me")
-            .unwrap()
-            .query,
-        "stand by me"
     );
 }
 
@@ -591,13 +403,6 @@ fn command_needs_play_after_a_wake_word_mid_sentence() {
             .query,
         "dracula"
     );
-    assert_eq!(
-        parser()
-            .command("right groovy please play dracula")
-            .unwrap()
-            .query,
-        "dracula"
-    );
 }
 
 /// "play" somewhere later in the sentence is not enough mid-sentence: that
@@ -608,33 +413,6 @@ fn a_later_play_mid_sentence_is_not_a_request() {
         "i told groovy to play something",
         "you have to ask groovy and then play it",
         "that is so groovy let me play it again",
-    ] {
-        assert_eq!(
-            parser().command(heard),
-            Err(ParseMiss::NoPlayVerb),
-            "for {heard:?}"
-        );
-    }
-}
-
-/// One letter off is how a name gets misheard, and also how an ordinary
-/// word looks. So a near match needs "play" straight after it, and never
-/// arms the speaker on its own.
-#[test]
-fn a_near_wake_word_needs_play_straight_after_it() {
-    assert_eq!(
-        parser().command("shemash play dracula").unwrap().query,
-        "dracula"
-    );
-    assert_eq!(
-        parser().command("groove play dracula").unwrap().query,
-        "dracula"
-    );
-    for heard in [
-        "groove is in the heart",
-        "shemash dracula by tame impala",
-        "groove could you play dracula",
-        "groove",
     ] {
         assert_eq!(
             parser().command(heard),
@@ -663,8 +441,8 @@ fn a_later_wake_word_is_still_heard() {
 }
 
 #[test]
-fn a_bare_wake_word_is_an_empty_request() {
-    assert_eq!(parser().command("Groovy."), Err(ParseMiss::EmptyRequest));
+fn a_bare_wake_word_and_play_is_an_empty_request() {
+    assert_eq!(parser().command("Groovy."), Err(ParseMiss::NoPlayVerb));
     assert_eq!(
         parser().command("groovy play"),
         Err(ParseMiss::EmptyRequest)
@@ -715,7 +493,7 @@ fn saying_album_names_the_album() {
         ("groovy play the slow rush album", "slow rush"),
         ("groovy play 17 by xxxtentacion album", "17 by xxxtentacion"),
         (
-            "Groovy, the album Thriller by Michael Jackson.",
+            "Groovy, play the album Thriller by Michael Jackson.",
             "thriller by michael jackson",
         ),
     ] {
@@ -761,23 +539,8 @@ fn a_typed_request_reads_like_the_same_words_spoken() {
 
 #[test]
 fn the_gate_ignores_punctuation_and_case() {
-    assert!(parser().wakes_on("Hey, GROOVY!"));
+    assert!(parser().wakes_on("Hey, GROOVY! Play"));
     assert!(!parser().wakes_on("not now"));
-}
-
-/// The gate wakes on whatever could be the start of a command.
-#[test]
-fn the_gate_wakes_on_what_could_start_a_command() {
-    for window in [
-        "groovy",
-        "hey groovy",
-        "groovy dracula by",
-        "groovy could you",
-        "and then groovy play",
-        "shemash play",
-    ] {
-        assert!(parser().wakes_on(window), "should wake on {window:?}");
-    }
 }
 
 /// And not on a wake word that is only part of what someone is saying.
@@ -788,7 +551,6 @@ fn the_gate_does_not_wake_on_a_wake_word_in_conversation() {
         "i told groovy to",
         "the groove in this",
         "groove is in the heart",
-        "shemash",
     ] {
         assert!(!parser().wakes_on(window), "should not wake on {window:?}");
     }
@@ -801,11 +563,8 @@ fn the_gate_wakes_on_everything_the_grammar_accepts() {
     let parser = parser();
     for heard in [
         "Groovy, play Dracula by Tame Impala.",
-        "Groovy, Dracula by Tame Impala",
-        "hey groovy could you please play bohemian rhapsody",
         "okay so groovy play dracula",
-        "shemash play dracula",
-        "Groovy.",
+        "and then groovy play",
     ] {
         assert_ne!(
             parser.command(heard),

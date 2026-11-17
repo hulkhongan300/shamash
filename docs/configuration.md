@@ -20,7 +20,7 @@ the bot at startup instead of silently falling back to a default.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `WAKE_WORDS` | `groovy,shamash` | Comma-separated wake words. See [Choosing wake words](#choosing-wake-words) |
+| `WAKE_WORDS` | `groovy` | Comma-separated wake words. See [Choosing wake words](#choosing-wake-words) |
 | `WAKE_MODEL` | Parakeet TDT+CTC 110M | The small, always-loaded model. A `.gguf` path or a Hugging Face model id |
 | `REQUEST_MODEL` | Whisper large-v3-turbo | The large model, loaded on the first wake word. A `.gguf` path or a Hugging Face model id. `PARAKEET_MODEL` is the old name and still works |
 | `ASR_PROMPT` | an example request | Example text for models that take a prompt (Whisper does). `off` disables it |
@@ -101,16 +101,11 @@ from ordinary speech. `bot` used to be a default. The small model often wrote
 it as "but", so it had to answer to "but" too, and then every sentence that
 opened with "but" was a song request.
 
-Wake words of four letters or fewer must be heard exactly. Longer ones also
-answer to one misheard letter ("shemash", "shammash" for "shamash"), but only
-with "play" straight after it: one letter off is also how ordinary words look,
-and "groove" is one letter from "groovy".
-
-Avoid common words. "Play" as a wake word would make "let's play a game" a song
-request. A real word such as "groovy" is fine as long as it is rare: it only
-wakes the bot when it opens the sentence or is followed by "play". "That's so
-groovy" is left alone, but "Groovy, see you tomorrow" is a request for "see you
-tomorrow".
+A command is a wake word with "play" straight after it, both heard exactly:
+"groovy play Dracula". Nothing else wakes the bot: not "groovy" on its own, not
+"hey groovy, Dracula", not "groovy please play", not "groove play" or "groovy
+late". So "that's so groovy" is left alone, and so is "play" without the wake
+word in front of it.
 
 ## The rewrite stage
 

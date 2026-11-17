@@ -13,7 +13,7 @@ Discord voice (Opus @ 48 kHz) ──► songbird receive, decoded to 16 kHz mono
 │  WAKE MODEL (small, resident): last 2 s of the utterance │
 │  checked every 250 ms while the speaker is talking       │
 └──────────────────────────────────────────────────────────┘
-        │ a wake word that could start a request
+        │ a wake word with "play" straight after it
         ▼
       tone 1 (880 Hz) and the music drops to 20%
         │
@@ -25,10 +25,10 @@ Discord voice (Opus @ 48 kHz) ──► songbird receive, decoded to 16 kHz mono
 │  LLM rewrite (optional): misheard names → likely names   │
 └──────────────────────────────────────────────────────────┘
         │
-        ├── wake word on its own ──► tone 2 (988 Hz); the speaker's
+        ├── "groovy play" alone ───► tone 2 (988 Hz); the speaker's
         │                            next utterance is the request
         ▼
-Parser: "groovy, [play] <title> by <artist>" → request
+Parser: "groovy play <title> by <artist>" → request
         ▼
 YouTube Music catalog: the song's real artist, title, length and video
         ▼
@@ -53,11 +53,8 @@ While someone talks, the small wake model checks the last two seconds every
 model when the speaker stops, so the request is transcribed in one piece, wake
 word included.
 
-Not every wake word counts. It has to open the sentence (after at most a
-greeting) or have "play" straight after it, so "that's so groovy" plays no tone
-and leaves the music alone. A wake word misheard by one letter needs "play"
-after it even at the start of the sentence, because one letter off is also how
-ordinary words look: "groove" is one letter from "groovy".
+Only the wake word with "play" straight after it counts, both heard exactly,
+so "that's so groovy" plays no tone and leaves the music alone.
 
 ## Resolving the request
 

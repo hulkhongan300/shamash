@@ -126,7 +126,7 @@ fn a_wake_word_at_the_very_end_is_caught_by_the_closing_check() {
     else {
         panic!("expected a closing check");
     };
-    let heard = gate.transcribed(1, "okay shamash", Some(audio));
+    let heard = gate.transcribed(1, "okay shamash play", Some(audio));
     assert!(matches!(
         heard[..],
         [
@@ -145,8 +145,8 @@ fn one_utterance_wakes_only_once() {
     let armed = Armed::default();
     let mut gate = gate(&armed);
     gate.push(1, &voice(40));
-    assert_eq!(gate.transcribed(1, "groovy", None).len(), 1);
-    assert!(gate.transcribed(1, "groovy", None).is_empty());
+    assert_eq!(gate.transcribed(1, "groovy play", None).len(), 1);
+    assert!(gate.transcribed(1, "groovy play", None).is_empty());
     // And no more rolling checks once woken.
     assert_eq!(checks(&gate.push(1, &voice(100))), 0);
 }
@@ -176,7 +176,7 @@ fn speakers_are_kept_apart() {
     let mut gate = gate(&armed);
     gate.push(1, &voice(40));
     gate.push(2, &voice(40));
-    gate.transcribed(1, "groovy", None);
+    gate.transcribed(1, "groovy play", None);
     let other = gate.push(2, &quiet(50));
     assert!(
         other

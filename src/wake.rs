@@ -14,7 +14,7 @@
 //! only frames above a loudness gate, so what it did record had its quiet parts
 //! spliced out.
 //!
-//! A wake word said on its own ("groovy", pause) leaves the speaker *armed*: the
+//! "groovy play" said on its own (then a pause) leaves the speaker *armed*: the
 //! pipeline plays the ready tone, and the speaker's next utterance is taken as
 //! the request without needing the wake word again. See [`Armed`].
 
