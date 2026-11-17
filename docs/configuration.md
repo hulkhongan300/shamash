@@ -24,7 +24,7 @@ the bot at startup instead of silently falling back to a default.
 | `WAKE_MODEL` | Parakeet TDT+CTC 110M | The small, always-loaded model. A `.gguf` path or a Hugging Face model id |
 | `REQUEST_MODEL` | Whisper large-v3-turbo | The large model, loaded on the first wake word. A `.gguf` path or a Hugging Face model id. `PARAKEET_MODEL` is the old name and still works |
 | `ASR_PROMPT` | an example request | Example text for models that take a prompt (Whisper does). `off` disables it |
-| `ASR_LANGUAGE` | detected | One ISO-639-1 code, such as `en` or `pt` |
+| `ASR_LANGUAGE` | detected | ISO-639-1 codes, such as `en` or `en,pt`. See [The two models](#the-two-models) |
 | `ASR_ENGINE` | `direct` | `direct` runs transcribe.cpp in-process. `handy` shells out to the Handy app, for comparing engines only |
 | `VOICE_DIAG` | off | Set to `1` to log how loud each speaker is |
 | `MODEL_DOWNLOAD` | on | Download a missing model at startup. `off` makes a missing model an error instead |
@@ -85,13 +85,15 @@ REQUEST_MODEL=handy-computer/parakeet-tdt-0.6b-v2-gguf/parakeet-tdt-0.6b-v2-Q8_0
 It cannot be prompted, though, and in the same comparison it spelled only two
 of the five artists right.
 
-**Language.** `ASR_LANGUAGE` takes one ISO-639-1 code: `en`, `pt` or `es`. It
-does not take `pt-PT`, `pt_PT` or `Portuguese`, and the bot will not start with
-a code its model does not know. Leave it unset if anyone speaks more than one
-language. Whisper then detects among 100 languages, while pinning it to `en`
-makes it render other languages as English words, and a misheard title is a
-wrong song. Some models (Canary, Nemotron) produce no text without a hint, so
-set one for those.
+**Language.** `ASR_LANGUAGE` takes ISO-639-1 codes: `en`, `pt` or `es`. It
+does not take `pt-PT`, `pt_PT` or `Portuguese`. Pinning one language makes
+Whisper render other languages as English words, and a misheard title is a
+wrong song. For a channel that speaks English and Portuguese, set `en,pt`:
+Whisper detects the language, and if it picks one outside the list it
+transcribes again as the first code. Each model keeps only the codes it knows,
+so the English-only wake model just uses `en`. The bot will not start if a
+model knows none of them. Unset, Whisper detects among all 100 languages. Some
+models (Canary, Nemotron) produce no text without a hint, so set one for those.
 
 ## Choosing wake words
 
