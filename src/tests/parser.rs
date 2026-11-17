@@ -23,7 +23,7 @@ fn extracts_title_and_artist() {
     assert_eq!(req.artist.as_deref(), Some("tame impala"));
 }
 
-/// Only an exact "<wake word> play" starts a command.
+/// Only the wake word and a way to ask for a song start a command.
 #[test]
 fn only_the_wake_word_then_play_is_a_command() {
     let parser = parser();
@@ -32,8 +32,7 @@ fn only_the_wake_word_then_play_is_a_command() {
         "hey groovy",
         "groovy, dracula by tame impala",
         "hey shamash please bohemian rhapsody",
-        "shamash could you play bohemian rhapsody",
-        "groovy please play dracula",
+        "groovy could you dracula",
         "groovy late look at me",
         "groovy plate dracula",
         "groovy lay dracula",
@@ -44,6 +43,64 @@ fn only_the_wake_word_then_play_is_a_command() {
             !parser.wakes_on(heard),
             "the gate should not wake on {heard:?}"
         );
+    }
+}
+
+/// A greeting first, "could you", "please", or another verb than "play".
+#[test]
+fn a_request_can_be_asked_for_naturally() {
+    let parser = parser();
+    for (heard, query) in [
+        ("Hey groovy, play Despacito.", "despacito"),
+        (
+            "Groovy, can you play Dracula by Tame Impala?",
+            "dracula by tame impala",
+        ),
+        (
+            "Hey groovy, could you please play Bohemian Rhapsody?",
+            "bohemian rhapsody",
+        ),
+        ("Groovy please play Blinding Lights", "blinding lights"),
+        (
+            "Groovy, would you put on Hotel California?",
+            "hotel california",
+        ),
+        ("groovy will you throw on some lofi", "some lofi"),
+        // Only the asking is taken off, never the title's own words.
+        ("Groovy, put on On My Way.", "on my way"),
+        ("Groovy, play Please Please Please.", "please please please"),
+        (
+            "Groovy, play Can You Feel My Heart",
+            "can you feel my heart",
+        ),
+    ] {
+        assert!(parser.wakes_on(heard), "the gate missed {heard:?}");
+        assert_eq!(
+            parser.command(heard).map(|r| r.query).as_deref(),
+            Ok(query),
+            "for {heard:?}"
+        );
+    }
+    assert_eq!(
+        parser.command("Hey groovy, could you play?"),
+        Err(ParseMiss::EmptyRequest)
+    );
+}
+
+/// The same words said to somebody else, or not followed by a verb.
+#[test]
+fn asking_somebody_else_is_not_a_command() {
+    let parser = parser();
+    for heard in [
+        "Could you play that part again?",
+        "can you put on your headphones",
+        "please play nice",
+        "that's so groovy, can you believe it",
+        "I told groovy to put on something",
+        "groovy, would you mind",
+    ] {
+        assert!(!parser.wakes_on(heard), "the gate woke on {heard:?}");
+        assert!(parser.command(heard).is_err(), "{heard:?} is not a command");
     }
 }
 

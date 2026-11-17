@@ -103,10 +103,12 @@ from ordinary speech. `bot` used to be a default. The small model often wrote
 it as "but", so it had to answer to "but" too, and then every sentence that
 opened with "but" was a song request.
 
-A command is a wake word with "play" straight after it: "groovy play Dracula".
-Nothing else wakes the bot: not "groovy" on its own, not "hey groovy, Dracula",
-not "groovy please play", not "groovy late". So "that's so groovy" is left
-alone, and so is "play" without the wake word in front of it.
+A command is a wake word, then "play", "put on" or "throw on", perhaps asked
+politely: "groovy play Dracula", "hey groovy, could you please put on Dracula".
+The polite words are "can you", "could you", "would you", "will you" and
+"please". Nothing else wakes the bot: not "groovy" on its own, not "hey groovy,
+Dracula", not "groovy late". So "that's so groovy" is left alone, and so is
+"could you play that again" without the wake word in front of it.
 
 The wake word is matched by sound, not spelling, because the speech models
 rarely spell it right: "groovy play" comes back as "ruby play", "rove played"
@@ -115,6 +117,11 @@ but the first) and ends the same way, in a vowel or not. The wake model's "b"
 also counts as "v", since it writes "ruby" for "groovy"; the request model's
 does not, so "Ruby, play your card" plays no song. A wake word with fewer than
 three consonants, such as `bot`, must be heard exactly.
+
+Matching by sound lets in words that sound like the wake word. In tests with
+synthetic voices, "Harvey, would you play the next round?" and "I'll drive,
+can you play some music?" were both taken as requests. Pick a wake word that
+sounds like nobody's name in the channel.
 
 ## The rewrite stage
 

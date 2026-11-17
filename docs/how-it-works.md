@@ -13,7 +13,7 @@ Discord voice (Opus @ 48 kHz) ──► songbird receive, decoded to 16 kHz mono
 │  WAKE MODEL (small, resident): last 2 s of the utterance │
 │  checked every 250 ms while the speaker is talking       │
 └──────────────────────────────────────────────────────────┘
-        │ a wake word with "play" straight after it
+        │ a wake word, then "play" or another way to ask
         ▼
       tone 1 (880 Hz) and the music drops to 20%
         │
@@ -53,10 +53,11 @@ While someone talks, the small wake model checks the last two seconds every
 model when the speaker stops, so the request is transcribed in one piece, wake
 word included.
 
-Only the wake word with "play" straight after it counts, so "that's so groovy"
-plays no tone and leaves the music alone. Both models are checked by sound, not
-spelling: the small one spells "groovy play" wrong more often than right ("ruby
-play", "rove played"). See [Choosing wake words](configuration.md#choosing-wake-words).
+Only the wake word followed by a way to ask for a song counts ("play", "could
+you play", "put on"), so "that's so groovy" plays no tone and leaves the music
+alone. Both models are checked by sound, not spelling: the small one spells
+"groovy play" wrong more often than right ("ruby play", "rove played"). See
+[Choosing wake words](configuration.md#choosing-wake-words).
 
 ## Resolving the request
 
