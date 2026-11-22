@@ -34,6 +34,7 @@ leaves the host.
 - **`/play` with live suggestions.** Start typing and matching songs appear.
   Links, playlists and albums work too.
 - **`/lock` and `/unlock`.** Turn listening off without removing the bot.
+- **`/version`.** Shows the commit the running bot was built from, linked on GitHub, so you can check it against the latest on `main`.
 - **Autonomous.** Joins when someone enters the configured channel and leaves,
   clearing the queue, once nobody is left.
 - **A queue and a dashboard.** A now-playing message with a progress bar and
