@@ -716,6 +716,10 @@ fn skip_stop_lock_and_unlock_are_controls() {
         ("Groovy, lock.", Control::Lock),
         ("Groovy, unlock.", Control::Unlock),
         ("groovy un lock", Control::Unlock),
+        ("Groovy, version.", Control::Version),
+        ("Groovy, what's your version?", Control::Version),
+        ("Groovy, tell me your version.", Control::Version),
+        ("groovy what version are you running", Control::Version),
     ] {
         assert_eq!(parser.control(heard), Some(control), "{heard:?}");
         assert!(parser.wakes_on(heard), "the gate missed {heard:?}");
@@ -726,6 +730,7 @@ fn skip_stop_lock_and_unlock_are_controls() {
         "that's so groovy, stop talking",
         "groovy skip this one",
         "groovy is locked out",
+        "groovy version two of that song",
     ] {
         assert_eq!(parser.control(heard), None, "{heard:?} is not a control");
     }

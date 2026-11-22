@@ -40,6 +40,8 @@ pub enum Control {
     Lock,
     /// "groovy unlock": listen for voice commands again.
     Unlock,
+    /// "groovy version": post the running build in the text channel.
+    Version,
 }
 
 /// Control words after the wake word, with the "-ed" spellings the models write.
@@ -53,6 +55,18 @@ const CONTROLS: &[(&[&str], Control)] = &[
     (&["unlock"], Control::Unlock),
     (&["unlocked"], Control::Unlock),
     (&["un", "lock"], Control::Unlock),
+    (&["version"], Control::Version),
+    (&["your", "version"], Control::Version),
+    (&["what", "version"], Control::Version),
+    (&["whats", "your", "version"], Control::Version),
+    (&["what", "is", "your", "version"], Control::Version),
+    (&["tell", "me", "your", "version"], Control::Version),
+    (&["what", "version", "are", "you"], Control::Version),
+    (&["what", "version", "are", "you", "on"], Control::Version),
+    (
+        &["what", "version", "are", "you", "running"],
+        Control::Version,
+    ),
 ];
 
 /// `words` without a leading "[could you] [please]".
