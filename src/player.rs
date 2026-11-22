@@ -906,6 +906,24 @@ impl Player {
         Ok(())
     }
 
+    /// Whether the request names one song as a whole: a taught phrase or one confident match.
+    pub async fn is_one_song(
+        &self,
+        guild_id: GuildId,
+        request: &PlayRequest,
+        timing: &Timing,
+    ) -> bool {
+        let library = self.library.as_deref();
+        library
+            .and_then(|library| search::remembered(library, &request.query))
+            .is_some()
+            || matches!(
+                search::resolve_request(request, &self.catalog, None, library, guild_id, timing)
+                    .await,
+                search::Resolved::Track { .. }
+            )
+    }
+
     /// Resolves the request against the catalog and queues it, or asks when nothing is convincing.
     pub async fn play(
         self: &Arc<Self>,

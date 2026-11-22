@@ -237,6 +237,38 @@ pub fn typed_request(text: &str) -> Option<PlayRequest> {
     build_request(&normalize(text))
 }
 
+/// What follows an "and" that surely starts another song: "and then", "and also", "and play".
+fn next_song<'a>(words: &'a [&'a str]) -> Option<&'a [&'a str]> {
+    let linked = ["then", "also"]
+        .iter()
+        .find_map(|w| words.strip_prefix(&[*w]));
+    after_verb(linked.unwrap_or(words)).or(linked)
+}
+
+/// The songs in "x and y": split at every "and" when `every`, else only where
+/// another song surely follows ("and play y"), so "Me and Bobby McGee" stays whole.
+pub fn songs(query: &str, every: bool) -> Vec<PlayRequest> {
+    let words: Vec<&str> = query.split(' ').filter(|w| !w.is_empty()).collect();
+    let mut parts = Vec::new();
+    let (mut start, mut at) = (0, 0);
+    while at < words.len() {
+        let rest = &words[at + 1..];
+        match next_song(rest).or(every.then_some(rest)) {
+            Some(next) if words[at] == "and" => {
+                parts.push(&words[start..at]);
+                start = words.len() - next.len();
+                at = start;
+            }
+            _ => at += 1,
+        }
+    }
+    parts.push(&words[start..]);
+    parts
+        .iter()
+        .filter_map(|part| build_request(&part.join(" ")))
+        .collect()
+}
+
 /// Album lead-ins before the title, longest first.
 const ALBUM_LEADS: &[&[&str]] = &[
     &["the", "full", "album"],

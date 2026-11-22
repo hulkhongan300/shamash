@@ -170,29 +170,52 @@ impl ListenerPipeline {
 
         // Unduck before the lookup, not after.
         self.player.duck(guild_id, ssrc, false);
-        let rewritten = self
-            .rewrite(ctx, config, guild_id, &transcript, timing)
-            .await
-            .and_then(|text| self.parser.strip_command(&text));
+        let songs = self.songs(guild_id, request, timing).await;
+        // The rewrite reads the whole transcript, so it only fits a single song.
+        let rewritten = match songs.len() {
+            1 => self
+                .rewrite(ctx, config, guild_id, &transcript, timing)
+                .await
+                .and_then(|text| self.parser.strip_command(&text)),
+            _ => None,
+        };
         if let Some(rewritten) = &rewritten {
             tracing::info!(guild_id = %guild_id, rewrite = %rewritten, "the transcript rewrite is a second candidate for this request");
         }
-        tracing::info!(guild_id = %guild_id, user, request = %request.query, "playing a request");
-        if let Err(e) = self
-            .player
-            .play(
-                ctx,
-                config,
-                guild_id,
-                &request,
-                rewritten.as_deref(),
-                timing,
-            )
-            .await
-        {
-            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "playback failed");
+        // In order: the first starts playing and the rest queue behind it.
+        for request in &songs {
+            tracing::info!(guild_id = %guild_id, user, request = %request.query, songs = songs.len(), "playing a request");
+            if let Err(e) = self
+                .player
+                .play(ctx, config, guild_id, request, rewritten.as_deref(), timing)
+                .await
+            {
+                tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "playback failed");
+            }
         }
         false
+    }
+
+    /// The songs in one request: "x and play y" always splits; a bare "and"
+    /// only when the whole phrase is not one song, as "Me and Bobby McGee" is.
+    async fn songs(
+        &self,
+        guild_id: GuildId,
+        request: PlayRequest,
+        timing: &crate::timing::Timing,
+    ) -> Vec<PlayRequest> {
+        let sure = crate::parser::songs(&request.query, false);
+        if sure.len() > 1 {
+            return sure;
+        }
+        let every = crate::parser::songs(&request.query, true);
+        if every.len() < 2
+            || crate::parser::album_request(&request).is_some()
+            || self.player.is_one_song(guild_id, &request, timing).await
+        {
+            return vec![request];
+        }
+        every
     }
 
     /// Bare wake word: play the ready tone and take the next utterance as the request.

@@ -658,3 +658,50 @@ fn the_gate_wakes_on_everything_the_grammar_accepts() {
         assert!(parser.wakes_on(heard), "the gate should wake on {heard:?}");
     }
 }
+
+fn queries(query: &str, every: bool) -> Vec<String> {
+    songs(query, every).into_iter().map(|r| r.query).collect()
+}
+
+#[test]
+fn and_play_or_and_then_always_starts_another_song() {
+    for query in [
+        "dracula by tame impala and play bohemian rhapsody by queen",
+        "dracula by tame impala and then bohemian rhapsody by queen",
+        "dracula by tame impala and also bohemian rhapsody by queen",
+        "dracula by tame impala and then play bohemian rhapsody by queen",
+        "dracula by tame impala and could you please put on bohemian rhapsody by queen",
+    ] {
+        assert_eq!(
+            queries(query, false),
+            ["dracula by tame impala", "bohemian rhapsody by queen"],
+            "{query:?}"
+        );
+    }
+}
+
+#[test]
+fn a_bare_and_splits_only_when_asked() {
+    assert_eq!(queries("me and bobby mcgee", false), ["me and bobby mcgee"]);
+    assert_eq!(
+        queries("dracula and bohemian rhapsody and hey jude", true),
+        ["dracula", "bohemian rhapsody", "hey jude"]
+    );
+}
+
+#[test]
+fn an_explicit_split_keeps_and_inside_names() {
+    assert_eq!(
+        queries(
+            "mrs robinson by simon and garfunkel and play dracula",
+            false
+        ),
+        ["mrs robinson by simon and garfunkel", "dracula"]
+    );
+}
+
+#[test]
+fn a_dangling_and_adds_no_empty_song() {
+    assert_eq!(queries("dracula and then", false), ["dracula"]);
+    assert_eq!(queries("dracula and", true), ["dracula"]);
+}
