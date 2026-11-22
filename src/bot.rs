@@ -772,7 +772,6 @@ async fn finish(ctx: &Context, command: &CommandInteraction, text: &str) {
     }
 }
 
-/// Answers a slash command privately.
 /// The running build: the crate version, plus the commit when the image build passed `GIT_SHA`.
 fn version() -> String {
     let crate_version = env!("CARGO_PKG_VERSION");
@@ -786,6 +785,7 @@ fn version() -> String {
     }
 }
 
+/// Answers a slash command privately.
 async fn reply(ctx: &Context, command: CommandInteraction, text: &str) {
     let response = CreateInteractionResponse::Message(
         CreateInteractionResponseMessage::new()
