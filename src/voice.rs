@@ -193,6 +193,20 @@ impl VoiceService {
         Ok(())
     }
 
+    /// Joins the target channel if the bot isn't in a call, e.g. so `/play` can bring it back.
+    pub async fn ensure_joined(
+        &self,
+        ctx: &SerenityContext,
+        guild_id: GuildId,
+    ) -> anyhow::Result<()> {
+        if self.presence(ctx, guild_id).await == Presence::Join {
+            let target = ChannelId::new(self.config.voice_channel_id);
+            self.join_with_retry(ctx, guild_id, target).await?;
+            tracing::info!(guild_id = %guild_id, channel = %target, "rejoined the voice channel for /play");
+        }
+        Ok(())
+    }
+
     async fn presence(&self, ctx: &SerenityContext, guild_id: GuildId) -> Presence {
         let target = ChannelId::new(self.config.voice_channel_id);
         let current = match self.manager.get(guild_id) {

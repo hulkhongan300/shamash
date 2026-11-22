@@ -394,9 +394,30 @@ impl Handler {
             return;
         }
 
+        // Defer first: rejoining and searching can exceed Discord's 3 s answer deadline.
+        if let Err(e) = command.defer_ephemeral(&ctx.http).await {
+            tracing::warn!(error = %format!("{e:#}"), "could not acknowledge /play");
+            return;
+        }
+
+        // The bot may have dropped out of the call (kicked, disconnected); bring it back.
+        let rejoined = match VoiceService::from_ctx(ctx).await {
+            Ok(service) => service.ensure_joined(ctx, guild_id).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = rejoined {
+            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "/play could not join the voice channel");
+            finish(
+                ctx,
+                &command,
+                &format!("I couldn't join the voice channel: {e:#}"),
+            )
+            .await;
+            return;
+        }
+
         // A playlist or album link queues the whole thing.
         if let Some(url) = crate::playlist::playlist_url(&query) {
-            let _ = command.defer_ephemeral(&ctx.http).await;
             let text = match player.play_playlist(ctx, &config, guild_id, &url).await {
                 Ok(queued) => queued.summary(),
                 Err(e) => {
@@ -410,7 +431,6 @@ impl Handler {
 
         // A single-video link plays directly; typed words are a search.
         if let Some(video_id) = crate::playlist::video_id(&query) {
-            let _ = command.defer_ephemeral(&ctx.http).await;
             match player
                 .play_direct(ctx, &config, guild_id, &query, &video_id)
                 .await
@@ -439,11 +459,6 @@ impl Handler {
             return;
         }
 
-        // Defer first: the search can exceed Discord's 3 s answer deadline.
-        if let Err(e) = command.defer_ephemeral(&ctx.http).await {
-            tracing::warn!(error = %format!("{e:#}"), "could not acknowledge /play");
-            return;
-        }
         let started = std::time::Instant::now();
         let searched = player
             .search_and_ask(ctx, &config, guild_id, &query, command.user.id)
