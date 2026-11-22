@@ -253,3 +253,29 @@ async fn the_loop_delivers_the_wake_before_the_utterance() {
     handle.await.unwrap();
     assert_eq!(order.lock().unwrap().clone(), vec!["wake", "utterance"]);
 }
+
+#[tokio::test]
+async fn the_loop_hears_unlock_while_locked() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Tick>();
+    let heard = Arc::new(Mutex::new(0));
+    let seen = Arc::clone(&heard);
+    let gate = WakeGate::with_detector(
+        Arc::new(FixedText("groovy unlock")),
+        parser(),
+        Armed::default(),
+        || Box::new(Marked),
+    );
+    let handle = tokio::spawn(run_wake_gate(
+        gate,
+        rx,
+        || true,
+        move |_| *seen.lock().unwrap() += 1,
+    ));
+    for chunk in voice(100).chunks(320) {
+        tx.send(vec![(1, chunk.to_vec())]).unwrap();
+    }
+    tx.send(vec![(1, quiet(60))]).unwrap();
+    drop(tx);
+    handle.await.unwrap();
+    assert_eq!(*heard.lock().unwrap(), 2, "a wake and the utterance");
+}

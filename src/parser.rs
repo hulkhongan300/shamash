@@ -29,14 +29,56 @@ const ASKS: &[&[&str]] = &[
 /// Not "queue": the wake model runs it into the next word ("cubohemian rhapsody").
 const VERBS: &[&[&str]] = &[&["play"], &["played"], &["put", "on"], &["throw", "on"]];
 
-/// What follows "[could you] [please] <verb>" at the start of `words`, if a verb is there.
-fn after_verb<'a>(words: &'a [&'a str]) -> Option<&'a [&'a str]> {
+/// A spoken command that controls playback instead of asking for a song.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    /// "groovy skip": the next song in the queue.
+    Skip,
+    /// "groovy stop": stop, clear the queue and leave the voice channel.
+    Stop,
+    /// "groovy lock": ignore voice commands until "groovy unlock".
+    Lock,
+    /// "groovy unlock": listen for voice commands again.
+    Unlock,
+}
+
+/// Control words after the wake word, with the "-ed" spellings the models write.
+const CONTROLS: &[(&[&str], Control)] = &[
+    (&["skip"], Control::Skip),
+    (&["skipped"], Control::Skip),
+    (&["stop"], Control::Stop),
+    (&["stopped"], Control::Stop),
+    (&["lock"], Control::Lock),
+    (&["locked"], Control::Lock),
+    (&["unlock"], Control::Unlock),
+    (&["unlocked"], Control::Unlock),
+    (&["un", "lock"], Control::Unlock),
+];
+
+/// `words` without a leading "[could you] [please]".
+fn after_ask<'a>(words: &'a [&'a str]) -> &'a [&'a str] {
     let words = ASKS
         .iter()
         .find_map(|ask| words.strip_prefix(*ask))
         .unwrap_or(words);
-    let words = words.strip_prefix(&["please"]).unwrap_or(words);
+    words.strip_prefix(&["please"]).unwrap_or(words)
+}
+
+/// What follows "[could you] [please] <verb>" at the start of `words`, if a verb is there.
+fn after_verb<'a>(words: &'a [&'a str]) -> Option<&'a [&'a str]> {
+    let words = after_ask(words);
     VERBS.iter().find_map(|verb| words.strip_prefix(*verb))
+}
+
+/// The control when `words` are exactly "[could you] [please] <control>".
+///
+/// Nothing may follow, so "that's so groovy, stop talking" does not leave the channel.
+fn control_word(words: &[&str]) -> Option<Control> {
+    let words = after_ask(words);
+    CONTROLS
+        .iter()
+        .find(|(said, _)| words == *said)
+        .map(|(_, control)| *control)
 }
 
 /// Whether `heard` could be a speech model's spelling of the wake word `wake`.
@@ -159,14 +201,37 @@ impl CommandParser {
     /// in tests with 40 voices, as both models drop or swap the "g" ("ruby
     /// played", "Roovy, play").
     fn request_start(&self, words: &[&str], at: usize, b_is_v: bool) -> Option<usize> {
-        if !self
-            .wake_words
-            .iter()
-            .any(|wake| sounds_like(words[at], wake, b_is_v))
-        {
+        if !self.sounds_like_wake(words[at], b_is_v) {
             return None;
         }
         after_verb(&words[at + 1..]).map(|request| words.len() - request.len())
+    }
+
+    fn sounds_like_wake(&self, word: &str, b_is_v: bool) -> bool {
+        self.wake_words
+            .iter()
+            .any(|wake| sounds_like(word, wake, b_is_v))
+    }
+
+    /// The first "<wake word> <control>" in `text`, matched by sound like a request.
+    fn find_control(&self, text: &str, b_is_v: bool) -> Option<Control> {
+        let text = normalize(text);
+        let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
+        (0..words.len()).find_map(|at| {
+            self.sounds_like_wake(words[at], b_is_v)
+                .then(|| control_word(&words[at + 1..]))
+                .flatten()
+        })
+    }
+
+    /// The control in the request model's "groovy skip", "groovy stop" and so on.
+    pub fn control(&self, transcript: &str) -> Option<Control> {
+        self.find_control(transcript, false)
+    }
+
+    /// Whether the wake model's window holds "<wake word> unlock", the one command heard while locked.
+    pub fn unlocks_on(&self, window: &str) -> bool {
+        self.find_control(window, true) == Some(Control::Unlock)
     }
 
     /// The request in "<wake word> play <request>", or `None`.
@@ -193,11 +258,12 @@ impl CommandParser {
         build_request(&words.join(" ")).map(|request| request.query)
     }
 
-    /// Whether the wake model's window holds "<wake word> play", or another way to ask.
+    /// Whether the wake model's window holds "<wake word> play", another way to ask, or a control.
     pub fn wakes_on(&self, window: &str) -> bool {
         let text = normalize(window);
         let words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
         (0..words.len()).any(|at| self.request_start(&words, at, true).is_some())
+            || self.find_control(window, true).is_some()
     }
 
     /// The words after the first "<wake word> play", or another way to ask, are the request.

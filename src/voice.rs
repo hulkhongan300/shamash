@@ -138,7 +138,12 @@ impl VoiceService {
         let armed = Armed::default();
         let gate = WakeGate::new(wake_model, parser.clone(), armed.clone());
         let pipeline = Arc::new(ListenerPipeline::new(
-            big_models, parser, player, armed, speakers,
+            big_models,
+            parser,
+            player,
+            armed,
+            speakers,
+            lock.clone(),
         ));
         let inbox = pipeline.start(ctx.clone(), self.config.clone(), guild_id);
 

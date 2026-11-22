@@ -141,6 +141,7 @@ fn main() -> anyhow::Result<()> {
                             armed.arm(SSRC);
                             println!("wake word on its own: waiting for the request (tone 2)");
                         }
+                        Understood::Control(control) => println!("control: {control:?}"),
                         Understood::Nothing(miss) => println!("not a play command: {miss:?}"),
                     }
                 }

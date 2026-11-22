@@ -1,9 +1,10 @@
 use crate::config::Config;
 use crate::listener::Speakers;
 use crate::llm;
-use crate::parser::{CommandParser, ParseMiss, PlayRequest};
+use crate::parser::{CommandParser, Control, ParseMiss, PlayRequest};
 use crate::player::{Player, Tone};
-use crate::state::HttpClientKey;
+use crate::state::{HttpClientKey, ListenLock};
+use crate::voice::VoiceService;
 use crate::wake::{ARM_TTL, Armed, BigModels, Heard, Ssrc};
 use serenity::model::id::GuildId;
 use serenity::prelude::Context as SerenityContext;
@@ -19,6 +20,8 @@ pub enum Understood {
     Request(PlayRequest),
     /// "groovy play" on its own: wait for the request.
     WakeOnly,
+    /// "groovy skip", "groovy stop", "groovy lock" or "groovy unlock".
+    Control(Control),
     /// Not a command after all.
     Nothing(Option<ParseMiss>),
 }
@@ -34,7 +37,10 @@ pub fn understand(parser: &CommandParser, transcript: &str, armed: bool) -> Unde
     match parser.command(transcript) {
         Ok(request) => Understood::Request(request),
         Err(ParseMiss::EmptyRequest) => Understood::WakeOnly,
-        Err(miss) => Understood::Nothing(Some(miss)),
+        Err(miss) => match parser.control(transcript) {
+            Some(control) => Understood::Control(control),
+            None => Understood::Nothing(Some(miss)),
+        },
     }
 }
 
@@ -46,6 +52,7 @@ pub struct ListenerPipeline {
     pub player: Arc<Player>,
     armed: Armed,
     speakers: Speakers,
+    lock: ListenLock,
     /// Wordless utterances, logged with the next real one.
     muted_utterances: AtomicUsize,
 }
@@ -57,6 +64,7 @@ impl ListenerPipeline {
         player: Arc<Player>,
         armed: Armed,
         speakers: Speakers,
+        lock: ListenLock,
     ) -> Self {
         Self {
             models,
@@ -64,6 +72,7 @@ impl ListenerPipeline {
             player,
             armed,
             speakers,
+            lock,
             muted_utterances: AtomicUsize::new(0),
         }
     }
@@ -146,6 +155,16 @@ impl ListenerPipeline {
         let user = self.speakers.user(ssrc).map(|u| u.to_string());
         let user = user.as_deref().unwrap_or("unknown");
 
+        // Locked: act on "groovy unlock" only, and log nothing that was said.
+        if self.lock.is_locked(guild_id) {
+            if understand(&self.parser, &transcript, false) == Understood::Control(Control::Unlock)
+            {
+                self.control(ctx, config, guild_id, Control::Unlock, user)
+                    .await;
+            }
+            return false;
+        }
+
         if transcript.trim().is_empty() {
             self.muted_utterances.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(guild_id = %guild_id, user, "heard an utterance but no words in it");
@@ -159,6 +178,10 @@ impl ListenerPipeline {
             Understood::WakeOnly => {
                 self.arm(guild_id, ssrc);
                 return true;
+            }
+            Understood::Control(control) => {
+                self.control(ctx, config, guild_id, control, user).await;
+                return false;
             }
             Understood::Nothing(miss) => {
                 // The false-wake log line.
@@ -216,6 +239,39 @@ impl ListenerPipeline {
             return vec![request];
         }
         every
+    }
+
+    /// Carries out a spoken control the way its slash command or button would.
+    async fn control(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        control: Control,
+        user: &str,
+    ) {
+        tracing::info!(guild_id = %guild_id, user, ?control, "voice control");
+        match control {
+            Control::Skip => self.player.skip(ctx, config, guild_id).await,
+            Control::Stop => {
+                self.player.release_duck(guild_id);
+                self.player.stop(ctx, config, guild_id).await;
+                let left = match VoiceService::from_ctx(ctx).await {
+                    Ok(service) => service.stop(guild_id).await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = left {
+                    tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not leave the voice channel");
+                }
+            }
+            Control::Lock => {
+                self.lock.set(guild_id, true);
+                self.player.release_duck(guild_id);
+            }
+            Control::Unlock => {
+                self.lock.set(guild_id, false);
+            }
+        }
     }
 
     /// Bare wake word: play the ready tone and take the next utterance as the request.
