@@ -705,3 +705,36 @@ fn a_dangling_and_adds_no_empty_song() {
     assert_eq!(queries("dracula and then", false), ["dracula"]);
     assert_eq!(queries("dracula and", true), ["dracula"]);
 }
+
+#[test]
+fn skip_stop_lock_and_unlock_are_controls() {
+    let parser = parser();
+    for (heard, control) in [
+        ("Groovy, skip.", Control::Skip),
+        ("Groovy, please stop.", Control::Stop),
+        ("groovy stopped", Control::Stop),
+        ("Groovy, lock.", Control::Lock),
+        ("Groovy, unlock.", Control::Unlock),
+        ("groovy un lock", Control::Unlock),
+    ] {
+        assert_eq!(parser.control(heard), Some(control), "{heard:?}");
+        assert!(parser.wakes_on(heard), "the gate missed {heard:?}");
+    }
+    for heard in [
+        "stop it",
+        "skip this one",
+        "that's so groovy, stop talking",
+        "groovy skip this one",
+        "groovy is locked out",
+    ] {
+        assert_eq!(parser.control(heard), None, "{heard:?} is not a control");
+    }
+}
+
+#[test]
+fn only_unlock_is_heard_while_locked() {
+    let parser = parser();
+    assert!(parser.unlocks_on("groovy unlock"));
+    assert!(!parser.unlocks_on("groovy lock"));
+    assert!(!parser.unlocks_on("groovy play dracula"));
+}

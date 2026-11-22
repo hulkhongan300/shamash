@@ -250,7 +250,8 @@ fn tail(audio: &[f32], len: usize) -> Vec<f32> {
 
 /// Consumes ticks until the channel closes, calling `on_heard` for each event.
 ///
-/// While `locked()`, audio and speaker state are dropped. `on_heard` must not block.
+/// While `locked()`, speech is dropped unless the small model hears "<wake word> unlock".
+/// `on_heard` must not block.
 pub async fn run_wake_gate(
     mut gate: WakeGate,
     mut rx: UnboundedReceiver<Tick>,
@@ -259,14 +260,11 @@ pub async fn run_wake_gate(
 ) {
     let mut was_locked = false;
     while let Some(tick) = rx.recv().await {
-        if locked() {
-            if !was_locked {
-                gate.reset();
-                was_locked = true;
-            }
-            continue;
+        let locked = locked();
+        if locked && !was_locked {
+            gate.reset();
         }
-        was_locked = false;
+        was_locked = locked;
 
         for (ssrc, audio) in tick {
             for step in gate.push(ssrc, &audio) {
@@ -294,6 +292,9 @@ pub async fn run_wake_gate(
                         continue;
                     }
                 };
+                if locked && !gate.parser.unlocks_on(&transcript) {
+                    continue;
+                }
                 for heard in gate.transcribed(ssrc, &transcript, closing) {
                     on_heard(heard);
                 }

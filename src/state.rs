@@ -41,7 +41,8 @@ impl TypeMapKey for BigModelsKey {
     type Value = Arc<BigModels>;
 }
 
-/// Guilds with listening switched off by `/lock`: playback continues, speech is dropped. In memory only.
+/// Guilds with listening switched off by `/lock` or "groovy lock": playback continues and
+/// speech is dropped, except "groovy unlock". In memory only.
 #[derive(Debug, Clone, Default)]
 pub struct ListenLock(Arc<std::sync::Mutex<std::collections::HashSet<GuildId>>>);
 

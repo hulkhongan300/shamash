@@ -54,3 +54,15 @@ fn the_wake_model_mishearing_is_not_a_request() {
         Understood::Nothing(Some(ParseMiss::NoWakeWord))
     ));
 }
+
+#[test]
+fn a_control_is_understood_and_play_still_wins() {
+    assert_eq!(
+        understand(&parser(), "Groovy, skip.", false),
+        Understood::Control(Control::Skip)
+    );
+    assert!(matches!(
+        understand(&parser(), "Groovy, play stop by someone", false),
+        Understood::Request(_)
+    ));
+}

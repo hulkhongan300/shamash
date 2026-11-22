@@ -562,7 +562,7 @@ impl Handler {
         tracing::info!(guild_id = %guild_id, user = %command.user.id, locked, changed, "listening lock");
         let text = match (locked, changed) {
             (true, true) => {
-                "🔒 Voice commands are off. I'm not listening to anything said in the channel. Use `/unlock` to turn them back on."
+                "🔒 Voice commands are off. I'm ignoring everything said in the channel except my name and \"unlock\". Use `/unlock` or say it to turn them back on."
             }
             (true, false) => {
                 "🔒 Voice commands were already off. Use `/unlock` to turn them back on."
