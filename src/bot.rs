@@ -773,7 +773,7 @@ async fn finish(ctx: &Context, command: &CommandInteraction, text: &str) {
 }
 
 /// The running build: the crate version, plus the commit when the image build passed `GIT_SHA`.
-fn version() -> String {
+pub fn version() -> String {
     let crate_version = env!("CARGO_PKG_VERSION");
     match option_env!("GIT_SHA").filter(|sha| !sha.is_empty()) {
         Some(sha) => format!(

@@ -271,6 +271,11 @@ impl ListenerPipeline {
             Control::Unlock => {
                 self.lock.set(guild_id, false);
             }
+            Control::Version => {
+                self.player
+                    .post_info(ctx, config, guild_id, &crate::bot::version())
+                    .await;
+            }
         }
     }
 

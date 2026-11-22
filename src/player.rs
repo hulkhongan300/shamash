@@ -1017,6 +1017,24 @@ impl Player {
         .await;
     }
 
+    /// Posts a message that stays, unlike a notice, in the alert channel.
+    pub async fn post_info(
+        &self,
+        ctx: &SerenityContext,
+        config: &Config,
+        guild_id: GuildId,
+        markdown: &str,
+    ) {
+        let Some(channel_id) = resolve_alert_channel(ctx, config, guild_id) else {
+            tracing::debug!(guild_id = %guild_id, "no alert channel, so there was nowhere to post");
+            return;
+        };
+        let message = dashboard::info(markdown).into_message();
+        if let Err(e) = channel_id.send_message(&ctx.http, message).await {
+            tracing::warn!(guild_id = %guild_id, error = %format!("{e:#}"), "could not post a message");
+        }
+    }
+
     /// Posts a short notice that deletes itself after [`NOTICE_TTL`].
     async fn post_notice(
         &self,
