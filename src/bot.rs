@@ -126,6 +126,7 @@ fn commands() -> Vec<CreateCommand> {
         CreateCommand::new("lock")
             .description("Stop listening for voice commands (music keeps playing)"),
         CreateCommand::new("unlock").description("Start listening for voice commands again"),
+        CreateCommand::new("version").description("Show which build of the bot is running"),
         CreateCommand::new("play")
             .description("Play a song, or a whole YouTube playlist or album from its link")
             .add_option(
@@ -243,6 +244,7 @@ impl EventHandler for Handler {
                 "stop" => self.slash_stop(&ctx, command).await,
                 "lock" => self.slash_lock(&ctx, command, true).await,
                 "unlock" => self.slash_lock(&ctx, command, false).await,
+                "version" => reply(&ctx, command, &version()).await,
                 _ => {}
             },
             Interaction::Autocomplete(command) => {
@@ -767,6 +769,19 @@ async fn finish(ctx: &Context, command: &CommandInteraction, text: &str) {
     let edit = EditInteractionResponse::new().content(text);
     if let Err(e) = command.edit_response(&ctx.http, edit).await {
         tracing::warn!(error = %format!("{e:#}"), "could not answer a deferred command");
+    }
+}
+
+/// The running build: the crate version, plus the commit when the image build passed `GIT_SHA`.
+fn version() -> String {
+    let crate_version = env!("CARGO_PKG_VERSION");
+    match option_env!("GIT_SHA").filter(|sha| !sha.is_empty()) {
+        Some(sha) => format!(
+            "shamash {crate_version}, commit [`{}`]({}/commit/{sha})",
+            &sha[..sha.len().min(7)],
+            env!("CARGO_PKG_REPOSITORY"),
+        ),
+        None => format!("shamash {crate_version}, local build (no commit recorded)"),
     }
 }
 

@@ -52,6 +52,9 @@ RUN if [ "$PORTABLE" = "1" ]; then export SOURCE_DATE_EPOCH=0; fi \
  && cargo chef cook --release --locked --recipe-path recipe.json
 
 COPY . .
+# The commit `/version` reports; CI passes it. Declared after the cook so a new
+# commit does not rebuild the dependencies.
+ARG GIT_SHA=
 RUN if [ "$PORTABLE" = "1" ]; then export SOURCE_DATE_EPOCH=0; fi \
  && cargo build --release --locked \
  && cp target/release/shamash /usr/local/bin/shamash
