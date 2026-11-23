@@ -1,6 +1,7 @@
-# Never in the image: secrets, build output, local data.
+# Never in the image: secrets, build output, local data, the site demo.
 .env
 target/
 data/
 Archive.zip
 .git/
+web/

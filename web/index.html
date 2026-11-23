@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shamash demo</title>
+<meta name="description" content="Try the shamash music bot's request pipeline in your browser: wake word, parser, matcher, playback.">
+<link rel="icon" href="../assets/avatar.jpg" type="image/jpeg">
+<script>
+  // The site's saved theme (same origin, same key), before first paint.
+  try { var t = localStorage.getItem('theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Comic+Neue:wght@400;700&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/comic-mono@0.0.1/index.css" rel="stylesheet">
+<!-- The site's own stylesheet: this page lives at site/shamash/. -->
+<link rel="stylesheet" href="../style.css">
+<style>
+  /* Only what the site's stylesheet has no rule for. */
+  :root { --ask: #8a5a00; }
+  [data-theme="dark"] { --ask: #e3b341; }
+  .sec-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .75rem 1rem; }
+  .muted { color: var(--muted); font-size: .875rem; }
+  .demo { display: grid; gap: 20px; padding: 20px; }
+  @media (min-width: 860px) { .demo { padding: 24px 28px 28px; } }
+  .demo h4 { margin: 0 0 .25rem; }
+  .sheet-text p:last-child { margin-bottom: 0; }
+  .note { padding: 10px 14px; border-left: 4px solid var(--accent); border-radius: 4px;
+    background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--ink) !important; }
+  .warn { color: var(--ask); }
+
+  form { display: flex; gap: 8px; }
+  input[type=text] { flex: 1; min-width: 0; font: inherit; padding: 9px 12px; border: 1px solid var(--rule);
+    border-radius: 4px; background: var(--bg); color: var(--ink); }
+  .demo button { font: 600 .875rem/1 var(--mono); padding: 10px 14px; border-radius: 4px; border: 1px solid var(--accent);
+    background: var(--accent); color: var(--panel); cursor: pointer; }
+  .demo button.ghost { background: transparent; color: var(--accent); }
+  .demo button:disabled { opacity: .5; cursor: default; }
+  .demo button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .demo .chips button { font-weight: 400; font-size: .8125rem; padding: 5px 10px; background: transparent; color: var(--body); border-color: var(--rule); }
+  .demo .chips button:hover { border-color: var(--accent); color: var(--ink); }
+
+  #stages { list-style: none; margin: 0; padding: 0; border-top: 1px dashed var(--rule); }
+  .stage { display: grid; grid-template-columns: 18px 1fr auto; gap: 10px; padding: 10px 0; border-bottom: 1px dashed var(--rule); }
+  .dot { width: 12px; height: 12px; margin-top: 5px; border-radius: 50%; border: 2px solid var(--rule); }
+  .stage[data-state=run] .dot { border-color: var(--accent); animation: pulse .6s infinite alternate; }
+  .stage[data-state=ok] .dot { background: var(--ok); border-color: var(--ok); }
+  .stage[data-state=ask] .dot { background: var(--ask); border-color: var(--ask); }
+  .stage[data-state=no] .dot { background: var(--no); border-color: var(--no); }
+  .stage[data-state=skip] { opacity: .45; }
+  @keyframes pulse { to { opacity: .3; } }
+  .stage > div > b { display: block; font: 600 .9375rem/1.4 var(--mono); color: var(--ink); }
+  .where { font-size: .8125rem; color: var(--muted); }
+  .detail { margin-top: 4px; color: var(--body); overflow-wrap: anywhere; }
+  .detail:empty { display: none; }
+  .ms { font: .75rem var(--mono); color: var(--muted); white-space: nowrap; }
+  .detail .spec { margin-top: 8px; }
+  .spec td.n { text-align: right; padding-left: 1rem; }
+
+  #playerBox { display: none; text-align: center; }
+  #playerBox.on { display: block; }
+  #playerBox .row { justify-content: center; }
+  /* After the clip the player goes away, so it can't be replayed or run past 30 s. */
+  #playerBox.done #yt, #playerBox.done .progress, #playerBox.done .row { display: none; }
+  #yt { display: block; margin: 0 auto; width: 356px; max-width: 100%; aspect-ratio: 16 / 9; height: auto; border: 0; border-radius: 4px; }
+  .progress { height: 6px; background: var(--rule); border-radius: 3px; margin: 8px auto 4px; max-width: 356px; }
+  .progress i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 3px; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  #clock { font-family: var(--mono); }
+  details summary { cursor: pointer; font: 600 .75rem/1 var(--mono); color: var(--muted); }
+  details ul { columns: 2; font-size: .875rem; color: var(--body); padding-left: 18px; margin-bottom: 0; }
+  @media (max-width: 520px) { details ul { columns: 1; } }
+  @media (prefers-reduced-motion: reduce) { .stage[data-state=run] .dot { animation: none; } }
+</style>
+</head>
+<body>
+<header class="bar wrap">
+  <nav aria-label="Main">
+    <a href="https://github.com/hulkhongan300/shamash">Source ↗</a>
+    <button id="theme-toggle" class="toggle" type="button" aria-label="Switch to light mode" title="Switch to light mode">
+      <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+      <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
+  </nav>
+</header>
+
+<main>
+  <section class="wrap section">
+    <header class="sec-head"><h2>Talk to shamash</h2><a class="btn ghost" href="../#shamash">← Back to the site</a></header>
+    <article class="sheet" aria-labelledby="demo-h">
+      <header class="sheet-head"><h3 id="demo-h">shamash</h3><span>Rust → WebAssembly</span><span>20 songs, 30 s each</span><span class="state main">Live demo</span></header>
+      <div class="demo">
+        <div class="sheet-text">
+          <p class="lede">Ask for a song the way you would in voice chat, and watch the request go through the bot.</p>
+          <p>Wake word, Understand and Match run the bot's own Rust code, compiled to WebAssembly.</p>
+          <p class="note" role="note"><b>Speaking to it</b> works in Firefox, Chrome and Edge. <b class="warn">Brave, Helium and other browsers without a speech service</b> can't use the 🎤, so type your request there instead.</p>
+        </div>
+
+        <div>
+          <form id="ask">
+            <input type="text" id="said" aria-label="What you say to the bot" placeholder="groovy play sky high by elektronomia" autocomplete="off">
+            <button type="button" class="ghost" id="mic" hidden aria-label="Say it">🎤</button>
+            <button type="submit" id="go">Send</button>
+          </form>
+          <div class="chips" id="chips" aria-label="Examples"></div>
+          <p class="muted" id="micNote" hidden style="margin:10px 0 0">🎤 uses your browser's speech recognition, which in Chrome sends the audio to Google. The real bot transcribes on its own machine.</p>
+        </div>
+
+        <div>
+          <h4>Pipeline</h4>
+          <ol id="stages"></ol>
+        </div>
+
+        <div id="playerBox">
+          <div id="yt"></div>
+          <div class="progress"><i id="bar"></i></div>
+          <div class="row">
+            <span class="muted" id="clock">0:00 / 0:30</span>
+            <button type="button" class="ghost" id="stop">Stop</button>
+          </div>
+          <p class="muted" id="credit" style="margin:6px 0 0"></p>
+        </div>
+
+        <details>
+          <summary>Songs this demo knows</summary>
+          <p class="muted" style="margin:10px 0 0">The real bot searches all of YouTube Music. This demo picks from these free-to-use songs by <a href="https://ncs.io">NoCopyrightSounds</a>, played through YouTube's own player for at most 30 seconds.</p>
+          <ul id="songs"></ul>
+        </details>
+      </div>
+    </article>
+  </section>
+</main>
+
+<footer class="wrap foot"><span>shamash · MIT</span><a href="https://github.com/hulkhongan300/shamash">github.com/hulkhongan300/shamash ↗</a></footer>
+
+<script>
+// The site's theme toggle, unchanged: dark by default, a click saves the choice.
+(function () {
+  var root = document.documentElement, btn = document.getElementById('theme-toggle');
+  function label() {
+    var next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    btn.setAttribute('aria-label', 'Switch to ' + next + ' mode');
+    btn.title = 'Switch to ' + next + ' mode';
+  }
+  label();
+  btn.addEventListener('click', function () {
+    root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    try { localStorage.setItem('theme', root.dataset.theme); } catch (e) {}
+    label();
+  });
+})();
+</script>
+<script type="module">
+import init, { run } from "./pkg/shamash_web.js";
+
+await init();
+
+const WAKE = "groovy";
+const LIMIT = 30; // seconds of each song the demo plays
+const VOLUME = 30; // percent; YouTube starts at 100, which is loud on a page you didn't expect music from
+
+// Official NoCopyrightSounds uploads; each was checked to allow embedding.
+const SONGS = [
+  ["TW9d8vYrVFQ", "Elektronomia", "Sky High"],
+  ["cNcy3J4x62M", "Elektronomia", "Limitless"],
+  ["3nQNiWdeH2Q", "Janji", "Heroes Tonight (feat. Johnning)"],
+  ["J2X5mJ3HDYE", "DEAF KEV", "Invincible"],
+  ["6FNHe3kf8_s", "Different Heaven", "Nekozilla"],
+  ["yJg-Y5byMMw", "Warriyo", "Mortals (feat. Laura Brehm)"],
+  ["x_OwcYTNbHs", "Jim Yosef", "Firefly"],
+  ["9iHM6X6uUH8", "Jim Yosef", "Link"],
+  ["yHLtE1wFeRQ", "Jim Yosef & Anna Yvette", "Linked"],
+  ["L7kF4MXXCoA", "Lost Sky", "Dreams pt. II (feat. Sara Skinner)"],
+  ["9rujCfYXhQc", "Lost Sky", "Fearless"],
+  ["S19UcWdOA-I", "Lost Sky", "Fearless pt.II (feat. Chris Linton)"],
+  ["q1ULJ92aldE", "Syn Cole", "Feel Good"],
+  ["p7ZsBPK656s", "Disfigure", "Blank"],
+  ["__CRWE-L45k", "Electro-Light", "Symbolism"],
+  ["LHvYrn3FAgI", "Unknown Brain", "Superhero (feat. Chris Linton)"],
+  ["xN1WOlptE58", "Alan Walker", "Dreamer"],
+  ["Ly5j7aL96Qg", "Narvent, Axstin", "Cloud 9"],
+  ["vJAcXd_UtWQ", "N3WPORT", "Alive (feat. Neoni)"],
+  ["-xKKo7t72Tg", "Itro & Kontinuum", "Alive"],
+].map(([id, artist, title]) => ({ id, artist, title }));
+const CATALOG = JSON.stringify(SONGS.map(s => [s.artist, s.title]));
+
+const EXAMPLES = [
+  "groovy play sky hi by electronomia",
+  "roovy, could you play heroes tonight",
+  "groovy play alive",
+  "groovy play invinsible",
+  "groovy play despacito",
+  "hey, play sky high",
+  "groovy stop",
+];
+
+const STAGES = [
+  ["Hear", "Bot: Discord voice, transcribed on its own machine. Here: what you typed or said."],
+  ["Wake word", "The bot's parser. It listens for a word that sounds like \"groovy\"."],
+  ["Understand", "The bot's parser. It finds the title and artist."],
+  ["Search", "Bot: YouTube Music. Here: the 20 songs listed below."],
+  ["Match", "The bot's matcher. It plays, asks which one, or gives up."],
+  ["Play", "Bot: streams into the voice channel. Here: YouTube's player, 30 seconds at most."],
+];
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const label = s => `${esc(s.title)} by ${esc(s.artist)}`;
+const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const pause = ms => new Promise(r => setTimeout(r, reduced ? 0 : ms));
+
+$("stages").innerHTML = STAGES.map(([name, where]) =>
+  `<li class="stage"><span class="dot"></span><div><b>${name}</b><span class="where">${where}</span><div class="detail" aria-live="polite"></div></div><span class="ms"></span></li>`).join("");
+const rows = [...document.querySelectorAll(".stage")];
+$("songs").innerHTML = SONGS.map(s => `<li>${label(s)}</li>`).join("");
+$("chips").innerHTML = EXAMPLES.map(e => `<button type="button">${esc(e)}</button>`).join("");
+
+let runId = 0; // a newer request cancels the stages of an older one
+function set(i, state, html = "", ms = "") {
+  rows[i].dataset.state = state;
+  rows[i].querySelector(".detail").innerHTML = html;
+  rows[i].querySelector(".ms").textContent = ms;
+}
+async function step(id, i, state, html, ms) {
+  if (id !== runId) return false;
+  set(i, "run");
+  await pause(450);
+  if (id !== runId) return false;
+  set(i, state, html, ms);
+  return true;
+}
+function skipFrom(i) { for (; i < rows.length; i++) set(i, "skip"); }
+
+async function go(said, how) {
+  const id = ++runId;
+  rows.forEach((_, i) => set(i, ""));
+  if (!await step(id, 0, "ok", `"${esc(said)}" <span class="muted">(${how})</span>`)) return;
+
+  const t0 = performance.now();
+  const r = JSON.parse(run(said, WAKE, CATALOG));
+  const ms = `${(performance.now() - t0).toFixed(1)} ms`;
+
+  if (!r.woke) { await step(id, 1, "no", "No wake word heard, so the bot stays quiet."); return skipFrom(2); }
+  if (!await step(id, 1, "ok", `Heard the wake word.`)) return;
+
+  if (r.control) {
+    const what = { stop: "Stop and leave the channel.", skip: "Skip to the next song.", lock: "Stop listening until \"groovy unlock\".",
+      unlock: "Listen again.", version: "Post the running version." }[r.control];
+    if (!await step(id, 2, "ok", `A control word, <b>${r.control}</b>: ${what}`, ms)) return;
+    if (r.control === "stop" || r.control === "skip") stopPlayer();
+    return skipFrom(3);
+  }
+  if (r.miss) { await step(id, 2, "no", `Not a request: ${esc(r.miss)}.`, ms); return skipFrom(3); }
+  const parsed = r.title ? `Title <b>${esc(r.title)}</b>, artist <b>${esc(r.artist)}</b>` : `Request <b>${esc(r.query)}</b>, no artist named`;
+  if (!await step(id, 2, "ok", parsed, ms)) return;
+
+  if (!await step(id, 3, "ok", `Looked through ${SONGS.length} songs.`)) return;
+
+  const top = r.scores.map((s, i) => ({ ...s, song: SONGS[i] })).sort((a, b) => b.combined - a.combined).slice(0, 3);
+  const table = `<table class="spec"><tr><th>Closest songs</th><th>title</th><th>artist</th><th>score</th></tr>${top.map(t =>
+    `<tr><td>${label(t.song)}</td><td class="n">${t.title.toFixed(2)}</td><td class="n">${t.artist.toFixed(2)}</td><td class="n">${t.combined.toFixed(2)}</td></tr>`).join("")}</table>`;
+  if (r.verdict === "none") {
+    await step(id, 4, "no", `Nothing close enough. The bot would say it couldn't find the song.${table}`);
+    return skipFrom(5);
+  }
+  if (r.verdict === "ask") {
+    const picks = r.picks.map(i => `<button type="button" class="ghost" data-pick="${i}">${label(SONGS[i])}</button>`).join(" ");
+    if (!await step(id, 4, "ask", `Not sure, so the bot asks which one:<div class="row" style="margin-top:6px">${picks}</div>${table}`)) return;
+    rows[4].querySelectorAll("[data-pick]").forEach(b => b.onclick = () => {
+      if (id === runId) step(id, 5, "ok", `Playing ${label(SONGS[b.dataset.pick])}`).then(ok => ok && play(SONGS[b.dataset.pick]));
+    });
+    return;
+  }
+  const song = SONGS[r.picks[0]];
+  if (!await step(id, 4, "ok", `Sure enough to play it: ${label(song)}${table}`)) return;
+  if (await step(id, 5, "ok", `Playing ${label(song)}`)) play(song);
+}
+
+// YouTube's IFrame API, loaded once; the demo never touches the audio itself.
+let player, timer, current;
+const credit = done => $("credit").innerHTML = `${done}${label(current)}. Music provided by NoCopyrightSounds. ` +
+  `<a href="https://youtu.be/${current.id}" target="_blank" rel="noopener">${done ? "Watch the full song" : "Watch"} on YouTube</a>`;
+const ytReady = new Promise(resolve => { window.onYouTubeIframeAPIReady = resolve; });
+const yt = document.createElement("script");
+yt.src = "https://www.youtube.com/iframe_api";
+document.head.append(yt);
+
+async function play(song) {
+  const loaded = await Promise.race([ytReady.then(() => true), new Promise(r => setTimeout(() => r(false), 8000))]);
+  if (!loaded) return set(5, "no", "YouTube's player didn't load. Is something blocking youtube.com?");
+  $("playerBox").classList.add("on");
+  $("playerBox").classList.remove("done");
+  current = song;
+  credit("");
+  const video = { videoId: song.id, startSeconds: 0, endSeconds: LIMIT };
+  if (player) player.loadVideoById(video);
+  else player = new YT.Player("yt", {
+    videoId: song.id,
+    playerVars: { autoplay: 1, start: 0, end: LIMIT, playsinline: 1, rel: 0 },
+    // Only on creation, so a volume the visitor picks in YouTube's controls sticks for later songs.
+    events: { onReady: e => { e.target.setVolume(VOLUME); e.target.playVideo(); } },
+  });
+  clearInterval(timer);
+  timer = setInterval(() => {
+    const t = Math.min(player.getCurrentTime?.() ?? 0, LIMIT);
+    $("bar").style.width = `${(t / LIMIT) * 100}%`;
+    $("clock").textContent = `0:${String(Math.floor(t)).padStart(2, "0")} / 0:${LIMIT}`;
+    if (t >= LIMIT) stopPlayer();
+  }, 250);
+}
+// Seeking past 0:30 in YouTube's controls lands here too, through the timer.
+function stopPlayer() {
+  clearInterval(timer);
+  player?.stopVideo?.();
+  if (!current) return;
+  $("playerBox").classList.add("done");
+  credit("Played ");
+}
+
+$("stop").onclick = stopPlayer;
+$("ask").onsubmit = e => { e.preventDefault(); const said = $("said").value.trim(); if (said) go(said, "typed"); };
+$("chips").onclick = e => { if (e.target.matches("button")) { $("said").value = e.target.textContent; go(e.target.textContent, "typed"); } };
+
+const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+if (Speech) {
+  $("mic").hidden = $("micNote").hidden = false;
+  $("mic").onclick = () => {
+    const rec = new Speech();
+    rec.lang = "en-US";
+    rec.onresult = e => { const said = e.results[0][0].transcript; $("said").value = said; go(said, "said"); };
+    // Chromium forks without Google's speech service (Helium, ungoogled-chromium) never answer at all.
+    const hung = setTimeout(() => {
+      rec.abort();
+      $("micNote").textContent = "🎤 This browser's speech recognition never answered. Chromium forks without Google's speech service (Helium, Brave, ungoogled-chromium) can't do it. Use Chrome or Edge, or type instead.";
+    }, 10000);
+    rec.onend = () => { clearTimeout(hung); $("mic").disabled = false; $("mic").textContent = "🎤"; };
+    // Failures are otherwise silent; Chromium builds without Google's speech service report "network".
+    rec.onerror = e => {
+      if (e.error === "aborted") return; // our own timeout, which already said why
+      $("micNote").textContent = {
+        "not-allowed": "🎤 The browser blocked the microphone. Allow it for this page and try again.",
+        "audio-capture": "🎤 No microphone found.",
+        "no-speech": "🎤 Didn't hear anything. Try again, a bit closer to the mic.",
+        "network": "🎤 This browser has no speech service (Chromium, Brave and embedded browsers often don't). Use Chrome, or type instead.",
+      }[e.error] ?? `🎤 Speech recognition failed (${e.error}). Type the request instead.`;
+    };
+    $("mic").disabled = true;
+    $("mic").textContent = "…";
+    rec.start();
+  };
+}
+
+</script>
+</body>
+</html>

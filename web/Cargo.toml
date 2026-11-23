@@ -1,0 +1,17 @@
+[package]
+name = "shamash-web"
+version = "0.1.0"
+edition = "2024"
+description = "The bot's request parser and song matcher, compiled to WebAssembly for the site demo."
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The same versions the bot uses, for the two files `src/lib.rs` borrows from it.
+rphonetic = "3"
+strsim = "0.9.3"
+serde_json = "1.0.151"
+wasm-bindgen = "0.2"
