@@ -51,6 +51,24 @@ first track straight away and the rest behind it, up to the 20-song queue.
 A message in the text channel says how many songs are coming. Stop drops the
 ones not queued yet.
 
+### Voice controls
+
+Say "groovy" and one of these:
+
+| Say | What it does |
+| --- | --- |
+| "skip", "next" | Starts the next song in the queue |
+| "pause" | Pauses the song |
+| "resume", "unpause", "continue" | Carries on with the paused song |
+| "stop" | Stops playback, clears the queue and leaves the voice channel, like `/stop` |
+| "lock", "unlock" | Like `/lock` and `/unlock`. While locked, "groovy unlock" is the only thing it hears |
+| "version" | Posts the running build, like `/version` |
+
+One of "this song", "the song", "this one", "the music", "it" or "please" may
+follow: "Groovy, skip this song", "Groovy, next song", "Groovy, stop the
+music". Anything else after the word, as in "that's so groovy, stop talking",
+is left alone.
+
 The bot answers with tones:
 
 | Tone | Meaning |

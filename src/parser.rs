@@ -42,12 +42,17 @@ pub enum Control {
     Unlock,
     /// "groovy version": post the running build in the text channel.
     Version,
+    /// "groovy pause": pause the song playing.
+    Pause,
+    /// "groovy resume": carry on with the paused song.
+    Resume,
 }
 
 /// Control words after the wake word, with the "-ed" spellings the models write.
 const CONTROLS: &[(&[&str], Control)] = &[
     (&["skip"], Control::Skip),
     (&["skipped"], Control::Skip),
+    (&["next"], Control::Skip),
     (&["stop"], Control::Stop),
     (&["stopped"], Control::Stop),
     (&["lock"], Control::Lock),
@@ -55,6 +60,13 @@ const CONTROLS: &[(&[&str], Control)] = &[
     (&["unlock"], Control::Unlock),
     (&["unlocked"], Control::Unlock),
     (&["un", "lock"], Control::Unlock),
+    (&["pause"], Control::Pause),
+    (&["paused"], Control::Pause),
+    (&["resume"], Control::Resume),
+    (&["resumed"], Control::Resume),
+    (&["unpause"], Control::Resume),
+    (&["un", "pause"], Control::Resume),
+    (&["continue"], Control::Resume),
     (&["version"], Control::Version),
     (&["your", "version"], Control::Version),
     (&["what", "version"], Control::Version),
@@ -67,6 +79,19 @@ const CONTROLS: &[(&[&str], Control)] = &[
         &["what", "version", "are", "you", "running"],
         Control::Version,
     ),
+];
+
+/// Words that may end a control, longest first: "skip this song", "stop the music", "next one".
+const TAILS: &[&[&str]] = &[
+    &["this", "song"],
+    &["the", "song"],
+    &["this", "one"],
+    &["the", "music"],
+    &["song"],
+    &["one"],
+    &["music"],
+    &["it"],
+    &["please"],
 ];
 
 /// `words` without a leading "[could you] [please]".
@@ -84,11 +109,15 @@ fn after_verb<'a>(words: &'a [&'a str]) -> Option<&'a [&'a str]> {
     VERBS.iter().find_map(|verb| words.strip_prefix(*verb))
 }
 
-/// The control when `words` are exactly "[could you] [please] <control>".
+/// The control when `words` are exactly "[could you] [please] <control> [tail]".
 ///
-/// Nothing may follow, so "that's so groovy, stop talking" does not leave the channel.
+/// Only a [`TAILS`] word may follow, so "that's so groovy, stop talking" does not leave the channel.
 fn control_word(words: &[&str]) -> Option<Control> {
     let words = after_ask(words);
+    let words = TAILS
+        .iter()
+        .find_map(|tail| words.strip_suffix(*tail))
+        .unwrap_or(words);
     CONTROLS
         .iter()
         .find(|(said, _)| words == *said)

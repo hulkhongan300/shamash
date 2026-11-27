@@ -707,7 +707,7 @@ fn a_dangling_and_adds_no_empty_song() {
 }
 
 #[test]
-fn skip_stop_lock_and_unlock_are_controls() {
+fn skip_stop_pause_lock_and_unlock_are_controls() {
     let parser = parser();
     for (heard, control) in [
         ("Groovy, skip.", Control::Skip),
@@ -720,6 +720,15 @@ fn skip_stop_lock_and_unlock_are_controls() {
         ("Groovy, what's your version?", Control::Version),
         ("Groovy, tell me your version.", Control::Version),
         ("groovy what version are you running", Control::Version),
+        ("Groovy, skip this song.", Control::Skip),
+        ("Groovy skipped the song.", Control::Skip),
+        ("groovy skip this one", Control::Skip),
+        ("Groovy, next song.", Control::Skip),
+        ("Groovy, stop the music.", Control::Stop),
+        ("Groovy, pause.", Control::Pause),
+        ("groovy pause the music", Control::Pause),
+        ("Groovy, resume.", Control::Resume),
+        ("groovy un pause", Control::Resume),
     ] {
         assert_eq!(parser.control(heard), Some(control), "{heard:?}");
         assert!(parser.wakes_on(heard), "the gate missed {heard:?}");
@@ -728,7 +737,8 @@ fn skip_stop_lock_and_unlock_are_controls() {
         "stop it",
         "skip this one",
         "that's so groovy, stop talking",
-        "groovy skip this one",
+        "groovy skip this one or else",
+        "groovy song",
         "groovy is locked out",
         "groovy version two of that song",
     ] {
