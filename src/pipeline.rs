@@ -20,7 +20,7 @@ pub enum Understood {
     Request(PlayRequest),
     /// "groovy play" on its own: wait for the request.
     WakeOnly,
-    /// "groovy skip", "groovy stop", "groovy lock" or "groovy unlock".
+    /// "groovy skip", "groovy stop", "groovy pause", "groovy lock" and the like.
     Control(Control),
     /// Not a command after all.
     Nothing(Option<ParseMiss>),
@@ -275,6 +275,13 @@ impl ListenerPipeline {
                 self.player
                     .post_info(ctx, config, guild_id, &crate::bot::version())
                     .await;
+            }
+            Control::Pause | Control::Resume => {
+                let paused = control == Control::Pause;
+                if self.player.set_paused(guild_id, paused).await.is_none() {
+                    tracing::info!(guild_id = %guild_id, "nothing to pause");
+                }
+                self.player.draw_dashboard(ctx, config, guild_id).await;
             }
         }
     }

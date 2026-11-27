@@ -33,6 +33,8 @@ leaves the host.
   [Song memory](docs/usage.md#song-memory).
 - **`/play` with live suggestions.** Start typing and matching songs appear.
   Links, playlists and albums work too.
+- **Voice controls.** "Groovy, skip", "next song", "pause", "resume", "stop",
+  "lock" and "unlock". See [Voice controls](docs/usage.md#voice-controls).
 - **`/lock` and `/unlock`.** Turn listening off without removing the bot.
 - **`/version`, or say "groovy version".** Shows the commit the running bot was built from, linked on GitHub, so you can check it against the latest on `main`.
 - **Autonomous.** Joins when someone enters the configured channel and leaves,
